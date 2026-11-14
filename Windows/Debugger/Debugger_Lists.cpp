@@ -2,18 +2,25 @@
 #include "Common/CommonWindows.h"
 #include <windowsx.h>
 #include <commctrl.h>
-#include "Windows/Debugger/DebuggerShared.h"
+#include "Windows/Debugger/BreakpointWindow.h"
 #include "Windows/Debugger/CtrlDisAsmView.h"
+#include "Windows/Debugger/DebuggerShared.h"
+#include "Windows/Debugger/WatchItemWindow.h"
+#include "Windows/W32Util/ContextMenu.h"
+#include "Windows/MainWindow.h"
 #include "Windows/resource.h"
 #include "Windows/main.h"
-#include "BreakpointWindow.h"
-#include "../../Core/HLE/sceKernelThread.h"
 #include "Common/Data/Encoding/Utf8.h"
+#include "Core/Core.h"
+#include "Core/Debugger/LineInfo.h"
+#include "Core/MemMap.h"
+#include "Core/HLE/sceKernelThread.h"
 
 enum { TL_NAME, TL_PROGRAMCOUNTER, TL_ENTRYPOINT, TL_PRIORITY, TL_STATE, TL_WAITTYPE, TL_COLUMNCOUNT };
 enum { BPL_ENABLED, BPL_TYPE, BPL_OFFSET, BPL_SIZELABEL, BPL_OPCODE, BPL_CONDITION, BPL_HITS, BPL_COLUMNCOUNT };
-enum { SF_ENTRY, SF_ENTRYNAME, SF_CURPC, SF_CUROPCODE, SF_CURSP, SF_FRAMESIZE, SF_COLUMNCOUNT };
+enum { SF_ENTRY, SF_ENTRYNAME, SF_CURPC, SF_CUROPCODE, SF_CURSP, SF_FRAMESIZE, SF_SOURCE, SF_COLUMNCOUNT };
 enum { ML_NAME, ML_ADDRESS, ML_SIZE, ML_ACTIVE, ML_COLUMNCOUNT };
+enum { WL_NAME, WL_EXPRESSION, WL_VALUE, WL_COLUMNCOUNT };
 
 GenericListViewColumn threadColumns[TL_COLUMNCOUNT] = {
 	{ L"Name",			0.20f },
@@ -47,8 +54,9 @@ GenericListViewColumn stackTraceColumns[SF_COLUMNCOUNT] = {
 	{ L"Name",			0.24f },
 	{ L"PC",			0.12f },
 	{ L"Opcode",		0.28f },
-	{ L"SP",			0.12f },
-	{ L"Frame Size",	0.12f }
+	{ L"SP",			0.10f },
+	{ L"Frame Size",	0.10f },
+	{ L"Source",		0.16f }
 };
 
 GenericListViewDef stackTraceListDef = {
@@ -66,9 +74,15 @@ GenericListViewDef moduleListDef = {
 	moduleListColumns,	ARRAY_SIZE(moduleListColumns),	NULL,	false
 };
 
-const int POPUP_SUBMENU_ID_BREAKPOINTLIST = 5;
-const int POPUP_SUBMENU_ID_THREADLIST = 6;
-const int POPUP_SUBMENU_ID_NEWBREAKPOINT = 7;
+GenericListViewColumn watchListColumns[WL_COLUMNCOUNT] = {
+	{ L"Name",          0.25f },
+	{ L"Expression",    0.5f },
+	{ L"Value",         0.25f },
+};
+
+GenericListViewDef watchListDef = {
+	watchListColumns, ARRAY_SIZE(watchListColumns), nullptr, false,
+};
 
 //
 // CtrlThreadList
@@ -114,10 +128,7 @@ void CtrlThreadList::showMenu(int itemIndex, const POINT &pt)
 	if (Core_IsActive())
 		return;
 
-	POINT screenPt(pt);
-	ClientToScreen(GetHandle(), &screenPt);
-
-	HMENU subMenu = GetSubMenu(g_hPopupMenus, POPUP_SUBMENU_ID_THREADLIST);
+	HMENU subMenu = GetContextMenu(ContextMenuID::THREADLIST);
 	switch (threadInfo.status) {
 	case THREADSTATUS_DEAD:
 	case THREADSTATUS_DORMANT:
@@ -138,20 +149,28 @@ void CtrlThreadList::showMenu(int itemIndex, const POINT &pt)
 		break;
 	}
 
-	switch (TrackPopupMenuEx(subMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screenPt.x, screenPt.y, GetHandle(), 0))
+	switch (TriggerContextMenu(ContextMenuID::THREADLIST, GetHandle(), ContextPoint::FromClient(pt)))
 	{
 	case ID_DISASM_THREAD_FORCERUN:
-		__KernelResumeThreadFromWait(threadInfo.id, 0);
+		{
+			// Route the actual thread-state mutation to the CPU thread instead of poking at it
+			// directly from this GUI thread - see Core_RunOnCPUThread() in Core.h.
+			SceUID threadID = threadInfo.id;
+			Core_RunOnCPUThread([&] { __KernelResumeThreadFromWait(threadID, 0); });
+		}
 		reloadThreads();
 		break;
 	case ID_DISASM_THREAD_KILL:
-		sceKernelTerminateThread(threadInfo.id);
+		{
+			SceUID threadID = threadInfo.id;
+			Core_RunOnCPUThread([&] { sceKernelTerminateThread(&mipsr4k, threadID); });
+		}
 		reloadThreads();
 		break;
 	}
 }
 
-void CtrlThreadList::GetColumnText(wchar_t* dest, int row, int col)
+void CtrlThreadList::GetColumnText(wchar_t* dest, size_t destSize, int row, int col)
 {
 	if (row < 0 || row >= (int)threads.size()) {
 		return;
@@ -210,7 +229,7 @@ void CtrlThreadList::GetColumnText(wchar_t* dest, int row, int col)
 		}
 		break;
 	case TL_WAITTYPE:
-		wcscpy(dest, ConvertUTF8ToWString(getWaitTypeName(threads[row].waitType)).c_str());
+		wcscpy(dest, ConvertUTF8ToWString(WaitTypeToString(threads[row].waitType)).c_str());
 		break;
 	}
 }
@@ -239,7 +258,17 @@ void CtrlThreadList::OnRightClick(int itemIndex, int column, const POINT& point)
 
 void CtrlThreadList::reloadThreads()
 {
-	threads = GetThreadsInfo();
+	// Reading live kernel thread state here on the GUI thread would otherwise race with the CPU
+	// thread - hold g_frameMutex for the duration of the read, which NativeFrame() also holds
+	// while it's actually touching that state. See g_frameMutex in Core.h.
+	{
+		std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+		CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+		// The loader thread creates the first ones while booting.
+		if (!PSP_IsBooting()) {
+			threads = GetThreadsInfo();
+		}
+	}
 	Update();
 }
 
@@ -258,7 +287,7 @@ const char* CtrlThreadList::getCurrentThreadName()
 // CtrlBreakpointList
 //
 
-CtrlBreakpointList::CtrlBreakpointList(HWND hwnd, DebugInterface* cpu, CtrlDisAsmView* disasm)
+CtrlBreakpointList::CtrlBreakpointList(HWND hwnd, MIPSDebugInterface* cpu, CtrlDisAsmView* disasm)
 	: GenericListControl(hwnd,breakpointListDef),cpu(cpu),disasm(disasm)
 {
 	SetSendInvalidRows(true);
@@ -309,10 +338,14 @@ bool CtrlBreakpointList::WindowMessage(UINT msg, WPARAM wParam, LPARAM lParam, L
 
 void CtrlBreakpointList::reloadBreakpoints()
 {
-	// Update the items we're displaying from the debugger.
-	displayedBreakPoints_ = CBreakPoints::GetBreakpoints();
-	displayedMemChecks_= CBreakPoints::GetMemChecks();
-	Update();
+	// Update the items we're displaying from the debugger. g_frameMutex guards this against races
+	// with the CPU thread - see g_frameMutex in Core.h.
+	{
+		std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+		CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+		displayedBreakPoints_ = g_breakpoints.GetBreakpoints();
+		displayedMemChecks_= g_breakpoints.GetMemChecks();
+	}
 
 	for (int i = 0; i < GetRowCount(); i++)
 	{
@@ -326,6 +359,8 @@ void CtrlBreakpointList::reloadBreakpoints()
 		else
 			SetCheckState(i, displayedBreakPoints_[index].IsEnabled());
 	}
+
+	Update();
 }
 
 void CtrlBreakpointList::editBreakpoint(int itemIndex)
@@ -334,6 +369,9 @@ void CtrlBreakpointList::editBreakpoint(int itemIndex)
 	int index = getBreakpointIndex(itemIndex, isMemory);
 	if (index == -1) return;
 
+	// Route the breakpoint mutation to the CPU thread instead of poking at it directly from this
+	// GUI thread - see Core_RunOnCPUThread() in Core.h. win.exec() is a modal dialog, so it must
+	// stay outside any queued callback, or we'd block the CPU thread on user input.
 	BreakpointWindow win(GetHandle(),cpu);
 	if (isMemory)
 	{
@@ -341,16 +379,20 @@ void CtrlBreakpointList::editBreakpoint(int itemIndex)
 		win.loadFromMemcheck(mem);
 		if (win.exec())
 		{
-			CBreakPoints::RemoveMemCheck(mem.start,mem.end);
-			win.addBreakpoint();
+			Core_RunOnCPUThread([&] {
+				g_breakpoints.RemoveMemCheck(mem.start,mem.end);
+				win.addBreakpoint();
+			});
 		}
 	} else {
 		auto bp = displayedBreakPoints_[index];
 		win.loadFromBreakpoint(bp);
 		if (win.exec())
 		{
-			CBreakPoints::RemoveBreakPoint(bp.addr);
-			win.addBreakpoint();
+			Core_RunOnCPUThread([&] {
+				g_breakpoints.RemoveBreakPoint(bp.addr);
+				win.addBreakpoint();
+			});
 		}
 	}
 }
@@ -361,12 +403,14 @@ void CtrlBreakpointList::toggleEnabled(int itemIndex)
 	int index = getBreakpointIndex(itemIndex, isMemory);
 	if (index == -1) return;
 
+	// Route the breakpoint mutation to the CPU thread instead of poking at it directly from this
+	// GUI thread - see Core_RunOnCPUThread() in Core.h.
 	if (isMemory) {
 		MemCheck mcPrev = displayedMemChecks_[index];
-		CBreakPoints::ChangeMemCheck(mcPrev.start, mcPrev.end, mcPrev.cond, BreakAction(mcPrev.result ^ BREAK_ACTION_PAUSE));
+		Core_RunOnCPUThread([&] { g_breakpoints.ChangeMemCheck(mcPrev.start, mcPrev.end, mcPrev.cond, BreakAction(mcPrev.action ^ BREAK_ACTION_PAUSE)); });
 	} else {
 		BreakPoint bpPrev = displayedBreakPoints_[index];
-		CBreakPoints::ChangeBreakPoint(bpPrev.addr, BreakAction(bpPrev.result ^ BREAK_ACTION_PAUSE));
+		Core_RunOnCPUThread([&] { g_breakpoints.ChangeBreakPoint(bpPrev.addr, BreakAction(bpPrev.action ^ BREAK_ACTION_PAUSE)); });
 	}
 }
 
@@ -379,10 +423,12 @@ void CtrlBreakpointList::gotoBreakpointAddress(int itemIndex)
 
 	if (isMemory) {
 		u32 address = displayedMemChecks_[index].start;
+		MainWindow::CreateMemoryWindow();
 		if (memoryWindow)
 			memoryWindow->Goto(address);
 	} else {
 		u32 address = displayedBreakPoints_[index].addr;
+		MainWindow::CreateDisasmWindow();
 		if (disasmWindow)
 			disasmWindow->Goto(address);
 	}
@@ -394,24 +440,20 @@ void CtrlBreakpointList::removeBreakpoint(int itemIndex)
 	int index = getBreakpointIndex(itemIndex,isMemory);
 	if (index == -1) return;
 
-	if (isMemory)
-	{
+	// Route the breakpoint mutation to the CPU thread instead of poking at it directly from this
+	// GUI thread - see Core_RunOnCPUThread() in Core.h.
+	if (isMemory) {
 		auto mc = displayedMemChecks_[index];
-		CBreakPoints::RemoveMemCheck(mc.start, mc.end);
+		Core_RunOnCPUThread([&] { g_breakpoints.RemoveMemCheck(mc.start, mc.end); });
 	} else {
 		u32 address = displayedBreakPoints_[index].addr;
-		CBreakPoints::RemoveBreakPoint(address);
+		Core_RunOnCPUThread([&] { g_breakpoints.RemoveBreakPoint(address); });
 	}
 }
 
-int CtrlBreakpointList::getTotalBreakpointCount()
-{
-	int count = (int)CBreakPoints::GetMemChecks().size();
-	for (size_t i = 0; i < CBreakPoints::GetBreakpoints().size(); i++) {
-		if (!displayedBreakPoints_[i].temporary) count++;
-	}
-
-	return count;
+int CtrlBreakpointList::getTotalBreakpointCount() {
+	// displayedBreakPoints_ never contains the internal step-over/run-until breakpoint.
+	return (int)displayedMemChecks_.size() + (int)displayedBreakPoints_.size();
 }
 
 int CtrlBreakpointList::getBreakpointIndex(int itemIndex, bool& isMemory)
@@ -428,12 +470,6 @@ int CtrlBreakpointList::getBreakpointIndex(int itemIndex, bool& isMemory)
 	size_t i = 0;
 	while (i < displayedBreakPoints_.size())
 	{
-		if (displayedBreakPoints_[i].temporary)
-		{
-			i++;
-			continue;
-		}
-
 		// the index is 0 when there are no more breakpoints to skip
 		if (itemIndex == 0)
 		{
@@ -448,7 +484,7 @@ int CtrlBreakpointList::getBreakpointIndex(int itemIndex, bool& isMemory)
 	return -1;
 }
 
-void CtrlBreakpointList::GetColumnText(wchar_t* dest, int row, int col)
+void CtrlBreakpointList::GetColumnText(wchar_t* dest, size_t destSize, int row, int col)
 {
 	if (!PSP_IsInited()) {
 		return;
@@ -480,7 +516,7 @@ void CtrlBreakpointList::GetColumnText(wchar_t* dest, int row, int col)
 					break;
 				}
 			} else {
-				wcscpy(dest,L"Execute");
+				wcscpy(dest, L"Execute");
 			}
 		}
 		break;
@@ -503,10 +539,8 @@ void CtrlBreakpointList::GetColumnText(wchar_t* dest, int row, int col)
 					wsprintf(dest,L"0x%08X",mc.end-mc.start);
 			} else {
 				const std::string sym = g_symbolMap->GetLabelString(displayedBreakPoints_[index].addr);
-				if (!sym.empty())
-				{
-					std::wstring s = ConvertUTF8ToWString(sym);
-					wcscpy(dest,s.c_str());
+				if (!sym.empty()) {
+					ConvertUTF8ToWString(dest, destSize, sym);
 				} else {
 					wcscpy(dest,L"-");
 				}
@@ -520,8 +554,7 @@ void CtrlBreakpointList::GetColumnText(wchar_t* dest, int row, int col)
 			} else {
 				char temp[256];
 				disasm->getOpcodeText(displayedBreakPoints_[index].addr, temp, sizeof(temp));
-				std::wstring s = ConvertUTF8ToWString(temp);
-				wcscpy(dest,s.c_str());
+				ConvertUTF8ToWString(dest, destSize, temp);
 			}
 		}
 		break;
@@ -569,21 +602,20 @@ void CtrlBreakpointList::OnToggle(int item, bool newValue)
 
 void CtrlBreakpointList::showBreakpointMenu(int itemIndex, const POINT &pt)
 {
-	POINT screenPt(pt);
-	ClientToScreen(GetHandle(), &screenPt);
-
 	bool isMemory;
 	int index = getBreakpointIndex(itemIndex, isMemory);
 	if (index == -1)
 	{
-		HMENU subMenu = GetSubMenu(g_hPopupMenus, POPUP_SUBMENU_ID_NEWBREAKPOINT);
-		
-		switch (TrackPopupMenuEx(subMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screenPt.x, screenPt.y, GetHandle(), 0))
+		switch (TriggerContextMenu(ContextMenuID::NEWBREAKPOINT, GetHandle(), ContextPoint::FromClient(pt)))
 		{
 		case ID_DISASM_ADDNEWBREAKPOINT:
 			{		
+				// bpw.exec() is a modal dialog - must stay outside any queued callback, or we'd
+				// block the CPU thread on user input - see Core_RunOnCPUThread() in Core.h.
 				BreakpointWindow bpw(GetHandle(),cpu);
-				if (bpw.exec()) bpw.addBreakpoint();
+				if (bpw.exec()) {
+					Core_RunOnCPUThread([&] { bpw.addBreakpoint(); });
+				}
 			}
 			break;
 		}
@@ -596,20 +628,22 @@ void CtrlBreakpointList::showBreakpointMenu(int itemIndex, const POINT &pt)
 			bpPrev = displayedBreakPoints_[index];
 		}
 
-		HMENU subMenu = GetSubMenu(g_hPopupMenus, POPUP_SUBMENU_ID_BREAKPOINTLIST);
+		HMENU subMenu = GetContextMenu(ContextMenuID::BREAKPOINTLIST);
 		if (isMemory) {
 			CheckMenuItem(subMenu, ID_DISASM_DISABLEBREAKPOINT, MF_BYCOMMAND | (mcPrev.IsEnabled() ? MF_CHECKED : MF_UNCHECKED));
 		} else {
 			CheckMenuItem(subMenu, ID_DISASM_DISABLEBREAKPOINT, MF_BYCOMMAND | (bpPrev.IsEnabled() ? MF_CHECKED : MF_UNCHECKED));
 		}
 
-		switch (TrackPopupMenuEx(subMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screenPt.x, screenPt.y, GetHandle(), 0))
+		switch (TriggerContextMenu(ContextMenuID::BREAKPOINTLIST, GetHandle(), ContextPoint::FromClient(pt)))
 		{
 		case ID_DISASM_DISABLEBREAKPOINT:
+			// Route the breakpoint mutation to the CPU thread instead of poking at it directly
+			// from this GUI thread - see Core_RunOnCPUThread() in Core.h.
 			if (isMemory) {
-				CBreakPoints::ChangeMemCheck(mcPrev.start, mcPrev.end, mcPrev.cond, BreakAction(mcPrev.result ^ BREAK_ACTION_PAUSE));
+				Core_RunOnCPUThread([&] { g_breakpoints.ChangeMemCheck(mcPrev.start, mcPrev.end, mcPrev.cond, BreakAction(mcPrev.action ^ BREAK_ACTION_PAUSE)); });
 			} else {
-				CBreakPoints::ChangeBreakPoint(bpPrev.addr, BreakAction(bpPrev.result ^ BREAK_ACTION_PAUSE));
+				Core_RunOnCPUThread([&] { g_breakpoints.ChangeBreakPoint(bpPrev.addr, BreakAction(bpPrev.action ^ BREAK_ACTION_PAUSE)); });
 			}
 			break;
 		case ID_DISASM_EDITBREAKPOINT:
@@ -617,9 +651,16 @@ void CtrlBreakpointList::showBreakpointMenu(int itemIndex, const POINT &pt)
 			break;
 		case ID_DISASM_ADDNEWBREAKPOINT:
 			{		
+				// bpw.exec() is a modal dialog - must stay outside any queued callback, or we'd
+				// block the CPU thread on user input - see Core_RunOnCPUThread() in Core.h.
 				BreakpointWindow bpw(GetHandle(),cpu);
-				if (bpw.exec()) bpw.addBreakpoint();
+				if (bpw.exec()) {
+					Core_RunOnCPUThread([&] { bpw.addBreakpoint(); });
+				}
 			}
+			break;
+		case ID_DISASM_DELETEBREAKPOINT:
+			removeBreakpoint(itemIndex);
 			break;
 		}
 	}
@@ -662,9 +703,11 @@ bool CtrlStackTraceView::WindowMessage(UINT msg, WPARAM wParam, LPARAM lParam, L
 	return false;
 }
 
-void CtrlStackTraceView::GetColumnText(wchar_t* dest, int row, int col)
+void CtrlStackTraceView::GetColumnText(wchar_t* dest, size_t destSize, int row, int col)
 {
-	if (row < 0 || row >= (int)frames.size()) {
+	// We should have emptied the list if g_symbolMap is nullptr, but apparently we don't,
+	// so let's have a sanity check here.
+	if (row < 0 || row >= (int)frames.size() || !g_symbolMap) {
 		return;
 	}
 
@@ -699,6 +742,13 @@ void CtrlStackTraceView::GetColumnText(wchar_t* dest, int row, int col)
 	case SF_FRAMESIZE:
 		wsprintf(dest,L"%08X",frames[row].stackSize);
 		break;
+	case SF_SOURCE:
+		{
+			// Empty unless the game shipped an unstripped ELF - see Core/Debugger/LineInfo.h.
+			const std::string source = g_lineInfo.LookupString(frames[row].pc);
+			wcscpy(dest, source.empty() ? L"-" : ConvertUTF8ToWString(source).c_str());
+		}
+		break;
 	}
 }
 
@@ -707,9 +757,18 @@ void CtrlStackTraceView::OnDoubleClick(int itemIndex, int column)
 	SendMessage(GetParent(GetHandle()),WM_DEB_GOTOWPARAM,frames[itemIndex].pc,0);
 }
 
-void CtrlStackTraceView::loadStackTrace()
-{
-	auto threads = GetThreadsInfo();
+void CtrlStackTraceView::loadStackTrace() {
+	// Reading live thread/register/stack state here on the GUI thread would otherwise race with
+	// the CPU thread - hold g_frameMutex for the duration of the read, which NativeFrame() also
+	// holds while it's actually touching that state. See g_frameMutex in Core.h.
+	//
+	// g_frameMutex first, then Core_LockAgainstShutdown() - never the other way around. See CtrlMemView::onPaint.
+	std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+	CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+	if (!PSP_IsInited())
+		return;
+
+	std::vector<DebugThreadInfo> threads = GetThreadsInfo();
 
 	u32 entry = 0, stackTop = 0;
 	for (size_t i = 0; i < threads.size(); i++)
@@ -767,16 +826,15 @@ bool CtrlModuleList::WindowMessage(UINT msg, WPARAM wParam, LPARAM lParam, LRESU
 	return false;
 }
 
-void CtrlModuleList::GetColumnText(wchar_t* dest, int row, int col)
+void CtrlModuleList::GetColumnText(wchar_t* dest, size_t destSize, int row, int col)
 {
 	if (row < 0 || row >= (int)modules.size()) {
 		return;
 	}
 
-	switch (col)
-	{
+	switch (col) {
 	case ML_NAME:
-		wcscpy(dest,ConvertUTF8ToWString(modules[row].name).c_str());
+		ConvertUTF8ToWString(dest, destSize, modules[row].name);
 		break;
 	case ML_ADDRESS:
 		wsprintf(dest,L"%08X",modules[row].address);
@@ -797,10 +855,212 @@ void CtrlModuleList::OnDoubleClick(int itemIndex, int column)
 
 void CtrlModuleList::loadModules()
 {
-	if (g_symbolMap) {
-		modules = g_symbolMap->getAllModules();
-	} else {
-		modules.clear();
+	// Reading the live symbol map here on the GUI thread would otherwise race with the CPU thread -
+	// hold g_frameMutex for the duration of the read, which NativeFrame() also holds while it's
+	// actually touching that state. See g_frameMutex in Core.h.
+	{
+		std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+		CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+		if (PSP_IsBooting()) {
+			// The loader thread is still adding them. Refreshed when the boot finishes.
+		} else if (g_symbolMap) {
+			modules = g_symbolMap->getAllModules();
+		} else {
+			modules.clear();
+		}
 	}
 	Update();
+}
+
+// In case you modify things in the memory view.
+static constexpr UINT_PTR IDT_CHECK_REFRESH = 0xC0DE0044;
+
+CtrlWatchList::CtrlWatchList(HWND hwnd, DebugInterface *cpu)
+	: GenericListControl(hwnd, watchListDef), cpu_(cpu) {
+	SetSendInvalidRows(true);
+	Update();
+
+	SetTimer(GetHandle(), IDT_CHECK_REFRESH, 1000U, nullptr);
+}
+
+void CtrlWatchList::RefreshValues() {
+	// Evaluating watch expressions reads live registers/memory here on the GUI thread, which would
+	// otherwise race with the CPU thread - hold g_frameMutex for the duration, which NativeFrame()
+	// also holds while it's actually touching that state. See g_frameMutex in Core.h.
+	std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+	CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+
+	int steppingCounter = Core_GetSteppingCounter();
+	int changes = false;
+	for (auto &watch : watches_) {
+		if (watch.steppingCounter != steppingCounter) {
+			watch.lastValue = watch.currentValue;
+			watch.steppingCounter = steppingCounter;
+			changes = true;
+		}
+
+		uint32_t prevValue = watch.currentValue;
+		watch.evaluateFailed = !parseExpression(cpu_, watch.expression, watch.currentValue);
+		if (prevValue != watch.currentValue)
+			changes = true;
+	}
+
+	if (changes)
+		Update();
+}
+
+bool CtrlWatchList::WindowMessage(UINT msg, WPARAM wParam, LPARAM lParam, LRESULT &returnValue) {
+	switch (msg) {
+	case WM_KEYDOWN:
+		switch (wParam) {
+		case VK_TAB:
+			returnValue = 0;
+			SendMessage(GetParent(GetHandle()), WM_DEB_TABPRESSED, 0, 0);
+			return true;
+		case VK_RETURN:
+			returnValue = 0;
+			EditWatch(GetSelectedIndex());
+			return true;
+		case VK_DELETE:
+			returnValue = 0;
+			DeleteWatch(GetSelectedIndex());
+			return true;
+		default:
+			break;
+		}
+		break;
+	case WM_GETDLGCODE:
+		if (lParam && ((MSG *)lParam)->message == WM_KEYDOWN) {
+			if (wParam == VK_TAB || wParam == VK_RETURN || wParam == VK_DELETE) {
+				returnValue = DLGC_WANTMESSAGE;
+				return true;
+			}
+		}
+		break;
+	case WM_TIMER:
+		if (wParam == IDT_CHECK_REFRESH) {
+			RefreshValues();
+			return true;
+		}
+		break;
+	}
+
+	return false;
+}
+
+void CtrlWatchList::GetColumnText(wchar_t *dest, size_t destSize, int row, int col) {
+	const auto &watch = watches_[row];
+	switch (col) {
+	case WL_NAME:
+		wcsncpy(dest, ConvertUTF8ToWString(watch.name).c_str(), 255);
+		dest[255] = 0;
+		break;
+	case WL_EXPRESSION:
+		wcsncpy(dest, ConvertUTF8ToWString(watch.originalExpression).c_str(), 255);
+		dest[255] = 0;
+		break;
+	case WL_VALUE:
+		if (watch.evaluateFailed) {
+			wcscpy(dest, L"(failed to evaluate)");
+		} else {
+			const uint32_t &value = watch.currentValue;
+			float valuef = 0.0f;
+			switch (watch.format) {
+			case WatchFormat::HEX:
+				wsprintf(dest, L"0x%08X", value);
+				break;
+			case WatchFormat::INT:
+				wsprintf(dest, L"%d", (int32_t)value);
+				break;
+			case WatchFormat::FLOAT:
+				memcpy(&valuef, &value, sizeof(valuef));
+				swprintf_s(dest, destSize, L"%f", valuef);
+				break;
+			case WatchFormat::STR:
+				if (Memory::IsValidAddress(value)) {
+					uint32_t len = Memory::ClampValidSizeAt(value, 255);
+					swprintf_s(dest, destSize, L"%.*S", len, Memory::GetCharPointer(value));
+				} else {
+					wsprintf(dest, L"(0x%08X)", value);
+				}
+				break;
+			}
+		}
+		break;
+	}
+}
+
+void CtrlWatchList::OnRightClick(int itemIndex, int column, const POINT &pt) {
+	if (itemIndex == -1) {
+		switch (TriggerContextMenu(ContextMenuID::CPUADDWATCH, GetHandle(), ContextPoint::FromClient(pt))) {
+		case ID_DISASM_ADDNEWBREAKPOINT:
+			AddWatch();
+			break;
+		}
+	} else {
+		switch (TriggerContextMenu(ContextMenuID::CPUWATCHLIST, GetHandle(), ContextPoint::FromClient(pt))) {
+		case ID_DISASM_EDITBREAKPOINT:
+			EditWatch(itemIndex);
+			break;
+		case ID_DISASM_DELETEBREAKPOINT:
+			DeleteWatch(itemIndex);
+			break;
+		case ID_DISASM_ADDNEWBREAKPOINT:
+			AddWatch();
+			break;
+		}
+	}
+}
+
+bool CtrlWatchList::OnRowPrePaint(int row, LPNMLVCUSTOMDRAW msg) {
+	if (row >= 0 && HasWatchChanged(row)) {
+		msg->clrText = RGB(255, 0, 0);
+		return true;
+	}
+	return false;
+}
+
+void CtrlWatchList::AddWatch() {
+	WatchItemWindow win(nullptr, GetHandle(), cpu_);
+	if (win.Exec()) {
+		WatchInfo info;
+		if (initExpression(cpu_, win.GetExpression().c_str(), info.expression)) {
+			info.name = win.GetName();
+			info.originalExpression = win.GetExpression();
+			info.format = win.GetFormat();
+			watches_.push_back(info);
+			RefreshValues();
+		} else {
+			char errorMessage[512];
+			snprintf(errorMessage, sizeof(errorMessage), "Invalid expression \"%s\": %s", win.GetExpression().c_str(), getExpressionError());
+			MessageBoxA(GetHandle(), errorMessage, "Error", MB_OK);
+		}
+	}
+}
+
+void CtrlWatchList::EditWatch(int pos) {
+	auto &watch = watches_[pos];
+	WatchItemWindow win(nullptr, GetHandle(), cpu_);
+	win.Init(watch.name, watch.originalExpression, watch.format);
+	if (win.Exec()) {
+		if (initExpression(cpu_, win.GetExpression().c_str(), watch.expression)) {
+			watch.name = win.GetName();
+			watch.originalExpression = win.GetExpression();
+			watch.format = win.GetFormat();
+			RefreshValues();
+		} else {
+			char errorMessage[512];
+			snprintf(errorMessage, sizeof(errorMessage), "Invalid expression \"%s\": %s", win.GetExpression().c_str(), getExpressionError());
+			MessageBoxA(GetHandle(), errorMessage, "Error", MB_OK);
+		}
+	}
+}
+
+void CtrlWatchList::DeleteWatch(int pos) {
+	watches_.erase(watches_.begin() + pos);
+	Update();
+}
+
+bool CtrlWatchList::HasWatchChanged(int pos) {
+	return watches_[pos].lastValue != watches_[pos].currentValue;
 }

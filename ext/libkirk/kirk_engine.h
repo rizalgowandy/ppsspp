@@ -24,11 +24,20 @@
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef KIRK_ENGINE
-#define KIRK_ENGINE
-typedef unsigned char u8;
-typedef unsigned short int u16;
-typedef unsigned int u32;
+#pragma once
+
+// kirk4()/kirk7() below take a size_t, and nothing here provided it - the header only ever
+// compiled because whatever included it had pulled in a definition first. Core/HLE/scePspNpDrm_user.cpp
+// includes libkirk before anything else, so it doesn't.
+#include <stddef.h>
+
+#include "kirk_common.h"
+#include "SHA1.h"
+#include "AES.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 //Kirk return values
 #define KIRK_OPERATION_SUCCESS 0
@@ -191,59 +200,97 @@ typedef struct
       0x12: Certificate Check (idstorage signatures)
 */
 
+typedef struct KirkState {
+	u32 g_fuse90;  // This is to match FuseID HW at BC100090 and BC100094
+	u32 g_fuse94;
+
+	AES_ctx aes_kirk1; //global
+	u8 PRNG_DATA[0x14];
+	u8 kirk_buf[0x0814]; // 1DC0 1DD4
+
+	char is_kirk_initialized; //"init" emulation
+} KirkState;
+
 //kirk-like funcs
-int kirk_CMD0(u8* outbuff, u8* inbuff, int size, int generate_trash);
-int kirk_CMD1(u8* outbuff, u8* inbuff, int size);
+int kirk_CMD0(KirkState *kirk, u8* outbuff, const u8* inbuff, int size, int generate_trash);
+int kirk_CMD1(KirkState *kirk, u8* outbuff, u8* inbuff, int size);
 
-int kirk_CMD4(u8* outbuff, u8* inbuff, int size);
-int kirk_CMD7(u8* outbuff, u8* inbuff, int size);
-int kirk_CMD10(u8* inbuff, int insize);
-int kirk_CMD11(u8* outbuff, u8* inbuff, int size);
-int kirk_CMD12(u8* outbuff, int outsize);
-int kirk_CMD13(u8* outbuff, int outsize,u8* inbuff, int insize);
-int kirk_CMD14(u8* outbuff, int outsize);
-int kirk_CMD16(u8* outbuff, int outsize,u8* inbuff, int insize);
-int kirk_CMD17(u8* inbuff, int insize);
+int kirk_CMD4(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD3(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD5(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD7(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD8(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD10(KirkState *kirk, u8* inbuff, int insize);
+int kirk_CMD11(KirkState *kirk, u8* outbuff, const u8* inbuff, int size);
+int kirk_CMD12(KirkState *kirk, u8* outbuff, int outsize);
+int kirk_CMD13(KirkState *kirk, u8* outbuff, int outsize,u8* inbuff, int insize);
+int kirk_CMD14(KirkState *kirk, u8* outbuff, int outsize);
+int kirk_CMD16(KirkState *kirk, u8* outbuff, int outsize,u8* inbuff, int insize);
+int kirk_CMD17(KirkState *kirk, const u8* inbuff, int insize);
+// KIRK command 1's ECDSA check, against the fixed public key on its own curve.
+int kirk1_ecdsa_verify(const u8 *hash, const u8 *r, const u8 *s);
 
-int kirk_init(); //CMD 0xF?
-int kirk_init2(u8 *, u32, u32, u32);
+int kirk_init(KirkState *kirk); //CMD 0xF?
+int kirk_init2(KirkState *kirk, u8 *, u32, u32, u32);
 
 // overhead free functions
 void kirk4(u8* outbuff, const u8* inbuff, size_t size, int keyId);
 void kirk7(u8* outbuff, const u8* inbuff, size_t size, int keyId);
 
 //helper funcs
-u8* kirk_4_7_get_key(int key_type);
+const u8* kirk_4_7_get_key(int key_type);
+void kirk_individual_key(KirkState *kirk, int seed, u8 *key_out);
 
 //kirk "ex" functions
-int kirk_CMD1_ex(u8* outbuff, u8* inbuff, int size, KIRK_CMD1_HEADER* header);
+int kirk_CMD1_ex(KirkState *kirk, u8* outbuff, u8* inbuff, int size, KIRK_CMD1_HEADER* header);
 
 //sce-like func. sceUtilsBufferCopyWithRange is clearly intentionally confusingly named.
-int kirk_sceUtilsBufferCopyWithRange(u8* outbuff, int outsize, const u8* inbuff, int insize, int cmd);
-void decrypt_kirk16_private(u8 *dA_out, u8 *dA_enc);
-void encrypt_kirk16_private(u8 *dA_out, u8 *dA_dec);
+// Also, some commands do write to inbuff!
+int kirk_sceUtilsBufferCopyWithRange(KirkState *kirk, u8* outbuff, int outsize, u8* inbuff, int insize, int cmd);
+void decrypt_kirk16_private(KirkState *kirk, u8 *dA_out, u8 *dA_enc);
+void encrypt_kirk16_private(KirkState *kirk, u8 *dA_out, u8 *dA_dec);
 
 // Prototypes for the Elliptic Curve and Big Number functions
-int ecdsa_get_params(u32 type, u8 *p, u8 *a, u8 *b, u8 *N, u8 *Gx, u8 *Gy);
-int ecdsa_set_curve(u8* p,u8* a,u8* b,u8* N,u8* Gx,u8* Gy);
+int ecdsa_set_curve(const u8* p, const u8* a, const u8* b, const u8* N, const u8* Gx, const u8* Gy);
 void ecdsa_set_pub(u8 *Q);
 void ecdsa_set_priv(u8 *k);
-int ecdsa_verify(u8 *hash, u8 *R, u8 *S);
-void ecdsa_sign(u8 *hash, u8 *R, u8 *S);
+int ecdsa_verify(const u8 *hash, const u8 *R, const u8 *S);
+void ecdsa_sign(KirkState *kirk, const u8 *hash, u8 *R, u8 *S);
 void ec_priv_to_pub(u8 *k, u8 *Q);
-void ec_pub_mult(u8 *k, u8 *Q);
-void bn_copy(u8 *d, u8 *a, u32 n);
-int bn_compare(u8 *a, u8 *b, u32 n);
-void bn_reduce(u8 *d, u8 *N, u32 n);
-void bn_add(u8 *d, u8 *a, u8 *b, u8 *N, u32 n);
-void bn_sub(u8 *d, u8 *a, u8 *b, u8 *N, u32 n);
-void bn_to_mon(u8 *d, u8 *N, u32 n);
-void bn_from_mon(u8 *d, u8 *N, u32 n);
-void bn_mon_mul(u8 *d, u8 *a, u8 *b, u8 *N, u32 n);
-void bn_mon_inv(u8 *d, u8 *a, u8 *N, u32 n);
-void hex_dump(char *str, u8 *buf, int size);
+void ec_pub_mult(const u8 *k, u8 *Q);
+
+// Arithmetic modulo an odd number below 2^160 (both KIRK curves' p and N), on 32-bit words, least
+// significant first. Montgomery form uses R = 2^160.
+#define BN_WORDS 5
+
+typedef struct bn_mod {
+	u32 m[BN_WORDS];
+	u32 minv;           // -m^-1 mod 2^32
+	u32 rr[BN_WORDS];   // R^2 mod m
+	u32 one[BN_WORDS];  // R mod m, 1 in Montgomery form
+} bn_mod;
+
+// Big-endian bytes, as KIRK has them. Inputs of more than 20 bytes have zeros on top.
+void bn_from_bytes(u32 *d, const u8 *b, u32 n);
+void bn_to_bytes(u8 *b, const u32 *a, u32 n);
+void bn_mod_init(bn_mod *M, const u8 *m, u32 n);
+int bn_is_zero(const u32 *a);
+int bn_equal(const u32 *a, const u32 *b);
+// Subtracts m once if a >= m, so takes anything below 2m to below m.
+void bn_reduce(u32 *d, const bn_mod *M);
+// These want their inputs below m.
+void bn_add(u32 *d, const u32 *a, const u32 *b, const bn_mod *M);
+void bn_sub(u32 *d, const u32 *a, const u32 *b, const bn_mod *M);
+void bn_mon_mul(u32 *d, const u32 *a, const u32 *b, const bn_mod *M);
+void bn_to_mon(u32 *d, const u32 *a, const bn_mod *M);
+void bn_from_mon(u32 *d, const u32 *a, const bn_mod *M);
+// Montgomery form in and out. The inverse of 0 comes out as 0.
+void bn_mon_inv(u32 *d, const u32 *a, const bn_mod *M);
 
 #define		round_up(x,n)	(-(-(x) & -(n)))
 
 #define		array_size(x)	(sizeof(x) / sizeof(*(x)))
+
+#ifdef __cplusplus
+}
 #endif

@@ -20,6 +20,7 @@ struct ShiftJIS {
 				return INVALID;
 			}
 			// Intentional fall-through.
+			[[fallthrough]];
 		case 0x9:
 		case 0xE:
 			row = ((j & 0x3F) << 1) - 0x01;
@@ -32,16 +33,27 @@ struct ShiftJIS {
 			} else if (j < 0xFD) {
 				row = ((j & 0x7F) << 1) - 0x1B;
 			} else {
-				return j;
+				return INVALID;
 			}
 			break;
 
-		// Anything else (i.e. <= 0x7x, 0xAx, 0xBx, 0xCx, and 0xDx) is JIS X 0201, return directly.
+		case 0xA:
+			if (j == 0xA0) {
+				return INVALID;
+			}
+			return j;
+
+		// Anything else (i.e. <= 0x7x, 0xBx, 0xCx, and 0xDx) is JIS X 0201, return directly.
 		default:
 			return j;
 		}
 
 		// Okay, if we didn't return, it's time for the second byte (the cell.)
+		if (c_[index_] == 0) {
+			// Truncated sequence right at the end of the string - don't consume the
+			// terminator, or index_ would end up one past it (OOB on the next call).
+			return INVALID;
+		}
 		j = (uint8_t)c_[index_++];
 		// Not a valid second byte.
 		if (j < 0x40 || j == 0x7F || j >= 0xFD) {
@@ -109,8 +121,9 @@ struct ShiftJIS {
 		} else if (row < 0x5F) {
 			// Reduce by 0x40 to account for the above range.
 			*dest++ = 0xE0 + ((row - 0x40 + 1) >> 1);
-		} else if (row >= 0x80) {
-			// TODO
+		} else {
+			// Rows 0x5F-0x7F and 0x80+ are not encodable.
+			return 0;
 		}
 
 		if (row & 1) {

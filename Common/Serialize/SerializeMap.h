@@ -30,6 +30,13 @@ void DoMap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 	case PointerWrap::MODE_READ:
 	{
 		x.clear();
+		// Guard against an attacker-controlled count driving an enormous number of
+		// loop iterations/allocations, same spirit as DoVector's guard.
+		constexpr size_t minElemSize = SerializeMinElemSize<typename M::key_type>() + SerializeMinElemSize<typename M::mapped_type>();
+		if (number > p.Remaining() / minElemSize) {
+			p.SetError(PointerWrap::ERROR_FAILURE);
+			return;
+		}
 		while (number > 0) {
 			typename M::key_type first = typename M::key_type();
 			Do(p, first);
@@ -38,8 +45,8 @@ void DoMap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 			x[first] = second;
 			--number;
 		}
+		break;
 	}
-	break;
 	case PointerWrap::MODE_WRITE:
 	case PointerWrap::MODE_MEASURE:
 	case PointerWrap::MODE_VERIFY:
@@ -52,18 +59,21 @@ void DoMap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 			--number;
 			++itr;
 		}
+		break;
 	}
-	break;
+	case PointerWrap::MODE_NOOP:
+		break;
 	}
 }
 
 template<class K, class T>
 void Do(PointerWrap &p, std::map<K, T *> &x) {
 	if (p.mode == PointerWrap::MODE_READ) {
-		for (auto it = x.begin(), end = x.end(); it != end; ++it) {
-			if (it->second != nullptr)
-				delete it->second;
+		for (auto &iter : x) {
+			delete iter.second;
 		}
+		// Right away: if reading the count fails, DoMap won't get as far as clearing.
+		x.clear();
 	}
 	T *dv = nullptr;
 	DoMap(p, x, dv);
@@ -78,10 +88,11 @@ void Do(PointerWrap &p, std::map<K, T> &x) {
 template<class K, class T>
 void Do(PointerWrap &p, std::unordered_map<K, T *> &x) {
 	if (p.mode == PointerWrap::MODE_READ) {
-		for (auto it = x.begin(), end = x.end(); it != end; ++it) {
-			if (it->second != nullptr)
-				delete it->second;
+		for (auto &iter : x) {
+			delete iter.second;
 		}
+		// Right away: if reading the count fails, DoMap won't get as far as clearing.
+		x.clear();
 	}
 	T *dv = nullptr;
 	DoMap(p, x, dv);
@@ -101,6 +112,13 @@ void DoMultimap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 	case PointerWrap::MODE_READ:
 	{
 		x.clear();
+		// Guard against an attacker-controlled count driving an enormous number of
+		// loop iterations/allocations, same spirit as DoVector's guard.
+		constexpr size_t minElemSize = SerializeMinElemSize<typename M::key_type>() + SerializeMinElemSize<typename M::mapped_type>();
+		if (number > p.Remaining() / minElemSize) {
+			p.SetError(PointerWrap::ERROR_FAILURE);
+			return;
+		}
 		while (number > 0) {
 			typename M::key_type first = typename M::key_type();
 			Do(p, first);
@@ -109,8 +127,8 @@ void DoMultimap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 			x.insert(std::make_pair(first, second));
 			--number;
 		}
+		break;
 	}
-	break;
 	case PointerWrap::MODE_WRITE:
 	case PointerWrap::MODE_MEASURE:
 	case PointerWrap::MODE_VERIFY:
@@ -122,18 +140,21 @@ void DoMultimap(PointerWrap &p, M &x, typename M::mapped_type &default_val) {
 			--number;
 			++itr;
 		}
+		break;
 	}
-	break;
+	case PointerWrap::MODE_NOOP:
+		break;
 	}
 }
 
 template<class K, class T>
 void Do(PointerWrap &p, std::multimap<K, T *> &x) {
 	if (p.mode == PointerWrap::MODE_READ) {
-		for (auto it = x.begin(), end = x.end(); it != end; ++it) {
-			if (it->second != nullptr)
-				delete it->second;
+		for (auto &iter : x) {
+			delete iter.second;
 		}
+		// Right away: if reading the count fails, DoMap won't get as far as clearing.
+		x.clear();
 	}
 	T *dv = nullptr;
 	DoMultimap(p, x, dv);
@@ -148,10 +169,11 @@ void Do(PointerWrap &p, std::multimap<K, T> &x) {
 template<class K, class T>
 void Do(PointerWrap &p, std::unordered_multimap<K, T *> &x) {
 	if (p.mode == PointerWrap::MODE_READ) {
-		for (auto it = x.begin(), end = x.end(); it != end; ++it) {
-			if (it->second != nullptr)
-				delete it->second;
+		for (auto &iter : x) {
+			delete iter.second;
 		}
+		// Right away: if reading the count fails, DoMap won't get as far as clearing.
+		x.clear();
 	}
 	T *dv = nullptr;
 	DoMultimap(p, x, dv);

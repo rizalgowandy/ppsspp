@@ -17,11 +17,12 @@
 
 #include <algorithm>
 #include <unordered_map>
+
 #include "Common/StringUtils.h"
 #include "Core/Debugger/WebSocket/InputSubscriber.h"
 #include "Core/Debugger/WebSocket/WebSocketUtils.h"
 #include "Core/HLE/sceCtrl.h"
-#include "Core/HLE/sceDisplay.h"
+#include "Core/HW/Display.h"
 
 // This is also used in InputBroadcaster.
 const std::unordered_map<std::string, uint32_t> buttonLookup = {
@@ -50,6 +51,11 @@ const std::unordered_map<std::string, uint32_t> buttonLookup = {
 	{ "forward", CTRL_FORWARD },
 	{ "back", CTRL_BACK },
 	{ "playpause", CTRL_PLAYPAUSE },
+	// Obscure unmapped keys, see issue #17464
+	{ "l2", CTRL_L2 },
+	{ "l3", CTRL_L3 },
+	{ "r2", CTRL_R2 },
+	{ "r3", CTRL_R3 },
 };
 
 struct WebSocketInputState : public DebuggerSubscriber {
@@ -64,12 +70,12 @@ protected:
 		std::string ticket;
 		uint32_t button;
 		uint32_t duration;
+		int pressId;
 
 		std::string Event();
 	};
 
 	std::vector<PressInfo> pressTickets_;
-	int lastCounter_ = -1;
 };
 
 std::string WebSocketInputState::PressInfo::Event() {
@@ -89,9 +95,9 @@ const std::unordered_map<std::string, uint32_t> &WebSocketInputButtonLookup() {
 
 DebuggerSubscriber *WebSocketInputInit(DebuggerEventHandlerMap &map) {
 	auto p = new WebSocketInputState();
-	map["input.buttons.send"] = std::bind(&WebSocketInputState::ButtonsSend, p, std::placeholders::_1);
-	map["input.buttons.press"] = std::bind(&WebSocketInputState::ButtonsPress, p, std::placeholders::_1);
-	map["input.analog.send"] = std::bind(&WebSocketInputState::AnalogSend, p, std::placeholders::_1);
+	map["input.buttons.send"] = [p](DebuggerRequest &req) { p->ButtonsSend(req); };
+	map["input.buttons.press"] = [p](DebuggerRequest &req) { p->ButtonsPress(req); };
+	map["input.analog.send"] = [p](DebuggerRequest &req) { p->AnalogSend(req); };
 
 	return p;
 }
@@ -128,7 +134,7 @@ DebuggerSubscriber *WebSocketInputInit(DebuggerEventHandlerMap &map) {
 //  - back: back button on headset.
 //  - playpause: play/pause button on headset.
 //
-// Empty response.
+// Response (same event name) with no extra data.
 void WebSocketInputState::ButtonsSend(DebuggerRequest &req) {
 	const JsonNode *jsonButtons = req.data.get("buttons");
 	if (!jsonButtons) {
@@ -155,12 +161,7 @@ void WebSocketInputState::ButtonsSend(DebuggerRequest &req) {
 		}
 	}
 
-	if (downFlags) {
-		__CtrlButtonDown(downFlags);
-	}
-	if (upFlags) {
-		__CtrlButtonUp(upFlags);
-	}
+	__CtrlUpdateButtons(downFlags, upFlags);
 
 	req.Respond();
 }
@@ -169,9 +170,10 @@ void WebSocketInputState::ButtonsSend(DebuggerRequest &req) {
 //
 // Parameters:
 //  - button: required string indicating button name (see input.buttons.send.)
-//  - duration: optional integer indicating frames to press for, defaults to 1.
+//  - duration: optional integer indicating frames to press for, defaults to 1. Counted in emulated
+//    vblanks: the game sees the button in exactly that many vblank samples.
 //
-// Empty response once released.
+// Response (same event name) with no extra data once released.
 void WebSocketInputState::ButtonsPress(DebuggerRequest &req) {
 	std::string button;
 	if (!req.ParamString("button", &button))
@@ -181,7 +183,7 @@ void WebSocketInputState::ButtonsPress(DebuggerRequest &req) {
 	press.duration = 1;
 	if (!req.ParamU32("duration", &press.duration, false, DebuggerParamType::OPTIONAL))
 		return;
-	if (press.duration < 0)
+	if ((int)press.duration < 0)
 		return req.Fail("Parameter 'duration' must not be negative");
 	const JsonNode *value = req.data.get("ticket");
 	press.ticket = value ? json_stringify(value) : "";
@@ -192,27 +194,24 @@ void WebSocketInputState::ButtonsPress(DebuggerRequest &req) {
 	}
 	press.button = info->second;
 
-	__CtrlButtonDown(press.button);
+	// Released by sceCtrl after that many vblanks of emulated time, so a scripted press lasts the
+	// same however fast the emulator runs. This thread only reports when it's over.
+	press.pressId = __CtrlPressFor(press.button, (int)press.duration);
 	pressTickets_.push_back(press);
 }
 
 void WebSocketInputState::Broadcast(net::WebSocketServer *ws) {
-	int counter = __DisplayGetNumVblanks();
-	if (pressTickets_.empty() || lastCounter_ == counter)
+	if (pressTickets_.empty())
 		return;
-	lastCounter_ = counter;
-
+	auto done = [](const PressInfo &press) -> bool {
+		return !__CtrlPressActive(press.pressId);
+	};
 	for (PressInfo &press : pressTickets_) {
-		press.duration--;
-		if (press.duration == -1) {
-			__CtrlButtonUp(press.button);
+		if (done(press)) {
 			ws->Send(press.Event());
 		}
 	}
-	auto negative = [](const PressInfo &press) -> bool {
-		return press.duration < 0;
-	};
-	pressTickets_.erase(std::remove_if(pressTickets_.begin(), pressTickets_.end(), negative), pressTickets_.end());
+	pressTickets_.erase(std::remove_if(pressTickets_.begin(), pressTickets_.end(), done), pressTickets_.end());
 }
 
 static bool AnalogValue(DebuggerRequest &req, float *value, const char *name) {
@@ -227,7 +226,7 @@ static bool AnalogValue(DebuggerRequest &req, float *value, const char *name) {
 	}
 
 	double val = node->value.toNumber();
-	if (val < 1.0 || val > 1.0) {
+	if (val < -1.0 || val > 1.0) {
 		req.Fail(StringFromFormat("Parameter '%s' must be between -1.0 and 1.0", name));
 		return false;
 	}
@@ -243,7 +242,7 @@ static bool AnalogValue(DebuggerRequest &req, float *value, const char *name) {
 //  - y: required number from -1.0 to 1.0.
 //  - stick: optional string, either "left" (default) or "right".
 //
-// Empty response.
+// Response (same event name) with no extra data.
 void WebSocketInputState::AnalogSend(DebuggerRequest &req) {
 	std::string stick = "left";
 	if (!req.ParamString("stick", &stick, DebuggerParamType::OPTIONAL))
@@ -254,8 +253,8 @@ void WebSocketInputState::AnalogSend(DebuggerRequest &req) {
 	if (!AnalogValue(req, &x, "x") || !AnalogValue(req, &y, "y"))
 		return;
 
-	__CtrlSetAnalogX(x, stick == "left" ? CTRL_STICK_LEFT : CTRL_STICK_RIGHT);
-	__CtrlSetAnalogY(y, stick == "left" ? CTRL_STICK_LEFT : CTRL_STICK_RIGHT);
+	// TODO: Route into the control mapper's PSPKey function or similar instead.
+	__CtrlSetAnalogXY(stick == "left" ? CTRL_STICK_LEFT : CTRL_STICK_RIGHT, x, y);
 
 	req.Respond();
 }

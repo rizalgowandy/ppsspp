@@ -9,7 +9,6 @@
 // OR it contains ONLY other chunks
 // otherwise the scheme breaks.
 
-#include <string>
 #include <cstdint>
 
 class RIFFReader {
@@ -21,7 +20,7 @@ public:
 	void Ascend();
 
 	int ReadInt();
-	void ReadData(void *data, int count);
+	bool ReadData(void *data, int count);  // Read count bytes into data, return false if hits EOF during read.
 
 	int GetCurrentChunkSize();
 

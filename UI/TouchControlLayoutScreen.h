@@ -17,29 +17,32 @@
 
 #pragma once
 
-#include <functional>
-#include <vector>
-
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
-#include "MiscScreens.h"
+#include "Common/UI/TabHolder.h"
+#include "BaseScreens.h"
 
 class ControlLayoutView;
 
-class TouchControlLayoutScreen : public UIDialogScreenWithBackground {
+class TouchControlLayoutScreen : public UIBaseDialogScreen {
 public:
-	TouchControlLayoutScreen();
+	// The controls go where they will be in the game.
+	bool LimitContentArea() const override { return false; }
+	TouchControlLayoutScreen(const Path &gamePath) : UIBaseDialogScreen(gamePath) {}
 
-	virtual void CreateViews() override;
-	virtual void dialogFinished(const Screen *dialog, DialogResult result) override;
-	virtual void onFinish(DialogResult reason) override;
-	virtual void update() override;
-	virtual void resized() override;
+	void CreateViews() override;
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+	void onFinish(DialogResult reason) override;
+	void update() override;
+	void resized() override;
+
+	const char *tag() const override { return "TouchControlLayout"; }
 
 protected:
-	virtual UI::EventReturn OnReset(UI::EventParams &e);
-	virtual UI::EventReturn OnVisibility(UI::EventParams &e);
-	virtual UI::EventReturn OnMode(UI::EventParams &e);
+	// The same as EmuScreen's, so the controls go where they will be in the game.
+	ViewLayoutMode LayoutMode() const override;
+	void OnReset(UI::EventParams &e);
+	void OnMode(UI::EventParams &e);
 
 private:
 	UI::ChoiceStrip *mode_ = nullptr;

@@ -61,19 +61,19 @@ void IRFrontend::Comp_IType(MIPSOpcode op) {
 	switch (op >> 26) {
 	case 8:	// same as addiu?
 	case 9:	// R(rt) = R(rs) + simm; break;	//addiu
-		ir.Write(IROp::AddConst, rt, rs, ir.AddConstant(simm));
+		ir.Write(IROp::AddConst, rt, rs, 0, (u32)simm);
 		break;
 
-	case 12: ir.Write(IROp::AndConst, rt, rs, ir.AddConstant(uimm)); break;
-	case 13: ir.Write(IROp::OrConst, rt, rs, ir.AddConstant(uimm)); break;
-	case 14: ir.Write(IROp::XorConst, rt, rs, ir.AddConstant(uimm)); break;
+	case 12: ir.Write(IROp::AndConst, rt, rs, 0, uimm); break;
+	case 13: ir.Write(IROp::OrConst, rt, rs, 0, uimm); break;
+	case 14: ir.Write(IROp::XorConst, rt, rs, 0, uimm); break;
 
 	case 10: // R(rt) = (s32)R(rs) < simm; break; //slti
-		ir.Write(IROp::SltConst, rt, rs, ir.AddConstant(simm));
+		ir.Write(IROp::SltConst, rt, rs, 0, (u32)simm);
 		break;
 
 	case 11: // R(rt) = R(rs) < suimm; break; //sltiu
-		ir.Write(IROp::SltUConst, rt, rs, ir.AddConstant(suimm));
+		ir.Write(IROp::SltUConst, rt, rs, 0, suimm);
 		break;
 
 	case 15: // R(rt) = uimm << 16;	 //lui
@@ -118,7 +118,7 @@ void IRFrontend::Comp_RType3(MIPSOpcode op) {
 	MIPSGPReg rd = _RD;
 
 	// noop, won't write to ZERO.
-	if (rd == 0)
+	if (rd == MIPS_REG_ZERO)
 		return;
 
 	switch (op & 63) {
@@ -192,8 +192,14 @@ void IRFrontend::CompShiftVar(MIPSOpcode op, IROp shiftOp) {
 	MIPSGPReg rd = _RD;
 	MIPSGPReg rt = _RT;
 	MIPSGPReg rs = _RS;
-	ir.Write(IROp::AndConst, IRTEMP_0, rs, ir.AddConstant(31));
-	ir.Write(shiftOp, rd, rt, IRTEMP_0);
+
+	if (opts.optimizeForInterpreter) {
+		// The interpreter already masks where needed, don't need to generate extra ops.
+		ir.Write(shiftOp, rd, rt, rs);
+	} else {
+		ir.Write(IROp::AndConst, IRTEMP_0, rs, 0, (u32)31);
+		ir.Write(shiftOp, rd, rt, IRTEMP_0);
+	}
 }
 
 void IRFrontend::Comp_ShiftType(MIPSOpcode op) {
@@ -206,13 +212,13 @@ void IRFrontend::Comp_ShiftType(MIPSOpcode op) {
 	if (rd == MIPS_REG_ZERO)
 		return;
 
-	// WARNING: srl/rotr and srlv/rotrv share encodings (differentiated using unused bits.)
+	// WARNING: srl/rotr and srlv/rotrv share encodings, told apart by the low bit of the unused field.
 	switch (op & 0x3f) {
 	case 0: CompShiftImm(op, IROp::ShlImm, sa); break; //sll
-	case 2: CompShiftImm(op, (rs == 1 ? IROp::RorImm : IROp::ShrImm), sa); break;	//srl
+	case 2: CompShiftImm(op, ((rs & 1) ? IROp::RorImm : IROp::ShrImm), sa); break;	//srl
 	case 3: CompShiftImm(op, IROp::SarImm, sa); break; //sra
 	case 4: CompShiftVar(op, IROp::Shl); break; //sllv
-	case 6: CompShiftVar(op, (sa == 1 ? IROp::Ror : IROp::Shr)); break; //srlv
+	case 6: CompShiftVar(op, ((sa & 1) ? IROp::Ror : IROp::Shr)); break; //srlv
 	case 7: CompShiftVar(op, IROp::Sar); break; //srav
 
 	default:
@@ -238,21 +244,34 @@ void IRFrontend::Comp_Special3(MIPSOpcode op) {
 	case 0x0: // ext
 		if (pos != 0) {
 			ir.Write(IROp::ShrImm, rt, rs, pos);
-			ir.Write(IROp::AndConst, rt, rt, ir.AddConstant(mask));
+			ir.Write(IROp::AndConst, rt, rt, 0, mask);
 		} else {
-			ir.Write(IROp::AndConst, rt, rs, ir.AddConstant(mask));
+			ir.Write(IROp::AndConst, rt, rs, 0, mask);
 		}
 		break;
 
 	case 0x4: //ins
 	{
+		// TODO: Might be good to support natively in the interpreter. Though, would have to
+		// abuse a register as a constant
 		u32 sourcemask = mask >> pos;
 		u32 destmask = ~(sourcemask << pos);
-		ir.Write(IROp::AndConst, IRTEMP_0, rs, ir.AddConstant(sourcemask));
-		if (pos != 0) {
-			ir.Write(IROp::ShlImm, IRTEMP_0, IRTEMP_0, pos);
+
+		if (size != 32) {
+			// Need to use the sourcemask.
+			ir.Write(IROp::AndConst, IRTEMP_0, rs, 0, sourcemask);
+			if (pos != 0) {
+				ir.Write(IROp::ShlImm, IRTEMP_0, IRTEMP_0, pos);
+			}
+		} else {
+			// If the shl takes care of the sourcemask, don't need to and.
+			if (pos != 0) {
+				ir.Write(IROp::ShlImm, IRTEMP_0, rs, pos);
+			} else {
+				ir.Write(IROp::Mov, IRTEMP_0, rs);
+			}
 		}
-		ir.Write(IROp::AndConst, rt, rt, ir.AddConstant(destmask));
+		ir.Write(IROp::AndConst, rt, rt, 0, destmask);
 		ir.Write(IROp::Or, rt, rt, IRTEMP_0);
 	}
 	break;
@@ -273,7 +292,7 @@ void IRFrontend::Comp_Allegrex(MIPSOpcode op) {
 	if (rd == MIPS_REG_ZERO)
 		return;
 
-	switch ((op >> 6) & 31) {
+	switch (AllegrexBitOp(op)) {
 	case 16: // seb	// R(rd) = SignExtend8ToU32(R(rt));
 		ir.Write(IROp::Ext8to32, rd, rt);
 		break;
@@ -298,14 +317,14 @@ void IRFrontend::Comp_Allegrex2(MIPSOpcode op) {
 	MIPSGPReg rd = _RD;
 
 	// Don't change $zr.
-	if (rd == 0)
+	if (rd == MIPS_REG_ZERO)
 		return;
 
-	switch (op & 0x3ff) {
-	case 0xA0: //wsbh
+	switch (AllegrexBitOp(op)) {
+	case 2: //wsbh
 		ir.Write(IROp::BSwap16, rd, rt);
 		break;
-	case 0xE0: //wsbw
+	case 3: //wsbw
 		ir.Write(IROp::BSwap32, rd, rt);
 		break;
 	default:

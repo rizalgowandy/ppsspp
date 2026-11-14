@@ -20,7 +20,9 @@
 #include <cstdint>
 #include <vector>
 
+#include "Common/CommonWindows.h"
 #include <d3d11.h>
+#include <wrl/client.h>
 
 class PushBufferD3D11 {
 public:
@@ -34,10 +36,9 @@ public:
 	}
 	PushBufferD3D11(PushBufferD3D11 &) = delete;
 	~PushBufferD3D11() {
-		buffer_->Release();
 	}
 	ID3D11Buffer *Buf() const {
-		return buffer_;
+		return buffer_.Get();
 	}
 
 	// Should be done each frame
@@ -46,7 +47,11 @@ public:
 		nextMapDiscard_ = true;
 	}
 
+	// Returns null if the buffer can't be mapped (after device removal, for example). Skip the draw then.
 	uint8_t *BeginPush(ID3D11DeviceContext *context, UINT *offset, size_t size, int align = 16) {
+		if (!buffer_) {
+			return nullptr;
+		}
 		D3D11_MAPPED_SUBRESOURCE map;
 		pos_ = (pos_ + align - 1) & ~(align - 1);
 		if (pos_ + size > size_) {
@@ -55,7 +60,10 @@ public:
 			pos_ = 0;
 			nextMapDiscard_ = true;
 		}
-		context->Map(buffer_, 0, nextMapDiscard_ ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &map);
+		if (FAILED(context->Map(buffer_.Get(), 0, nextMapDiscard_ ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &map))) {
+			return nullptr;
+		}
+		mapped_ = true;
 		nextMapDiscard_ = false;
 		*offset = (UINT)pos_;
 		uint8_t *retval = (uint8_t *)map.pData + pos_;
@@ -63,40 +71,26 @@ public:
 		return retval;
 	}
 	void EndPush(ID3D11DeviceContext *context) {
-		context->Unmap(buffer_, 0);
+		if (mapped_) {
+			context->Unmap(buffer_.Get(), 0);
+			mapped_ = false;
+		}
 	}
 
 private:
-	ID3D11Buffer *buffer_ = nullptr;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> buffer_;
 	size_t pos_ = 0;
 	size_t size_;
 	bool nextMapDiscard_ = false;
+	bool mapped_ = false;
 };
 
-std::vector<uint8_t> CompileShaderToBytecodeD3D11(const char *code, size_t codeSize, const char *target, UINT flags);
+std::vector<uint8_t> CompileShaderToBytecodeD3D11(const char *code, size_t codeSize, const char *target, UINT flags, std::string *errorMessage = nullptr);
 
-ID3D11VertexShader *CreateVertexShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, std::vector<uint8_t> *byteCodeOut, D3D_FEATURE_LEVEL featureLevel, UINT flags = 0);
-ID3D11PixelShader *CreatePixelShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags = 0);
-ID3D11ComputeShader *CreateComputeShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags = 0);
-ID3D11GeometryShader *CreateGeometryShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags = 0);
-
-class StockObjectsD3D11 {
-public:
-	void Create(ID3D11Device *device);
-	void Destroy();
-
-	ID3D11DepthStencilState *depthStencilDisabled;
-	ID3D11DepthStencilState *depthDisabledStencilWrite;
-	ID3D11BlendState *blendStateDisabledWithColorMask[16];
-	ID3D11RasterizerState *rasterStateNoCull;
-	ID3D11SamplerState *samplerPoint2DWrap;
-	ID3D11SamplerState *samplerLinear2DWrap;
-	ID3D11SamplerState *samplerPoint2DClamp;
-	ID3D11SamplerState *samplerLinear2DClamp;
-};
+HRESULT CreateVertexShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, std::vector<uint8_t> *byteCodeOut, D3D_FEATURE_LEVEL featureLevel, UINT flags, ID3D11VertexShader **);
+HRESULT CreatePixelShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags, ID3D11PixelShader **);
+HRESULT CreateComputeShaderD3D11(ID3D11Device *device, const char *code, size_t codeSize, D3D_FEATURE_LEVEL featureLevel, UINT flags, ID3D11ComputeShader **);
 
 #define ASSERT_SUCCESS(x) \
 	if (!SUCCEEDED((x))) \
 		Crash();
-
-extern StockObjectsD3D11 stockD3D11;

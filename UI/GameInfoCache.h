@@ -17,20 +17,24 @@
 
 #pragma once
 
+#include <ctime>
 #include <string>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
 
+#include "Common/Thread/Event.h"
+#include "Common/Thread/ThreadManager.h"
 #include "Core/ELF/ParamSFO.h"
-#include "UI/TextureUtil.h"
+#include "Core/Util/PSARUnpack.h"
+#include "Common/File/Path.h"
 
 namespace Draw {
 	class DrawContext;
 	class Texture;
 }
-class PrioritizedWorkQueue;
 
 // A GameInfo holds information about a game, and also lets you do things that the VSH
 // does on the PSP, namely checking for and deleting savedata, and similar things.
@@ -38,73 +42,113 @@ class PrioritizedWorkQueue;
 
 // A GameInfo object can also represent a piece of savedata.
 
-// Guessed from GameID, not necessarily accurate
-enum GameRegion {
-	GAMEREGION_JAPAN,
-	GAMEREGION_USA,
-	GAMEREGION_EUROPE,
-	GAMEREGION_HONGKONG,
-	GAMEREGION_ASIA,
-	GAMEREGION_KOREA,
-	GAMEREGION_OTHER,
-	GAMEREGION_MAX,
+enum class GameInfoFlags {
+	EMPTY = 0x00,
+	FILE_TYPE = 0x01,  // Don't need to specify this, always included.
+	PARAM_SFO = 0x02,
+	ICON = 0x04,
+	PIC1 = 0x08,
+	PIC0 = 0x10,
+	SND = 0x20,
+	SIZE = 0x40,
+	UNCOMPRESSED_SIZE = 0x80,
+	SAVEDATA_SIZE = 0x100,
+	ICON1_PMF = 0x200,
+	BUNDLED_UPDATE_INFO = 0x400,  // The firmware updater that most game discs carry. ISO only.
 };
-
-enum GameInfoWantFlags {
-	GAMEINFO_WANTBG = 0x01,
-	GAMEINFO_WANTSIZE = 0x02,
-	GAMEINFO_WANTSND = 0x04,
-	GAMEINFO_WANTBGDATA = 0x08, // Use with WANTBG.
-};
+ENUM_CLASS_BITOPS(GameInfoFlags);
 
 class FileLoader;
 enum class IdentifiedFileType;
 
 struct GameInfoTex {
 	std::string data;
-	std::unique_ptr<ManagedTexture> texture;
+	Draw::Texture *texture = nullptr;
 	// The time at which the Icon and the BG were loaded.
 	// Can be useful to fade them in smoothly once they appear.
+	// Also, timeLoaded != 0 && texture == nullptr means that the load failed.
 	double timeLoaded = 0.0;
 	std::atomic<bool> dataLoaded{};
 
-	void Clear() {
-		if (!data.empty()) {
-			data.clear();
-			dataLoaded = false;
-		}
-		texture.reset(nullptr);
+	// Can ONLY be called from the main thread!
+	void Clear();
+	bool Failed() const {
+		return timeLoaded != 0.0 && !texture;
 	}
 };
 
 class GameInfo {
 public:
-	GameInfo();
+	GameInfo(const Path &gamePath);
 	~GameInfo();
 
-	bool Delete();  // Better be sure what you're doing when calling this.
-	bool DeleteAllSaveData();
-	bool LoadFromPath(const std::string &gamePath);
+	bool Delete();  // Better be sure what you're doing when calling this. Will move to trash if available on the system, though.
+	bool DeleteAllSaveData() const;
+	bool CreateLoader();
+
+	bool HasFileLoader() const {
+		return fileLoader.get() != nullptr;
+	}
 
 	std::shared_ptr<FileLoader> GetFileLoader();
 	void DisposeFileLoader();
 
-	u64 GetGameSizeInBytes();
-	u64 GetSaveDataSizeInBytes();
-	u64 GetInstallDataSizeInBytes();
+	u64 GetSizeUncompressedInBytes();  // NOTE: More expensive than GetGameSizeOnDiskInBytes().
+	u64 GetSizeOnDiskInBytes();
+	u64 GetGameSavedataSizeInBytes() const;  // For games
+	u64 GetInstallDataSizeInBytes() const;
 
-	void ParseParamSFO();
+	// For various kinds of savedata, mainly. Read along with SIZE, empty before that.
+	std::string GetMTime() const;
+	// The file whose modification time GetMTime() shows.
+	Path GetMTimePath() const;
 
-	std::vector<std::string> GetSaveDataDirectories();
+	void ParseParamSFO(IdentifiedFileType type);
+	const ParamSFOData &GetParamSFO() const {
+		_dbg_assert_(hasFlags & GameInfoFlags::PARAM_SFO);
+		return paramSFO;
+	}
+	void FinishPendingTextureLoads(Draw::DrawContext *draw);
+
+	std::vector<Path> GetSaveDataDirectories() const;
 
 	std::string GetTitle();
+	std::string GetDBTitle();  // Falls back to GetTitle if not in the DB.
+
 	void SetTitle(const std::string &newTitle);
 
-	GameInfoTex *GetBGPic() {
+	const Path &GetFilePath() const {
+		return filePath_;
+	}
+
+	bool Ready(GameInfoFlags flags) {
+		std::unique_lock<std::mutex> guard(lock);
+		// Avoid the operator, we want to check all the bits.
+		return ((int)hasFlags & (int)flags) == (int)flags;
+	}
+
+	// Blocks the calling thread until the specified flags have been loaded. Note that you must
+	// have requested them through GetInfo first, otherwise nobody will ever compute them and
+	// this will simply hang.
+	// Only use this where there's really no way to wait asynchronously by polling Ready() every
+	// frame - loading can take a while, especially from slow or remote storage.
+	void WaitUntilReady(GameInfoFlags flags) {
+		std::unique_lock<std::mutex> guard(lock);
+		readyCond.wait(guard, [this, flags]() {
+			// Avoid the operator, we want to check all the bits.
+			return ((int)hasFlags & (int)flags) == (int)flags;
+		});
+	}
+
+	void MarkReadyNoLock(GameInfoFlags flags) {
+		hasFlags |= flags;
+		pendingFlags &= ~flags;
+		readyCond.notify_all();
+	}
+
+	GameInfoTex *GetPIC1() {
 		if (pic1.texture)
 			return &pic1;
-		if (pic0.texture)
-			return &pic0;
 		return nullptr;
 	}
 
@@ -114,44 +158,64 @@ public:
 	// to it.
 	std::mutex lock;
 
+	// Signalled whenever flags are marked as ready, see WaitUntilReady. Goes with the lock above.
+	std::condition_variable readyCond;
+
+	// Controls access to the fileLoader pointer.
+	std::mutex loaderLock;
+
+	// Keep track of what we have, or what we're processing.
+	// These are protected by the mutex. While pendingFlags != 0, something is being loaded.
+	GameInfoFlags hasFlags{};
+	GameInfoFlags pendingFlags{};
+
 	std::string id;
 	std::string id_version;
 	int disc_total = 0;
 	int disc_number = 0;
-	int region = -1;
+	GameRegion region = GameRegion::UNKNOWN;
 	IdentifiedFileType fileType;
-	ParamSFOData paramSFO;
-	bool paramSFOLoaded = false;
 	bool hasConfig = false;
 
-	// Pre read the data, create a texture the next time (GL thread..)
+	// Pre read the data, create a texture the next time
 	GameInfoTex icon;
 	GameInfoTex pic0;
 	GameInfoTex pic1;
+	std::string icon1pmf;
 
 	std::string sndFileData;
 	std::atomic<bool> sndDataLoaded{};
 
-	int wantFlags = 0;
-
 	double lastAccessedTime = 0.0;
 
-	u64 gameSize = 0;
+	u64 gameSizeUncompressed = 0;
+	u64 gameSizeOnDisk = 0;  // compressed size, in case of CSO
 	u64 saveDataSize = 0;
 	u64 installDataSize = 0;
-	std::atomic<bool> pending{};
-	std::atomic<bool> working{};
+	// With SIZE.
+	bool hasMTime = false;
+	tm mtime{};
+
+	// The firmware updater bundled on the disc, if any - see GameInfoFlags::BUNDLED_UPDATE_INFO.
+	// Always left empty for anything that isn't an ISO.
+	BundledUpdateInfo bundledUpdate;
+
+	std::string errorString;
 
 protected:
+	ParamSFOData paramSFO;
 	// Note: this can change while loading, use GetTitle().
 	std::string title;
 
 	// TODO: Get rid of this shared_ptr and managae lifetime better instead.
 	std::shared_ptr<FileLoader> fileLoader;
-	std::string filePath_;
+	Path filePath_;
+
+	void SetupTexture(Draw::DrawContext *draw, GameInfoTex &tex, int maxWidth = 8192, int maxHeight = 8192);
 
 private:
 	DISALLOW_COPY_AND_ASSIGN(GameInfo);
+	friend class GameInfoWorkItem;
 };
 
 class GameInfoCache {
@@ -159,7 +223,7 @@ public:
 	GameInfoCache();
 	~GameInfoCache();
 
-	// This creates a background worker thread!
+	// Cancels in-flight loads and drops everything, textures included. Main thread only.
 	void Clear();
 	void PurgeType(IdentifiedFileType fileType);
 
@@ -167,26 +231,29 @@ public:
 	// but filled in later asynchronously in the background. So keep calling this,
 	// redrawing the UI often. Only set flags to GAMEINFO_WANTBG or WANTSND if you really want them 
 	// because they're big. bgTextures and sound may be discarded over time as well.
-	std::shared_ptr<GameInfo> GetInfo(Draw::DrawContext *draw, const std::string &gamePath, int wantFlags);
+	// NOTE: This never returns null, so you don't need to check for that. Do check Ready() flags though.
+	// It's OK to pass in nullptr for draw if you don't need the actual texture right now.
+	// priority orders the background loads: NORMAL for what's on screen, LOW for speculative work like
+	// search. HIGH is for a one-off request you're about to block on: it doesn't wait behind a
+	// lower-priority load that's already queued for the same data, it queues its own - so don't use it
+	// every frame.
+	std::shared_ptr<GameInfo> GetInfo(Draw::DrawContext *draw, const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags = nullptr, GameInfoFlags refetchFlags = GameInfoFlags::EMPTY, TaskPriority priority = TaskPriority::NORMAL);
 	void FlushBGs();  // Gets rid of all BG textures. Also gets rid of bg sounds.
 
-	PrioritizedWorkQueue *WorkQueue() { return gameInfoWQ_; }
-
 	void CancelAll();
-	void WaitUntilDone(std::shared_ptr<GameInfo> &info);
 
 private:
-	void Init();
 	void Shutdown();
-	void SetupTexture(std::shared_ptr<GameInfo> &info, Draw::DrawContext *draw, GameInfoTex &tex);
 
 	// Maps ISO path to info. Need to use shared_ptr as we can return these pointers - 
 	// and if they get destructed while being in use, that's bad.
 	std::map<std::string, std::shared_ptr<GameInfo> > info_;
-
-	// Work queue and management
-	PrioritizedWorkQueue *gameInfoWQ_;
+	std::mutex mapLock_;
 };
 
 // This one can be global, no good reason not to.
 extern GameInfoCache *g_gameInfoCache;
+
+// Whether a folder in PSP/SAVEDATA holds data a game installed (or downloaded) there, rather than a save.
+// Games write those files with sceIo rather than the savedata utility, so PARAM.SFO's file list leaves them out.
+bool IsInstalledGameData(const Path &saveDir);

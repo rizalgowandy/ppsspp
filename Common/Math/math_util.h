@@ -7,28 +7,12 @@
 #include <cstring>
 #include <cstdint>
 
-typedef unsigned short float16;
-
-// This ain't a 1.5.10 float16, it's a stupid hack format where we chop 16 bits off a float.
-// This choice is subject to change. Don't think I'm using this for anything at all now anyway.
-// DEPRECATED
-inline float16 FloatToFloat16(float x) {
-	int ix;
-	memcpy(&ix, &x, sizeof(float));
-	return ix >> 16;
-}
-
-inline float Float16ToFloat(float16 ix) {
-	float x;
-	memcpy(&x, &ix, sizeof(float));
-	return x;
-}
-
-inline bool isPowerOf2(int n) {
+inline constexpr bool isPowerOf2(int n) {
 	return n == 1 || (n & (n - 1)) == 0;
 }
 
-inline uint32_t RoundUpToPowerOf2(uint32_t v) {
+// Next power of 2 (NOTE: Not next multiple of a power of two, like the below function!)
+inline constexpr uint32_t RoundToNextPowerOf2(uint32_t v) {
 	v--;
 	v |= v >> 1;
 	v |= v >> 2;
@@ -39,8 +23,18 @@ inline uint32_t RoundUpToPowerOf2(uint32_t v) {
 	return v;
 }
 
+// NOTE: multiple must be a power of two!
+inline constexpr uint32_t RoundUpToMultipleOf(uint32_t v, uint32_t multiple) {
+	return (v + multiple - 1) & ~(multiple - 1);
+}
+
+inline constexpr uint32_t RoundDownToMultipleOf(uint32_t v, uint32_t multiple) {
+	return v & ~(multiple - 1);
+}
+
+// TODO: this should just use a bitscan.
 inline uint32_t log2i(uint32_t val) {
-	unsigned int ret = -1;
+	unsigned int ret = (unsigned int)-1;
 	while (val != 0) {
 		val >>= 1; ret++;
 	}
@@ -60,6 +54,13 @@ inline T clamp_value(T val, T floor, T cap) {
 		return floor;
 	else
 		return val;
+}
+
+// Very common operation, familiar from shaders.
+inline float saturatef(float x) {
+	if (x > 1.0f) return 1.0f;
+	else if (x < 0.0f) return 0.0f;
+	else return x;
 }
 
 #define ROUND_UP(x, a)   (((x) + (a) - 1) & ~((a) - 1))
@@ -98,6 +99,10 @@ inline bool my_isinf(float f) {
 		f2u.u == 0xff800000;
 }
 
+inline bool my_isinf_u(uint32_t u) {
+	return u == 0x7f800000 || u == 0xff800000;
+}
+
 inline bool my_isnan(float f) {
 	FP32 f2u;
 	f2u.f = f;
@@ -112,10 +117,27 @@ inline bool my_isnanorinf(float f) {
 	return ((f2u.u & 0x7F800000) == 0x7F800000);
 }
 
+inline float InfToZero(float f) {
+	return my_isinf(f) ? 0.0f : f;
+}
+
 inline int is_even(float d) {
 	float int_part;
 	modff(d / 2.0f, &int_part);
 	return 2.0f * int_part == d;
+}
+
+// Float to int the way the PSP's FPU does it: at or past the int32 range the result is the nearest
+// limit, and a NaN gives INT_MAX whatever its sign (cpu/fpu/roundmode). The plain cast is undefined
+// there, and x86 makes it INT_MIN. Takes a value that's already been rounded.
+inline int32_t SaturatedFloatToInt(double d) {
+	if (d >= 2147483648.0)
+		return 0x7FFFFFFF;
+	if (d <= -2147483648.0)
+		return (int32_t)0x80000000;
+	if (d != d)
+		return 0x7FFFFFFF;
+	return (int32_t)d;
 }
 
 // Rounds *.5 to closest even number

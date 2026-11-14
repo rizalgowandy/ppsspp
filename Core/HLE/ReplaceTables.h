@@ -15,14 +15,19 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+
 // Regular replacement funcs are just C functions. These take care of their
 // own parameter parsing using the old school PARAM macros.
 // The return value is the number of cycles to eat.
 
+// Replacement functions are replaced by function hash, also checking the size to reduce
+// collisions. This is not really super safe, and we probably should restrict them by
+// game ID, really...
+
 // JIT replacefuncs can be for inline or "outline" replacement.
 // With inline replacement, we recognize the call to the functions
 // at jal time already. With outline replacement, we just replace the
-// implementation.
+// implementation, which gets jumped to from other functions.
 
 // In both cases the jit needs to know how much to subtract downcount.
 //
@@ -34,20 +39,24 @@
 #pragma once
 
 #include <map>
+#include <utility>
+#include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 
-typedef int (* ReplaceFunc)();
+typedef int (* ReplaceFunc)(MIPSState *mips);
 
 enum {
-	REPFLAG_ALLOWINLINE = 0x01,
 	// Used to keep things around but disable them.
 	REPFLAG_DISABLED = 0x02,
-	// Note that this will re-execute in a function that loops at start.
-	REPFLAG_HOOKENTER = 0x04,
-	// Only hooks jr ra, so only use on funcs that have that.
+	// Executes the replacement, then the original instruction (note: this will re-execute if a function loops here.)
+	REPFLAG_HOOK = 0x04,
+	// Finds 'jr ra' instructions and hooks only them, so only use on funcs that have that.
 	REPFLAG_HOOKEXIT = 0x08,
+	// Function may take a lot of time and execute in slices (executed multiple times.)
+	REPFLAG_SLICED = 0x10,
 };
 
 // Kind of similar to HLE functions but with different data.
@@ -56,7 +65,7 @@ struct ReplacementTableEntry {
 	ReplaceFunc replaceFunc;
 	MIPSComp::MIPSReplaceFunc jitReplaceFunc;
 	int flags;
-	s32 hookOffset;
+	s32 hookOffset;  // hook's offset from the function's start (only for REPFLAG_HOOK)
 };
 
 void Replacement_Init();
@@ -64,14 +73,50 @@ void Replacement_Shutdown();
 
 int GetNumReplacementFuncs();
 std::vector<int> GetReplacementFuncIndexes(u64 hash, int funcSize);
-const ReplacementTableEntry *GetReplacementFunc(int index);
+const ReplacementTableEntry *GetReplacementFunc(size_t index);
 
-void WriteReplaceInstructions(u32 address, u64 hash, int size);
-void RestoreReplacedInstruction(u32 address);
-void RestoreReplacedInstructions(u32 startAddr, u32 endAddr);
-bool GetReplacedOpAt(u32 address, u32 *op);
-bool CanReplaceJalTo(u32 dest, const ReplacementTableEntry **entry, u32 *funcSize);
+// Installed replacements never touch PSP memory. A hooked instruction gets a nonzero block shadow
+// entry: the JIT's block there, or the hook value if there's none. The CPU cores look up every
+// instruction with a nonzero entry when they run or compile it, and substitute the CallRepl
+// pseudo-op.
+void InstallReplacements(u32 address, u64 hash, int size);
+void RemoveReplacement(u32 address);
+void RemoveReplacements(u32 startAddr, u32 endAddr);
+// The address and original instruction of every installed hook.
+std::vector<std::pair<u32, u32>> Replacement_GetHookedOps();
+// Some old savestates have hook ops in memory, which the CPU would now take as illegal and which
+// change the functions' hashes, so they wouldn't be hooked again. Puts back the instructions this
+// session hooked at the same addresses (booting the game hooked the same module there).
+void Replacement_RepairStaleHookOps(const std::vector<std::pair<u32, u32>> &hookedOps);
+// Drops hooks in functions the game has changed. Called when the icache is invalidated over them.
+void RemoveModifiedReplacementsInRange(u32 address, u32 length);
 
-// For savestates.  If you call SaveAndClearReplacements(), you must call RestoreSavedReplacements().
-std::map<u32, u32> SaveAndClearReplacements();
-void RestoreSavedReplacements(const std::map<u32, u32> &saved);
+// The JIT's hook value, which its dispatcher sends to the compiler. Rewrites the hooks' entries.
+void Replacement_SetBlockShadowHook(u32 value);
+u32 Replacement_GetBlockShadowHook();
+bool Replacement_IsHooked(u32 address);
+
+// Only call for a nonzero block shadow entry. Returns the CallRepl pseudo-op, or the instruction in
+// memory if there's no hook there or the game has overwritten the hooked instruction (which also
+// drops the hook). Address must be valid.
+MIPSOpcode GetReplacementOpAt(u32 address);
+
+// What the CPU runs at a valid address: the CallRepl pseudo-op if hooked, otherwise memory.
+inline MIPSOpcode ReadExecutedOp(u32 address) {
+	if (*Memory::GetBlockShadowEntry(address) != 0) {
+		return GetReplacementOpAt(address);
+	}
+	return Memory::ReadUnchecked_Instruction(address);
+}
+
+// The same in a CPU's address space. Only the main CPU's has hooks.
+inline MIPSOpcode ReadExecutedOp(const Memory::AddressSpace &space, u32 address) {
+	if (&space != &Memory::g_mainSpace) {
+		return MIPSOpcode(space.ReadUnchecked_U32(address));
+	}
+	return ReadExecutedOp(address);
+}
+
+// ReadExecutedOp for the debugger: safe from any thread, and never drops a hook. Address must be valid.
+MIPSOpcode Replacement_GetDisplayOp(u32 address);
+

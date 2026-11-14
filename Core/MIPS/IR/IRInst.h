@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 #include <utility>
 
 #include "Common/CommonTypes.h"
+#include "Common/Data/Collections/FastVec.h"
 #include "Core/MIPS/MIPS.h"
 
 // Basic IR
@@ -16,9 +18,10 @@
 // even be directly JIT-ed, but the gains will probably be tiny over our older direct
 // MIPS->target JITs.
 
-enum class IROp : u8 {
-	Nop,
+// Ops beginning with "OI" are specialized for IR Interpreter use. These will not be produced
+// for the IR JITs.
 
+enum class IROp : uint8_t {
 	SetConst,
 	SetConstF,
 
@@ -34,11 +37,14 @@ enum class IROp : u8 {
 	Xor,
 
 	AddConst,
+	OptAddConst,
 	SubConst,
 
 	AndConst,
 	OrConst,
 	XorConst,
+	OptAndConst,
+	OptOrConst,
 
 	Shl,
 	Shr,
@@ -92,6 +98,7 @@ enum class IROp : u8 {
 	Load32,
 	Load32Left,
 	Load32Right,
+	Load32Linked,
 	LoadFloat,
 	LoadVec4,
 
@@ -100,8 +107,20 @@ enum class IROp : u8 {
 	Store32,
 	Store32Left,
 	Store32Right,
+	Store32Conditional,
 	StoreFloat,
 	StoreVec4,
+
+	// Kernel code's loads and stores, which may reach hardware registers (MMIO). See
+	// ResolveKernelMemory.
+	LoadKernel8,
+	LoadKernel8Ext,
+	LoadKernel16,
+	LoadKernel16Ext,
+	LoadKernel32,
+	StoreKernel8,
+	StoreKernel16,
+	StoreKernel32,
 
 	Ext8to32,
 	Ext16to32,
@@ -127,17 +146,31 @@ enum class IROp : u8 {
 
 	FCvtWS,
 	FCvtSW,
+	FCvtScaledWS,
+	FCvtScaledSW,
 
 	FMovFromGPR,
+	OptFCvtSWFromGPR,
 	FMovToGPR,
+	OptFMovToGPRShr8,
+	// A conditional exit merged with the ExitToConst after it, which stays behind as the target
+	// to take otherwise (in its constant).
+	OptExitToConstIfEqElse,
+	OptExitToConstIfNeqElse,
+	OptExitToConstIfGtZElse,
+	OptExitToConstIfGeZElse,
+	OptExitToConstIfLtZElse,
+	OptExitToConstIfLeZElse,
 
 	FSat0_1,
 	FSatMinus1_1,
 
+	FpCondFromReg,
 	FpCondToReg,
+	FpCtrlFromReg,
+	FpCtrlToReg,
 	VfpuCtrlToReg,
 
-	ZeroFpCond,
 	FCmp,
 
 	FCmovVfpuCC,
@@ -158,23 +191,31 @@ enum class IROp : u8 {
 	// support SIMD.
 	Vec4Init,
 	Vec4Shuffle,
+	Vec4Blend,
 	Vec4Mov,
 	Vec4Add,
 	Vec4Sub,
 	Vec4Mul,
 	Vec4Div,
 	Vec4Scale,
-	Vec4Dot,
+	Vec4VfpuDot,  // The VFPU's own dot product, bit-exact (vfpu_dot).
+	Vec4VfpuMultiDot,  // Four of them against one vector, see IRMultiDot.
 	Vec4Neg,
 	Vec4Abs,
+	// vmin/vmax (by vfpu_minmax_key, a tie taking src2), vslt and vsge (1.0 or 0.0, 0.0 for NaN).
+	Vec4Min,
+	Vec4Max,
+	Vec4Slt,
+	Vec4Sge,
+	// vi2f: each lane's int to float, divided by 2^src2.
+	Vec4CvtScaledSW,
 
 	// vx2i
 	Vec2Unpack16To31,  // Note that the result is shifted down by 1, hence 31
 	Vec2Unpack16To32,
 	Vec4Unpack8To32,
 	Vec4DuplicateUpperBitsAndShift1,  // Bizarro vuc2i behaviour, in an instruction. Split?
-	Vec4ClampToZero,
-	Vec2ClampToZero,
+	// vi2x. The 31 ones take bits 30 and down, after clamping negative lanes to zero (vi2uc, vi2us).
 	Vec4Pack31To8,
 	Vec4Pack32To8,
 	Vec2Pack31To16,
@@ -183,9 +224,15 @@ enum class IROp : u8 {
 	// Slow special functions. Used on singles.
 	FSin,
 	FCos,
-	FRSqrt,
-	FRecip,
+	FRSqrt,  // vrsq, bit-exact with the PSP
+	FRecip,  // vrcp, bit-exact with the PSP
 	FAsin,
+	FVSqrt,  // vsqrt, bit-exact with the PSP (FSqrt is the FPU's IEEE sqrt.s)
+	FExp2,  // vexp2, bit-exact with the PSP
+	FLog2,  // vlog2, bit-exact with the PSP
+	FHalfToFloat,  // vh2f of the lower (src2 = 0) or upper (src2 = 1) half of src1
+	FSinCos,  // dest = sin(src1), dest + 1 = cos(src1), from one argument reduction
+	FFloatToHalf2,  // vf2h of a pair: dest = half(src1) | half(src2) << 16, bit-exact with the PSP
 
 	// Fake/System instructions
 	Interpret,
@@ -208,13 +255,27 @@ enum class IROp : u8 {
 	ExitToConstIfFpFalse,
 	ExitToPC,  // Used after a syscall to give us a way to do things before returning.
 
-	Syscall,
+	Syscall,  // Needs the syscall instruction work in the constant.
+	SyscallUnresolved,  // Used when the syscall is not resolved at compile time. PC in the constant.
 	SetPC,  // hack to make syscall returns work
 	SetPCConst,  // hack to make replacement know PC
 	CallReplacement,
 	Break,
+
+	// Debugging breakpoints.
 	Breakpoint,
 	MemoryCheck,
+
+	ValidateAddress8,
+	ValidateAddress16,
+	ValidateAddress32,
+	ValidateAddress128,
+
+	// Tracing support.
+	LogIRBlock,
+
+	Nop,
+	Bad,
 };
 
 enum IRComparison {
@@ -236,6 +297,18 @@ enum class Vec4Init {
 	Set_0100,
 	Set_0010,
 	Set_0001,
+};
+
+// The source lane of dest lane i in a Vec4Shuffle, two bits per lane like a VFPU prefix's swizzle.
+inline int Vec4ShuffleLane(u32 shuffle, int i) {
+	return (shuffle >> (i * 2)) & 3;
+}
+
+enum class IRRoundMode : uint8_t {
+	RINT_0 = 0,
+	CAST_1 = 1,
+	CEIL_2 = 2,
+	FLOOR_3 = 3,
 };
 
 // Hm, unused
@@ -276,7 +349,19 @@ enum IRFpCompareMode {
 	LessEqualUnordered, // ule, ngt (less equal, unordered)
 };
 
-enum {
+typedef u8 IRReg;
+
+// Vec4VfpuMultiDot dest, block, v, constant: lane k of dest is vfpu_dot() of lane k of the 4x4 block
+// of regs (16 in a row) and v, over the first IRMULTIDOT_TERMS(constant) terms (the rest are zero in
+// both). Lane k is the block's row k (block[4 * i + k]), or with IRMULTIDOT_TRANSPOSED, its Vec4 k
+// (block[4 * k + i]).
+enum : u32 {
+	IRMULTIDOT_TERMS_MASK = 0x7,
+	IRMULTIDOT_TRANSPOSED = 0x10,
+};
+inline int IRMULTIDOT_TERMS(u32 constant) { return (int)(constant & IRMULTIDOT_TERMS_MASK); }
+
+enum : IRReg {
 	IRTEMP_0 = 192,
 	IRTEMP_1,
 	IRTEMP_2,
@@ -293,9 +378,6 @@ enum {
 	IRVTEMP_PFX_D = 232 - 32,
 	IRVTEMP_0 = 236 - 32,
 
-	// 16 float temps for vector S and T prefixes and things like that.
-	// IRVTEMP_0 = 208 - 64,  // -64 to be relative to v[0]
-
 	// Hacky way to get to other state
 	IRREG_VFPU_CTRL_BASE = 208,
 	IRREG_VFPU_CC = 211,
@@ -303,6 +385,7 @@ enum {
 	IRREG_HI = 243,
 	IRREG_FCR31 = 244,
 	IRREG_FPCOND = 245,
+	IRREG_LLBIT = 250,
 };
 
 enum IRFlags {
@@ -312,12 +395,14 @@ enum IRFlags {
 	IRFLAG_SRC3DST = 0x0002,
 	// Exit instruction (maybe conditional.)
 	IRFLAG_EXIT = 0x0004,
+	// Instruction like Interpret which may read anything, but not an exit.
+	IRFLAG_BARRIER = 0x0008,
 };
 
 struct IRMeta {
 	IROp op;
 	const char *name;
-	const char types[4];  // GGG
+	char types[5];  // GGG
 	u32 flags;
 };
 
@@ -325,54 +410,106 @@ struct IRMeta {
 struct IRInst {
 	IROp op;
 	union {
-		u8 dest;
-		u8 src3;
+		IRReg dest;
+		IRReg src3;
 	};
-	u8 src1;
-	u8 src2;
+	IRReg src1;
+	IRReg src2;
 	u32 constant;
 };
 
-// Returns the new PC.
-u32 IRInterpret(MIPSState *ms, const IRInst *inst, int count);
+// Returns the new PC. With the block arena, exits go straight on to the next compiled block while
+// downcount lasts, instead of returning.
+u32 IRInterpret(MIPSState *ms, const IRInst *inst, const IRInst *chainArena = nullptr);
+
+// Kinds of instructions that only some passes act on. An IRWriter collects the kinds written to it,
+// so a pass with nothing to act on can be skipped (see IRApplyPasses).
+enum IROpKind : u8 {
+	IRKIND_LEFT_RIGHT = 0x01,  // Load32Left, Load32Right, Store32Left, Store32Right
+	IRKIND_KERNEL_MEMORY = 0x02,  // LoadKernel*, StoreKernel*
+	IRKIND_VEC4 = 0x04,  // Has a Vec4 or matrix operand
+	IRKIND_FMOV_TO_GPR = 0x08,
+	IRKIND_PLAIN_LOAD = 0x10,  // A load of 1, 2, 4 or 16 bytes, not Left, Right or Linked
+};
+// Filled in by InitIR().
+extern u8 irOpKinds[256];
 
 // Each IR block gets a constant pool.
 class IRWriter {
 public:
-	IRWriter &operator =(const IRWriter &w) {
-		insts_ = w.insts_;
-		return *this;
-	}
-	IRWriter &operator =(IRWriter &&w) {
+	IRWriter() {}
+	IRWriter(const IRWriter &w) = delete;
+	IRWriter(IRWriter &&w) noexcept : insts_(std::move(w.insts_)), kinds_(w.kinds_) {}
+	IRWriter &operator =(const IRWriter &w) = delete;
+	IRWriter &operator =(IRWriter &&w) noexcept {
 		insts_ = std::move(w.insts_);
+		kinds_ = w.kinds_;
 		return *this;
 	}
 
-	void Write(IROp op, u8 dst = 0, u8 src1 = 0, u8 src2 = 0);
+	// Inline (with FastVec rather than std::vector, which the compiler didn't inline), since the
+	// frontend and every pass write each instruction through these.
+	void Write(IROp op, u8 dst = 0, u8 src1 = 0, u8 src2 = 0, u32 constant = 0) {
+		IRInst &inst = insts_.push_uninitialized();
+		inst.op = op;
+		inst.dest = dst;
+		inst.src1 = src1;
+		inst.src2 = src2;
+		inst.constant = constant;
+		kinds_ |= irOpKinds[(int)op];
+	}
+	void WriteFC(IROp op, u8 dst, u8 src1, u8 src2, float fconstant);
+
+	void WriteSetConstant(u8 dst, u32 value);
+	void WriteSetConstantFloat(u8 dst, float value);
 	void Write(IRInst inst) {
 		insts_.push_back(inst);
+		kinds_ |= irOpKinds[(int)inst.op];
 	}
-	void WriteSetConstant(u8 dst, u32 value);
 
-	int AddConstant(u32 value);
-	int AddConstantFloat(float value);
-
+	void Reserve(size_t s) {
+		insts_.reserve(s);
+	}
 	void Clear() {
 		insts_.clear();
+		kinds_ = 0;
 	}
+	void ReplaceConstant(size_t instNumber, u32 newConstant);
 
-	const std::vector<IRInst> &GetInstructions() const { return insts_; }
+	const FastVec<IRInst> &GetInstructions() const { return insts_; }
+	// IROpKind flags of what's been written.
+	u8 Kinds() const { return kinds_; }
 
 private:
-	std::vector<IRInst> insts_;
-	u32 nextConst_ = 0;
+	FastVec<IRInst> insts_;
+	u8 kinds_ = 0;
 };
+
+// How far IRFrontend compiles on past conditional branches. The interpreter ends its blocks in the
+// same places (see GetIRBlockEnd in MIPSTables.cpp), so events happen at the same instruction.
+constexpr bool IR_CONTINUE_BRANCHES = true;
+constexpr int IR_MAX_CONTINUED_INSTRUCTIONS = 96;
+constexpr int IR_MAX_CONTINUED_BRANCHES = 6;
 
 struct IROptions {
 	uint32_t disableFlags;
 	bool unalignedLoadStore;
+	bool unalignedLoadStoreVec4;
+	bool preferVec4;
+	bool optimizeForInterpreter;
+	// The backend has Vec4VfpuMultiDot.
+	bool vfpuMultiDot;
+	// Compile on past conditional branches (see IRFrontend::CanContinuePastBranch). Always
+	// IR_CONTINUE_BRANCHES, which the interpreter follows.
+	bool continueBranches;
+	// The backend has Vec4Min, Vec4Max, Vec4Slt, Vec4Sge and Vec4CvtScaledSW.
+	bool moreVec4Ops;
 };
 
-const IRMeta *GetIRMeta(IROp op);
+// Filled in by InitIR(). Inline, since the passes and backends look it up for every instruction.
+extern const IRMeta *metaIndex[256];
+inline const IRMeta *GetIRMeta(IROp op) {
+	return metaIndex[(int)op];
+}
 void DisassembleIR(char *buf, size_t bufsize, IRInst inst);
 void InitIR();

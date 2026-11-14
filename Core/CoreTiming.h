@@ -18,7 +18,9 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "Common/CommonTypes.h"
+#include "Common/Data/Collections/LinkedList.h"
 
 // This is a system to schedule events into the emulated machine's future. Time is measured
 // in main CPU clock cycles.
@@ -70,21 +72,46 @@ inline s64 cyclesToUs(s64 cycles) {
 	return (cycles * 1000000) / CPU_HZ;
 }
 
-namespace CoreTiming
-{
-	void Init();
-	void Shutdown();
+class MIPSState;
 
-	typedef void (*MHzChangeCallback)();
+namespace CoreTiming {
 	typedef void (*TimedCallback)(u64 userdata, int cyclesLate);
 
-	u64 GetTicks();
+	struct EventType {
+		TimedCallback callback;
+		const char *name;
+	};
+
+	struct BaseEvent {
+		s64 time;
+		u64 userdata;
+		int type;
+	};
+	typedef LinkedListItem<BaseEvent> Event;
+
+	void Init(MIPSState *mips);
+	void Shutdown();
+
+	u64 GetTicks(MIPSState *mips);
 	u64 GetIdleTicks();
 	u64 GetGlobalTimeUs();
 	u64 GetGlobalTimeUsScaled();
+	// GetGlobalTimeUs() without the internal rebasing, so it's safe to call off the CPU thread -
+	// for the debugger's status poll. Same value, just doesn't help the next call along.
+	u64 PeekGlobalTimeUs();
+
+	// Debugger support (cpu.runUntilTime): break as soon as emulated time reaches this many
+	// microseconds. Advance() shortens its slice to land exactly on it rather than overshooting,
+	// so this stops at a reproducible point rather than "somewhere in the next frame". 0 clears it.
+	// Core_Break() clears it too, so a deadline can't outlive the run it belonged to.
+	// Deliberately in microseconds and not ticks: games change the CPU clock mid-run (CrossCraft
+	// Classic goes 222 -> 333MHz during startup), so a tick count fixed up front drifts.
+	void SetBreakDeadlineUs(u64 us);
+	u64 GetBreakDeadlineUs();
 
 	// Returns the event_type identifier.
 	int RegisterEvent(const char *name, TimedCallback callback);
+
 	// For save states.
 	void RestoreRegisterEvent(int &event_type, const char *name, TimedCallback callback);
 	void UnregisterAllEvents();
@@ -92,37 +119,34 @@ namespace CoreTiming
 	// userdata MAY NOT CONTAIN POINTERS. userdata might get written and reloaded from disk,
 	// when we implement state saves.
 	void ScheduleEvent(s64 cyclesIntoFuture, int event_type, u64 userdata=0);
-	void ScheduleEvent_Threadsafe(s64 cyclesIntoFuture, int event_type, u64 userdata=0);
-	void ScheduleEvent_Threadsafe_Immediate(int event_type, u64 userdata=0);
 	s64 UnscheduleEvent(int event_type, u64 userdata);
-	s64 UnscheduleThreadsafeEvent(int event_type, u64 userdata);
 
+	const std::vector<EventType> &GetEventTypes();
+	const Event *GetFirstEvent();
 	void RemoveEvent(int event_type);
-	void RemoveThreadsafeEvent(int event_type);
-	void RemoveAllEvents(int event_type);
 	bool IsScheduled(int event_type);
-	void Advance();
-	void MoveEvents();
-	void ProcessFifoWaitEvents();
-	void ForceCheck();
+	void Advance(MIPSState *mips);
+	void ForceCheck(MIPSState *mips);
+	// Runs the other CPUs (the Media Engine) up to where this one is in the slice, as they otherwise
+	// run at its end: for when this one looks at what they share, such as the boot page.
+	void CatchUpOtherCPUs(MIPSState *mips);
 
 	// Pretend that the main CPU has executed enough cycles to reach the next event.
-	void Idle(int maxIdle = 0);
+	void Idle(MIPSState *mips, int maxIdle = 0);
 
 	// Clear all pending events. This should ONLY be done on exit or state load.
 	void ClearPendingEvents();
 
 	void LogPendingEvents();
 
-	// Warning: not included in save states.
-	void RegisterMHzChangeCallback(MHzChangeCallback callback);
-
 	std::string GetScheduledEventsSummary();
 
 	void DoState(PointerWrap &p);
 
-	void SetClockFrequencyHz(int cpuHz);
+	bool SetClockFrequencyHz(int cpuHz);  // Return false if the frequency was already set.
 	int GetClockFrequencyHz();
+
+	// TODO: Add accessors?
 	extern int slicelength;
 
 }; // end of namespace

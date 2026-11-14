@@ -16,24 +16,27 @@ public:
 		hw_render_.bottom_left_origin = true;
 	}
 
-	bool Init() override;
+   bool NeedsSeparateEmuThread() const override { return true; }
+
+	bool InitAPI(void *wnd, std::string *deviceName, std::string *error_message) override;
 	void CreateDrawContext() override;
 	void DestroyDrawContext() override;
-	void SetRenderTarget() override {
+	void SetRenderTarget() override {}
+	bool ThreadFrame() override {
 		extern GLuint g_defaultFBO;
 		g_defaultFBO = hw_render_.get_current_framebuffer();
+		return renderManager_->ThreadFrame();
 	}
 
 	void ThreadStart() override { renderManager_->ThreadStart(draw_); }
-	bool ThreadFrame() override { return renderManager_->ThreadFrame(); }
+	bool ThreadFramePending() override { return renderManager_->HasQueuedThreadWork(); }
 	void ThreadEnd() override { renderManager_->ThreadEnd(); }
-	void StopThread() override {
-		renderManager_->WaitUntilQueueIdle();
-		renderManager_->StopThread();
-	}
 
 	GPUCore GetGPUCore() override { return GPUCORE_GLES; }
 	const char *Ident() override { return "OpenGL"; }
+
+   // Call from emu thread
+   void NotifyEmuThreadExit() override;
 
 private:
 	GLRenderManager *renderManager_ = nullptr;

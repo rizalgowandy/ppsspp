@@ -4,9 +4,6 @@
 
 #include <string>
 #include <stdexcept>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
 #include <cstring>
 
 #include <zlib.h>
@@ -20,7 +17,7 @@ bool compress_string(const std::string& str, std::string *dest, int compressionl
 	memset(&zs, 0, sizeof(zs));
 
 	if (deflateInit(&zs, compressionlevel) != Z_OK) {
-		ERROR_LOG(IO, "deflateInit failed while compressing.");
+		ERROR_LOG(Log::IO, "deflateInit failed while compressing.");
 		return false;
 	}
 
@@ -48,8 +45,7 @@ bool compress_string(const std::string& str, std::string *dest, int compressionl
 	deflateEnd(&zs);
 
 	if (ret != Z_STREAM_END) {          // an error occurred that was not EOF
-		std::ostringstream oss;
-		oss << "Exception during zlib compression: (" << ret << ") " << zs.msg;
+		ERROR_LOG(Log::IO, "Exception during zlib compression: (%d): %s", ret, zs.msg);
 		return false;
 	}
 
@@ -58,7 +54,7 @@ bool compress_string(const std::string& str, std::string *dest, int compressionl
 }
 
 /** Decompress an STL string using zlib and return the original data. */
-bool decompress_string(const std::string& str, std::string *dest) {
+bool decompress_string(const std::string& str, std::string *dest, size_t maxSize) {
 	if (!str.size())
 		return false;
 
@@ -67,7 +63,7 @@ bool decompress_string(const std::string& str, std::string *dest) {
 
 	// modification by hrydgard: inflateInit2, 16+MAXWBITS makes it read gzip data too
 	if (inflateInit2(&zs, 32+MAX_WBITS) != Z_OK) {
-		ERROR_LOG(IO, "inflateInit failed while decompressing.");
+		ERROR_LOG(Log::IO, "inflateInit failed while decompressing.");
 		return false;
 	}
 
@@ -89,17 +85,20 @@ bool decompress_string(const std::string& str, std::string *dest) {
 			outstring.append(outbuffer,
 				zs.total_out - outstring.size());
 		}
-
+		if (outstring.size() > maxSize) {
+			inflateEnd(&zs);
+			ERROR_LOG(Log::IO, "Decompressed data is larger than %d bytes, giving up", (int)maxSize);
+			return false;
+		}
 	} while (ret == Z_OK);
 
 	inflateEnd(&zs);
 
 	if (ret != Z_STREAM_END) {          // an error occurred that was not EOF
-		std::ostringstream oss;
-		ERROR_LOG(IO, "Exception during zlib decompression: (%i) %s", ret, zs.msg);
+		ERROR_LOG(Log::IO, "Exception during zlib decompression: (%i) %s", ret, zs.msg);
 		return false;
 	}
 
-	*dest = outstring;
+	*dest = std::move(outstring);
 	return true;
 }

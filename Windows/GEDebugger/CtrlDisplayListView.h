@@ -2,13 +2,11 @@
 
 #include <algorithm>
 #include "Common/CommonWindows.h"
-#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GPUDefinitions.h"
 
-class CtrlDisplayListView
-{
+class CtrlDisplayListView {
 	HWND wnd;
 	RECT rect;
-	static LPCTSTR windowClass;
 	DisplayList list;
 	
 	HFONT font;
@@ -30,6 +28,8 @@ class CtrlDisplayListView
 	} pixelPositions;
 
 	void toggleBreakpoint();
+	void PromptBreakpointCond();
+
 public:
 	CtrlDisplayListView(HWND _wnd);
 	~CtrlDisplayListView();
@@ -53,6 +53,10 @@ public:
 		validDisplayList = true;
 		list = displayList;
 		gotoAddr(list.pc);
+	}
+	void clearDisplayList()
+	{
+		validDisplayList = false;
 	}
 
 	void scrollWindow(int lines)

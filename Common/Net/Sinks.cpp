@@ -1,32 +1,15 @@
 #include "ppsspp_config.h"
 
-#if PPSSPP_PLATFORM(WINDOWS)
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <io.h>
-
-#else
-
-#include <sys/socket.h>       /*  socket definitions        */
-#include <sys/types.h>        /*  socket types              */
-#include <sys/wait.h>         /*  for waitpid()             */
-#include <netinet/in.h>       /*  struct sockaddr_in        */
-#include <arpa/inet.h>        /*  inet (3) funtions         */
-#include <unistd.h>           /*  misc. UNIX functions      */
-
-#endif
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdarg>
 
+#include "Common/Net/SocketCompat.h"
 #include "Common/Net/Sinks.h"
 
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Common/File/FileDescriptor.h"
 
 #ifndef MSG_NOSIGNAL
@@ -62,8 +45,39 @@ bool InputSink::ReadLineWithEnding(std::string &s) {
 		memcpy(&s[0], buf_ + read_, newline + 1);
 	}
 	AccountDrain(newline + 1);
-
 	return true;
+}
+
+std::pair<std::string_view, std::string_view> InputSink::BufferParts() const {
+	if (read_ + valid_ <= BUFFER_SIZE) {
+		return {std::string_view(buf_ + read_, valid_), std::string_view()};
+	} else {
+		size_t firstPartSize = BUFFER_SIZE - read_;
+		size_t secondPartSize = valid_ - firstPartSize;
+		return {std::string_view(buf_ + read_, firstPartSize), std::string_view(buf_, secondPartSize)};
+	}
+}
+
+size_t InputSink::ReadBinaryUntilTerminator(char *dest, size_t bufSize, std::string_view terminator, bool *didReadTerminator) {
+	Fill();
+
+	auto [part1, part2] = BufferParts();
+	size_t offset = SplitSearch(terminator, part1, part2);
+	if (offset == std::string_view::npos) {
+		*didReadTerminator = false;
+		// Not found, read as much as we can - but leave space for the terminator
+		const s64 toRead = std::min((s64)valid_, (s64)bufSize - (s64)terminator.length());
+		TakeExact(dest, toRead);
+		return toRead;
+	} else {
+		// Terminator found! Read right up to it, and then skip it.
+		*didReadTerminator = true;
+		_dbg_assert_(offset < valid_);
+		TakeExact(dest, offset);
+		Skip(terminator.size());
+		_dbg_assert_(valid_ >= 0);
+		return offset;
+	}
 }
 
 std::string InputSink::ReadLineWithEnding() {
@@ -117,6 +131,10 @@ size_t InputSink::FindNewline() const {
 
 bool InputSink::TakeExact(char *buf, size_t bytes) {
 	while (bytes > 0) {
+		if (hasError_) {
+			return false;
+		}
+
 		size_t drained = TakeAtMost(buf, bytes);
 		buf += drained;
 		bytes -= drained;
@@ -148,6 +166,10 @@ size_t InputSink::TakeAtMost(char *buf, size_t bytes) {
 
 bool InputSink::Skip(size_t bytes) {
 	while (bytes > 0) {
+		if (hasError_) {
+			return false;
+		}
+
 		size_t drained = std::min(valid_, bytes);
 		AccountDrain(drained);
 		bytes -= drained;
@@ -168,48 +190,57 @@ void InputSink::Discard() {
 	read_ = 0;
 	write_ = 0;
 	valid_ = 0;
+	hasError_ = false;
 }
 
 void InputSink::Fill() {
+	if (hasError_) {
+		return;
+	}
+
 	// Avoid small reads if possible.
 	if (BUFFER_SIZE - valid_ > PRESSURE) {
 		// Whatever isn't valid and follows write_ is what's available.
 		size_t avail = BUFFER_SIZE - std::max(write_, valid_);
 
-		int bytes = recv(fd_, buf_ + write_, (int)avail, MSG_NOSIGNAL);
-		AccountFill(bytes);
+		int bytes = recv(fd_, buf_ + write_, avail, MSG_NOSIGNAL);
+		if (bytes < 0) {
+			int err = socket_errno;
+			if (err == EWOULDBLOCK || err == EAGAIN)
+				return;
+			ERROR_LOG(Log::Net, "Error reading from socket: %d", err);
+			hasError_ = true;
+			return;
+		}
+
+		if (bytes == 0 && avail > 0) {
+			// recv() returning 0 on a non-empty request means the peer closed. Sticky: nothing more
+			// will ever arrive, and anything waiting for more has to stop rather than poll forever.
+			atEnd_ = true;
+			return;
+		}
+
+		// Okay, move forward (might be by zero.)
+		valid_ += bytes;
+		write_ += bytes;
+		if (write_ >= BUFFER_SIZE) {
+			write_ -= BUFFER_SIZE;
+		}
 	}
 }
 
 bool InputSink::Block() {
+	if (atEnd_ || hasError_) {
+		// Nothing can arrive any more. Without this we'd spin: a closed socket is always "ready",
+		// so WaitUntilReady returns immediately and Fill() reads nothing, forever.
+		return false;
+	}
 	if (!fd_util::WaitUntilReady((int)fd_, 5.0)) {
 		return false;
 	}
 
 	Fill();
-	return true;
-}
-
-void InputSink::AccountFill(int bytes) {
-	if (bytes < 0) {
-#if PPSSPP_PLATFORM(WINDOWS)
-		int err = WSAGetLastError();
-		if (err == WSAEWOULDBLOCK)
-			return;
-#else
-		if (errno == EWOULDBLOCK || errno == EAGAIN)
-			return;
-#endif
-		ERROR_LOG(IO, "Error reading from socket");
-		return;
-	}
-
-	// Okay, move forward (might be by zero.)
-	valid_ += bytes;
-	write_ += bytes;
-	if (write_ >= BUFFER_SIZE) {
-		write_ -= BUFFER_SIZE;
-	}
+	return !atEnd_;
 }
 
 void InputSink::AccountDrain(size_t bytes) {
@@ -220,7 +251,7 @@ void InputSink::AccountDrain(size_t bytes) {
 	}
 }
 
-bool InputSink::Empty() {
+bool InputSink::Empty() const {
 	return valid_ == 0;
 }
 
@@ -239,6 +270,10 @@ bool OutputSink::Push(const std::string &s) {
 
 bool OutputSink::Push(const char *buf, size_t bytes) {
 	while (bytes > 0) {
+		if (hasError_) {
+			return false;
+		}
+
 		size_t pushed = PushAtMost(buf, bytes);
 		buf += pushed;
 		bytes -= pushed;
@@ -254,19 +289,12 @@ bool OutputSink::Push(const char *buf, size_t bytes) {
 	return true;
 }
 
-bool OutputSink::PushCRLF(const std::string &s) {
-	if (Push(s)) {
-		return Push("r\n", 2);
-	}
-	return false;
-}
-
 size_t OutputSink::PushAtMost(const char *buf, size_t bytes) {
 	Drain();
 
 	if (valid_ == 0 && bytes > PRESSURE) {
 		// Special case for pushing larger buffers: let's try to send directly.
-		int sentBytes = send(fd_, buf, (int)bytes, MSG_NOSIGNAL);
+		int sentBytes = send(fd_, buf, bytes, MSG_NOSIGNAL);
 		// If it was 0 or EWOULDBLOCK, that's fine, we'll enqueue as we can.
 		if (sentBytes > 0) {
 			return sentBytes;
@@ -284,7 +312,6 @@ size_t OutputSink::PushAtMost(const char *buf, size_t bytes) {
 	return avail;
 }
 
-
 bool OutputSink::Printf(const char *fmt, ...) {
 	// Let's start by checking how much space we have.
 	size_t avail = BUFFER_SIZE - std::max(write_, valid_);
@@ -301,15 +328,10 @@ bool OutputSink::Printf(const char *fmt, ...) {
 	if (result >= (int)avail) {
 		// There wasn't enough space.  Let's use a buffer instead.
 		// This could be caused by wraparound.
-		char temp[BUFFER_SIZE];
-		result = vsnprintf(temp, BUFFER_SIZE, fmt, args);
+		char temp[4096];
+		result = vsnprintf(temp, sizeof(temp), fmt, backup);
 
-		if ((size_t)result < BUFFER_SIZE && result > 0) {
-			// In case it did return the null terminator.
-			if (temp[result - 1] == '\0') {
-				result--;
-			}
-
+		if ((size_t)result < sizeof(temp) && result > 0) {
 			success = Push(temp, result);
 			// We've written so there's nothing more.
 			result = 0;
@@ -321,10 +343,10 @@ bool OutputSink::Printf(const char *fmt, ...) {
 	// Okay, did we actually write?
 	if (result >= (int)avail) {
 		// This means the result string was too big for the buffer.
-		ERROR_LOG(IO, "Not enough space to format output.");
+		ERROR_LOG(Log::Net, "Not enough space to format output.");
 		return false;
 	} else if (result < 0) {
-		ERROR_LOG(IO, "vsnprintf failed.");
+		ERROR_LOG(Log::Net, "vsnprintf failed.");
 		return false;
 	}
 
@@ -336,6 +358,10 @@ bool OutputSink::Printf(const char *fmt, ...) {
 }
 
 bool OutputSink::Block() {
+	if (hasError_) {
+		// A broken socket reports as ready forever, so waiting on it would just spin.
+		return false;
+	}
 	if (!fd_util::WaitUntilReady((int)fd_, 5.0, true)) {
 		return false;
 	}
@@ -346,13 +372,15 @@ bool OutputSink::Block() {
 
 bool OutputSink::Flush(bool allowBlock) {
 	while (valid_ > 0) {
+		if (hasError_) {
+			return false;
+		}
+
 		size_t avail = std::min(BUFFER_SIZE - read_, valid_);
 
-		int bytes = send(fd_, buf_ + read_, (int)avail, MSG_NOSIGNAL);
-#if !PPSSPP_PLATFORM(WINDOWS)
-		if (bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		int bytes = send(fd_, buf_ + read_, avail, MSG_NOSIGNAL);
+		if (bytes == -1 && (socket_errno == EAGAIN || socket_errno == EWOULDBLOCK))
 			bytes = 0;
-#endif
 		AccountDrain(bytes);
 
 		if (bytes == 0) {
@@ -372,19 +400,22 @@ void OutputSink::Discard() {
 	read_ = 0;
 	write_ = 0;
 	valid_ = 0;
+	hasError_ = false;
 }
 
 void OutputSink::Drain() {
+	if (hasError_) {
+		return;
+	}
+
 	// Avoid small reads if possible.
 	if (valid_ > PRESSURE) {
 		// Let's just do contiguous valid.
 		size_t avail = std::min(BUFFER_SIZE - read_, valid_);
 
-		int bytes = send(fd_, buf_ + read_, (int)avail, MSG_NOSIGNAL);
-#if !PPSSPP_PLATFORM(WINDOWS)
-		if (bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			bytes = 0;
-#endif
+		int bytes = send(fd_, buf_ + read_, avail, MSG_NOSIGNAL);
+		if (bytes == -1 && (socket_errno == EAGAIN || socket_errno == EWOULDBLOCK))
+			bytes = 0;  // don't report errors
 		AccountDrain(bytes);
 	}
 }
@@ -399,15 +430,11 @@ void OutputSink::AccountPush(size_t bytes) {
 
 void OutputSink::AccountDrain(int bytes) {
 	if (bytes < 0) {
-#if PPSSPP_PLATFORM(WINDOWS)
-		int err = WSAGetLastError();
-		if (err == WSAEWOULDBLOCK)
+		int err = socket_errno;
+		if (err == EWOULDBLOCK || err == EAGAIN)
 			return;
-#else
-		if (errno == EWOULDBLOCK || errno == EAGAIN)
-			return;
-#endif
-		ERROR_LOG(IO, "Error writing to socket");
+		ERROR_LOG(Log::IO, "Error writing to socket: %d", err);
+		hasError_ = true;
 		return;
 	}
 
@@ -418,8 +445,12 @@ void OutputSink::AccountDrain(int bytes) {
 	}
 }
 
-bool OutputSink::Empty() {
+bool OutputSink::Empty() const {
 	return valid_ == 0;
 }
 
-};
+size_t OutputSink::BytesRemaining() const {
+	return valid_;
+}
+
+}  // namespace net

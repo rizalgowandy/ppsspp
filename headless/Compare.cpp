@@ -19,41 +19,22 @@
 #include <cmath>
 #include <cstdarg>
 #include <iostream>
-#include <fstream>
+#include <png.h>
 #include <vector>
-#include "headless/Compare.h"
 
-#include "Common/ColorConv.h"
+#include "headless/Compare.h"
+#include "Common/Data/Convert/ColorConv.h"
 #include "Common/Data/Format/PNGLoad.h"
 #include "Common/File/FileUtil.h"
 #include "Common/StringUtils.h"
-#include "Core/Host.h"
 #include "Core/Loaders.h"
 
 #include "GPU/GPUState.h"
-#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GPUCommon.h"
 #include "GPU/Common/TextureDecoder.h"
 
 
-bool teamCityMode = false;
 std::string currentTestName = "";
-
-void TeamCityPrint(const char *fmt, ...)
-{
-	if (!teamCityMode)
-		return;
-
-	const int TEMP_BUFFER_SIZE = 32768;
-	char temp[TEMP_BUFFER_SIZE];
-
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(temp, TEMP_BUFFER_SIZE - 1, fmt, args);
-	temp[TEMP_BUFFER_SIZE - 1] = '\0';
-	va_end(args);
-
-	printf("##teamcity[%s]\n", temp);
-}
 
 void GitHubActionsPrint(const char *type, const char *fmt, ...) {
 	if (!getenv("GITHUB_ACTIONS"))
@@ -75,8 +56,7 @@ struct BufferedLineReader {
 	const static int MAX_BUFFER = 5;
 	const static int TEMP_BUFFER_SIZE = 32768;
 
-	BufferedLineReader(const std::string &data) : valid_(0), data_(data), pos_(0) {
-	}
+	BufferedLineReader(const std::string &data) : data_(data) {}
 
 	void Fill() {
 		while (valid_ < MAX_BUFFER && HasMoreLines()) {
@@ -135,14 +115,14 @@ struct BufferedLineReader {
 	}
 
 protected:
-	BufferedLineReader() : valid_(0) {
+	BufferedLineReader() {
 	}
 
-	virtual bool HasMoreLines() {
+	bool HasMoreLines() {
 		return pos_ != data_.npos;
 	}
 
-	virtual std::string ReadLine() {
+	std::string ReadLine() {
 		size_t next = data_.find('\n', pos_);
 		if (next == data_.npos) {
 			std::string result = data_.substr(pos_);
@@ -163,48 +143,23 @@ protected:
 		return s.substr(0, p + 1);
 	}
 
-	int valid_;
+	int valid_ = 0;
 	std::string buffer_[MAX_BUFFER];
 	const std::string data_;
-	size_t pos_;
+	size_t pos_ = 0;
 };
 
-struct BufferedLineReaderFile : public BufferedLineReader {
-	BufferedLineReaderFile(std::ifstream &in) : BufferedLineReader(), in_(in) {
+Path ExpectedScreenshotFromFilename(const Path &bootFilename) {
+	std::string extension = bootFilename.GetFileExtension();
+	if (extension.empty()) {
+		return bootFilename.WithExtraExtension(".bmp");
 	}
 
-protected:
-	virtual bool HasMoreLines() {
-		return !in_.eof();
-	}
-
-	virtual std::string ReadLine() {
-		char temp[TEMP_BUFFER_SIZE];
-		in_.getline(temp, TEMP_BUFFER_SIZE);
-		return temp;
-	}
-
-	std::ifstream &in_;
-};
-
-std::string ExpectedFromFilename(const std::string &bootFilename) {
-	size_t pos = bootFilename.find_last_of('.');
-	if (pos == bootFilename.npos) {
-		return bootFilename + ".expected";
-	}
-	return bootFilename.substr(0, pos) + ".expected";
-}
-
-std::string ExpectedScreenshotFromFilename(const std::string &bootFilename) {
-	size_t pos = bootFilename.find_last_of('.');
-	if (pos == bootFilename.npos) {
-		return bootFilename + ".bmp";
-	}
 	// Let's use pngs as the default for ppdmp tests.
-	if (bootFilename.substr(pos) == ".ppdmp") {
-		return bootFilename.substr(0, pos) + ".png";
+	if (extension == ".ppdmp") {
+		return bootFilename.WithReplacedExtension(".png");
 	}
-	return bootFilename.substr(0, pos) + ".expected.bmp";
+	return bootFilename.WithReplacedExtension(".expected.bmp");
 }
 
 static std::string ChopFront(std::string s, std::string front)
@@ -228,14 +183,19 @@ static std::string ChopEnd(std::string s, std::string end)
 	return s;
 }
 
-std::string GetTestName(const std::string &bootFilename)
+std::string GetTestName(const Path &bootFilename)
 {
 	// Kinda ugly, trying to guesstimate the test name from filename...
-	return ChopEnd(ChopFront(ChopFront(bootFilename, "tests/"), "pspautotests/tests/"), ".prx");
+	return ChopEnd(ChopFront(ChopFront(bootFilename.ToString(), "tests/"), "pspautotests/tests/"), ".prx");
 }
 
-bool CompareOutput(const std::string &bootFilename, const std::string &output, bool verbose) {
-	std::string expect_filename = ExpectedFromFilename(bootFilename);
+bool CompareOutput(const Path &bootFilename, const std::string &output, bool verbose, bool printEqualLines) {
+	// A .prx test has its expectations next to it as ".expected"; anything else just gets the
+	// extension tacked on.
+	Path expect_filename;
+	if (!bootFilename.WithReplacedExtension(".prx", ".expected", &expect_filename)) {
+		expect_filename = bootFilename.WithExtraExtension(".expected");
+	}
 	std::unique_ptr<FileLoader> expect_loader(ConstructFileLoader(expect_filename));
 
 	if (expect_loader->Exists()) {
@@ -247,14 +207,17 @@ bool CompareOutput(const std::string &bootFilename, const std::string &output, b
 		BufferedLineReader actual(output);
 
 		bool failed = false;
-		while (expected.HasLines())
-		{
-			if (expected.Compare(actual))
+		while (expected.HasLines()) {
+			std::string value = expected.Peek(0);
+			if (expected.Compare(actual)) {  // note: Compare actually advances if equal. This is pretty ugly.
+				if (printEqualLines) {
+					printf("= %s\n", value.c_str());
+				}
+				// Lines were equal.
 				continue;
+			}
 
-			if (!failed)
-			{
-				TeamCityPrint("testFailed name='%s' message='Output different from expected file'", currentTestName.c_str());
+			if (!failed) {
 				GitHubActionsPrint("error", "Incorrect output for %s", currentTestName.c_str());
 				failed = true;
 			}
@@ -262,20 +225,18 @@ bool CompareOutput(const std::string &bootFilename, const std::string &output, b
 			// This is a really dirt simple comparing algorithm.
 
 			// Perhaps it was an extra line?
-			if (expected.Peek(0) == actual.Peek(1) || !expected.HasLines())
+			if (expected.Peek(0) == actual.Peek(1) || !expected.HasLines()) {
 				printf("+ %s\n", actual.Consume().c_str());
-			// A single missing line?
-			else if (expected.Peek(1) == actual.Peek(0) || !actual.HasLines())
+				// A single missing line?
+			} else if (expected.Peek(1) == actual.Peek(0) || !actual.HasLines()) {
 				printf("- %s\n", expected.Consume().c_str());
-			else
-			{
+			} else {
 				printf("O %s\n", actual.Consume().c_str());
 				printf("E %s\n", expected.Consume().c_str());
 			}
 		}
 
-		while (actual.HasLines())
-		{
+		while (actual.HasLines()) {
 			// If it's a blank line, this will pass.
 			if (actual.Compare(expected))
 				continue;
@@ -283,21 +244,17 @@ bool CompareOutput(const std::string &bootFilename, const std::string &output, b
 			printf("+ %s\n", actual.Consume().c_str());
 		}
 
-		if (verbose)
-		{
-			if (!failed)
-			{
+		if (verbose) {
+			if (!failed) {
 				printf("++++++++++++++ The Equal Output +++++++++++++\n");
 				printf("%s", output.c_str());
 				printf("+++++++++++++++++++++++++++++++++++++++++++++\n");
-			}
-			else
-			{
+			} else {
 				printf("============== output from failed %s:\n", GetTestName(bootFilename).c_str());
 				printf("%s", output.c_str());
 				printf("============== expected output:\n");
 				std::string fullExpected;
-				if (readFileToString(true, expect_filename.c_str(), fullExpected))
+				if (File::ReadTextFileToString(expect_filename, &fullExpected))
 					printf("%s", fullExpected.c_str());
 				printf("===============================\n");
 			}
@@ -311,12 +268,10 @@ bool CompareOutput(const std::string &bootFilename, const std::string &output, b
 			// Okay, just a screenshot then.  Allow a pass with no output (i.e. screenshot match.)
 			failed = output.find_first_not_of(" \r\n\t") != output.npos;
 			if (failed) {
-				TeamCityPrint("testFailed name='%s' message='Output different from expected file'", currentTestName.c_str());
 				GitHubActionsPrint("error", "Incorrect output for %s", currentTestName.c_str());
 			}
 		} else {
 			fprintf(stderr, "Expectation file %s not found\n", expect_filename.c_str());
-			TeamCityPrint("testIgnored name='%s' message='Expects file missing'", currentTestName.c_str());
 			GitHubActionsPrint("error", "Expected file missing for %s", currentTestName.c_str());
 		}
 
@@ -330,16 +285,20 @@ bool CompareOutput(const std::string &bootFilename, const std::string &output, b
 	}
 }
 
-inline int ComparePixel(u32 pix1, u32 pix2)
-{
-	// For now, if they're different at all except alpha, it's an error.
-	if ((pix1 & 0xFFFFFF) != (pix2 & 0xFFFFFF))
-		return 1;
-	return 0;
+static inline float CompareChannel(int pix1, int pix2) {
+	float diff = pix1 - pix2;
+	return diff * diff;
 }
 
-std::vector<u32> TranslateDebugBufferToCompare(const GPUDebugBuffer *buffer, u32 stride, u32 h)
-{
+static inline double ComparePixel(u32 pix1, u32 pix2) {
+	// Ignore alpha.
+	double r = CompareChannel(pix1 & 0xFF, pix2 & 0xFF);
+	double g = CompareChannel((pix1 >> 8) & 0xFF, (pix2 >> 8) & 0xFF);
+	double b = CompareChannel((pix1 >> 16) & 0xFF, (pix2 >> 16) & 0xFF);
+	return r + g + b;
+}
+
+std::vector<u32> TranslateDebugBufferToCompare(const GPUDebugBuffer *buffer, u32 stride, u32 h) {
 	// If the output was small, act like everything outside was 0.
 	// This can happen depending on viewport parameters.
 	u32 safeW = std::min(stride, buffer->GetStride());
@@ -351,32 +310,35 @@ std::vector<u32> TranslateDebugBufferToCompare(const GPUDebugBuffer *buffer, u32
 	const u32 *pixels32 = (const u32 *)buffer->GetData();
 	const u16 *pixels16 = (const u16 *)buffer->GetData();
 	int outStride = buffer->GetStride();
-	if (!buffer->GetFlipped()) {
-		// Bitmaps are flipped, so we have to compare backwards in this case.
-		int toLastRow = outStride * (buffer->GetHeight() - 1);
+	if (buffer->GetFlipped()) {
+		// The buffer is stored bottom-up (e.g. to fit a bitmap), so read backwards
+		// here to get top-down output.
+		int toLastRow = outStride * (h > buffer->GetHeight() ? buffer->GetHeight() - 1 : h - 1);
 		pixels32 += toLastRow;
 		pixels16 += toLastRow;
 		outStride = -outStride;
 	}
 
-	u32 errors = 0;
+	// The output is top-down; if the buffer was smaller, the image starts at the top.
+	u32 *dst = &data[0];
+
 	for (u32 y = 0; y < safeH; ++y) {
 		switch (buffer->GetFormat()) {
 		case GPU_DBG_FORMAT_8888:
-			ConvertBGRA8888ToRGBA8888(&data[y * stride], pixels32, safeW);
+			ConvertBGRA8888ToRGBA8888(&dst[y * stride], pixels32, safeW);
 			break;
 		case GPU_DBG_FORMAT_8888_BGRA:
-			memcpy(&data[y * stride], pixels32, safeW * sizeof(u32));
+			memcpy(&dst[y * stride], pixels32, safeW * sizeof(u32));
 			break;
 
 		case GPU_DBG_FORMAT_565:
-			ConvertRGB565ToBGRA8888(&data[y * stride], pixels16, safeW);
+			ConvertRGB565ToBGRA8888(&dst[y * stride], pixels16, safeW);
 			break;
 		case GPU_DBG_FORMAT_5551:
-			ConvertRGBA5551ToBGRA8888(&data[y * stride], pixels16, safeW);
+			ConvertRGBA5551ToBGRA8888(&dst[y * stride], pixels16, safeW);
 			break;
 		case GPU_DBG_FORMAT_4444:
-			ConvertRGBA4444ToBGRA8888(&data[y * stride], pixels16, safeW);
+			ConvertRGBA4444ToBGRA8888(&dst[y * stride], pixels16, safeW);
 			break;
 
 		default:
@@ -391,32 +353,36 @@ std::vector<u32> TranslateDebugBufferToCompare(const GPUDebugBuffer *buffer, u32
 	return data;
 }
 
-double CompareScreenshot(const std::vector<u32> &pixels, u32 stride, u32 w, u32 h, const std::string& screenshotFilename, std::string &error)
-{
-	if (pixels.size() < stride * h)
-	{
-		error = "Buffer format conversion error";
+
+ScreenshotComparer::~ScreenshotComparer() {
+	if (reference_)
+		free(reference_);
+}
+
+double ScreenshotComparer::Compare(const Path &screenshotFilename) {
+	if (pixels_.size() < stride_ * h_) {
+		error_ = "Buffer format conversion error";
 		return -1.0f;
 	}
 
 	// We assume the bitmap is the specified size, not including whatever stride.
-	u32 *reference = nullptr;
-	bool asBitmap = false;
-
 	std::unique_ptr<FileLoader> loader(ConstructFileLoader(screenshotFilename));
 	if (loader->Exists()) {
 		uint8_t header[2];
 		if (loader->ReadAt(0, 2, header) != 2) {
-			error = "Unable to read screenshot data: " + screenshotFilename;
+			error_ = "Unable to read screenshot data: " + screenshotFilename.ToVisualString();
 			return -1.0f;
 		}
 
 		if (header[0] == 'B' && header[1] == 'M') {
-			reference = (u32 *)calloc(stride * h, sizeof(u32));
-			asBitmap = true;
+			reference_ = (u32 *)calloc(stride_ * h_, sizeof(u32));
+			referenceStride_ = stride_;
+			asBitmap_ = true;
 			// The bitmap header is 14 + 40 bytes.  We could validate it but the test would fail either way.
-			if (reference && loader->ReadAt(14 + 40, sizeof(u32), stride * h, reference) != stride * h) {
-				error = "Unable to read screenshot data: " + screenshotFilename;
+			if (reference_ && loader->ReadAt(14 + 40, sizeof(u32), stride_ * h_, reference_) != stride_ * h_) {
+				error_ = "Unable to read screenshot data: " + screenshotFilename.ToVisualString();
+				free(reference_);
+				reference_ = nullptr;
 				return -1.0f;
 			}
 		} else {
@@ -424,45 +390,181 @@ double CompareScreenshot(const std::vector<u32> &pixels, u32 stride, u32 w, u32 
 			std::vector<uint8_t> compressed;
 			compressed.resize(loader->FileSize());
 			if (loader->ReadAt(0, compressed.size(), &compressed[0]) != compressed.size()) {
-				error = "Unable to read screenshot data: " + screenshotFilename;
+				error_ = "Unable to read screenshot data: " + screenshotFilename.ToVisualString();
 				return -1.0f;
 			}
 
 			int width, height;
-			if (!pngLoadPtr(&compressed[0], compressed.size(), &width, &height, (unsigned char **)&reference)) {
-				error = "Unable to read screenshot data: " + screenshotFilename;
+			if (!pngLoadPtr(&compressed[0], compressed.size(), &width, &height, (unsigned char **)&reference_)) {
+				error_ = "Unable to read screenshot data: " + screenshotFilename.ToVisualString();
+				if (reference_)
+					free(reference_);
+				reference_ = nullptr;
 				return -1.0f;
+			}
+
+			// Everything below reads w_ x h_ pixels from it.
+			if (width < (int)w_ || height < (int)h_) {
+				error_ = StringFromFormat("Screenshot is too small (%dx%d, expected %dx%d): %s", width, height, (int)w_, (int)h_, screenshotFilename.ToVisualString().c_str());
+				free(reference_);
+				reference_ = nullptr;
+				return -1.0f;
+			}
+			referenceStride_ = width;
+		}
+	} else {
+		error_ = "Unable to read screenshot: " + screenshotFilename.ToVisualString();
+		return -1.0f;
+	}
+
+	if (!reference_) {
+		error_ = "Unable to allocate screenshot data: " + screenshotFilename.ToVisualString();
+		return -1.0f;
+	}
+
+	double errors = 0;
+	if (asBitmap_) {
+		// The reference is a BMP, stored bottom-up and BGRA by default for the
+		// common BMP compare case, so read it backwards (pixels_ is top-down).
+		for (u32 y = 0; y < h_; ++y) {
+			u32 yoff = (h_ - y - 1) * referenceStride_;
+			for (u32 x = 0; x < w_; ++x)
+				errors += ComparePixel(pixels_[y * stride_ + x], reference_[yoff + x]);
+		}
+	} else {
+		// The reference is a PNG, stored top-down, so no flip needed.
+		// Just convert to BGRA for simplicity.
+		ConvertRGBA8888ToBGRA8888(reference_, reference_, h_ * referenceStride_);
+		for (u32 y = 0; y < h_; ++y) {
+			u32 yoff = y * referenceStride_;
+			for (u32 x = 0; x < w_; ++x)
+				errors += ComparePixel(pixels_[y * stride_ + x], reference_[yoff + x]);
+		}
+	}
+
+	// Convert to MSE, accounting for all three channels (RGB.)
+	return errors / (double)(w_ * h_ * 3);
+}
+
+bool ScreenshotComparer::SaveActualBitmap(const Path &resultFilename) {
+	static const u8 header[14 + 40] = {
+		0x42, 0x4D, 0x38, 0x80, 0x08, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x28, 0x00,
+		0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x10, 0x01,
+		0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x02, 0x80, 0x08, 0x00, 0x12, 0x0B,
+		0x00, 0x00, 0x12, 0x0B, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	};
+
+	FILE *saved = File::OpenCFile(resultFilename, "wb");
+	if (saved) {
+		fwrite(&header, sizeof(header), 1, saved);
+		// Bitmaps are stored bottom-up, so write the rows backwards (pixels_ is top-down).
+		for (u32 y = 0; y < h_; ++y)
+			fwrite(pixels_.data() + (h_ - y - 1) * stride_, sizeof(u32), stride_, saved);
+		fclose(saved);
+
+		return true;
+	}
+
+	return false;
+}
+
+bool ScreenshotComparer::SaveActualPNG(const Path &resultFilename, bool keepAlpha) {
+	std::vector<u8> rgba((size_t)stride_ * h_ * 4);
+	const u32 *pixels = pixels_.data();
+	for (size_t i = 0; i < (size_t)stride_ * h_; ++i) {
+		u32 p = pixels[i];
+		rgba[i * 4 + 0] = (p >> 16) & 0xFF;
+		rgba[i * 4 + 1] = (p >> 8) & 0xFF;
+		rgba[i * 4 + 2] = p & 0xFF;
+		// Games often use the alpha channel for non-visual purposes, which
+		// results in fully transparent images in PNG viewers.  By default,
+		// force alpha to 255 when writing the image.
+		rgba[i * 4 + 3] = keepAlpha ? ((p >> 24) & 0xFF) : 0xFF;
+	}
+	return pngSave(resultFilename, rgba.data(), stride_, h_, 4);
+}
+
+bool ScreenshotComparer::SaveVisualComparisonPNG(const Path &resultFilename) {
+	std::unique_ptr<u32[]> comparison(new u32[w_ * 2 * h_ * 2]);
+
+	if (asBitmap_) {
+		// The reference is a BMP, stored bottom-up, so read it backwards.
+		for (u32 y = 0; y < h_; ++y) {
+			u32 yoff = (h_ - y - 1) * referenceStride_;
+			u32 comparisonRow = y * 2 * w_ * 2;
+			for (u32 x = 0; x < w_; ++x) {
+				PlotVisualComparison(comparison.get(), comparisonRow + x * 2, pixels_[y * stride_ + x], reference_[yoff + x]);
 			}
 		}
 	} else {
-		error = "Unable to read screenshot: " + screenshotFilename;
-		return -1.0f;
-	}
-
-	if (!reference) {
-		error = "Unable to allocate screenshot data: " + screenshotFilename;
-		return -1.0f;
-	}
-
-	u32 errors = 0;
-	if (asBitmap) {
-		// The reference is flipped and BGRA by default for the common BMP compare case.
-		for (u32 y = 0; y < h; ++y) {
-			u32 yoff = y * stride;
-			for (u32 x = 0; x < w; ++x)
-				errors += ComparePixel(pixels[y * stride + x], reference[yoff + x]);
-		}
-	} else {
-		// Just convert to BGRA for simplicity.
-		ConvertRGBA8888ToBGRA8888(reference, reference, h * stride);
-		for (u32 y = 0; y < h; ++y) {
-			u32 yoff = (h - y - 1) * stride;
-			for (u32 x = 0; x < w; ++x)
-				errors += ComparePixel(pixels[y * stride + x], reference[yoff + x]);
+		// Reference is a PNG, stored top-down, so no flip needed.
+		for (u32 y = 0; y < h_; ++y) {
+			u32 yoff = y * referenceStride_;
+			u32 comparisonRow = y * 2 * w_ * 2;
+			for (u32 x = 0; x < w_; ++x) {
+				PlotVisualComparison(comparison.get(), comparisonRow + x * 2, pixels_[y * stride_ + x], reference_[yoff + x]);
+			}
 		}
 	}
 
-	free(reference);
+	FILE *fp = File::OpenCFile(resultFilename, "wb");
+	if (!fp)
+		return false;
 
-	return (double) errors / (double) (w * h);
+	png_image png;
+	memset(&png, 0, sizeof(png));
+	png.version = PNG_IMAGE_VERSION;
+	png.format = PNG_FORMAT_BGRA;
+	png.width = w_ * 2;
+	png.height = h_ * 2;
+
+	bool success = png_image_write_to_stdio(&png, fp, 0, comparison.get(), w_ * 2 * 4, nullptr) != 0;
+	fclose(fp);
+	png_image_free(&png);
+
+	return success && png.warning_or_error < 2;
+}
+
+int ChannelDifference(u8 actual, u8 reference) {
+	int diff = actual > reference ? actual - reference : reference - actual;
+	if (diff == 0)
+		return 0;
+	if (diff < 4)
+		return 1;
+	if (diff < 8)
+		return 2;
+	if (diff < 16)
+		return 3;
+	if (diff < 32)
+		return 4;
+	return 5;
+}
+
+int PixelDifference(u32 actual, u32 reference) {
+	int b = ChannelDifference((actual >> 0) & 0xFF, (reference >> 0) & 0xFF);
+	int g = ChannelDifference((actual >> 8) & 0xFF, (reference >> 8) & 0xFF);
+	int r = ChannelDifference((actual >> 16) & 0xFF, (reference >> 16) & 0xFF);
+	return std::max(b, std::max(g, r));
+}
+
+void ScreenshotComparer::PlotVisualComparison(u32 *dst, u32 offset, u32 actual, u32 reference) {
+	int diff = PixelDifference(actual, reference);
+	dst[offset + 0] = actual | 0xFF000000;
+	dst[offset + 1] = actual | 0xFF000000;
+	dst[offset + w_ * 2 + 0] = reference | 0xFF000000;
+
+	int alpha = 0x00000000;
+	switch (diff) {
+	case 0: alpha = 0xFF000000; break;
+	case 1: alpha = 0xEF000000; break;
+	case 2: alpha = 0xCF000000; break;
+	case 3: alpha = 0xAF000000; break;
+	case 4: alpha = 0x7F000000; break;
+	default: break;
+	}
+
+	dst[offset + w_ * 2 + 1] = (reference & 0x00FFFFFF) | alpha;
 }

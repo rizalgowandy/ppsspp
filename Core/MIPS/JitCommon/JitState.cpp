@@ -19,11 +19,13 @@
 #include "Common/CPUDetect.h"
 #include "Core/Config.h"
 #include "Core/MIPS/JitCommon/JitState.h"
+#include "Core/MemMap.h"
 #include "Common/MemoryUtil.h"
 
 namespace MIPSComp {
+
 	JitOptions::JitOptions() {
-		disableFlags = g_Config.uJitDisableFlags;
+		disableFlags = (JitDisable)g_Config.uJitDisableFlags;
 
 		// x86
 		enableVFPUSIMD = !Disabled(JitDisable::SIMD);
@@ -37,37 +39,22 @@ namespace MIPSComp {
 
 		// ARM only
 		downcountInRegister = true;
-		useNEONVFPU = false;  // true
-		if (!cpu_info.bNEON || Disabled(JitDisable::SIMD))
-			useNEONVFPU = false;
-
-		//ARM64
-		useASIMDVFPU = false;  // !Disabled(JitDisable::SIMD);
 
 		// Common
 
 		// We can get block linking to work with W^X by doing even more unprotect/re-protect, but let's try without first.
 		// enableBlocklink = !PlatformIsWXExclusive();  // Revert to this line if block linking is slow in W^X mode
-#if PPSSPP_ARCH(MIPS)
-		enableBlocklink = false;
-#else
 		enableBlocklink = !Disabled(JitDisable::BLOCKLINK);
-#endif
-		immBranches = false;
-		continueBranches = false;
-		continueJumps = false;
-		continueMaxInstructions = 300;
-
 		useStaticAlloc = false;
 		enablePointerify = false;
-#if PPSSPP_ARCH(ARM64)
+#if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(RISCV64) || PPSSPP_ARCH(LOONGARCH64)
 		useStaticAlloc = !Disabled(JitDisable::STATIC_ALLOC);
 		// iOS/etc. may disable at runtime if Memory::base is not nicely aligned.
 		enablePointerify = !Disabled(JitDisable::POINTERIFY);
 #endif
-	}
-
-	bool JitOptions::Disabled(JitDisable bit) {
-		return (disableFlags & (uint32_t)bit) != 0;
+#if PPSSPP_ARCH(RISCV64)
+		// Seems to perform slightly better than a checked entry at the start.
+		useBackJump = true;
+#endif
 	}
 }

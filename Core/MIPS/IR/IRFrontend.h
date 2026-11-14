@@ -1,23 +1,33 @@
 #pragma once
 
 #include "Common/CommonTypes.h"
+#include "Common/TimeUtil.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/JitCommon/JitState.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
 #include "Core/MIPS/IR/IRInst.h"
+
+namespace Memory {
+struct AddressSpace;
+}
 
 namespace MIPSComp {
 
 class IRFrontend : public MIPSFrontendInterface {
 public:
 	IRFrontend(bool startDefaultPrefix);
+	// Copies the state compiling depends on, to compile a block on the side.
+	IRFrontend(const IRFrontend &other) : js(other.js), opts(other.opts), space_(other.space_) {}
 	void Comp_Generic(MIPSOpcode op) override;
 
-	void Comp_RunBlock(MIPSOpcode op) override;
+	// What the CPU compiled for sees of memory, which is the main CPU's unless set.
+	void SetAddressSpace(const Memory::AddressSpace *space) { space_ = space; }
+
 	void Comp_ReplacementFunc(MIPSOpcode op) override;
 
 	// Ops
 	void Comp_ITypeMem(MIPSOpcode op) override;
+	void Comp_StoreSync(MIPSOpcode op) override;
 	void Comp_Cache(MIPSOpcode op) override;
 
 	void Comp_RelBranch(MIPSOpcode op) override;
@@ -83,12 +93,23 @@ public:
 	void Comp_Vocp(MIPSOpcode op) override;
 	void Comp_ColorConv(MIPSOpcode op) override;
 	void Comp_Vbfy(MIPSOpcode op) override;
+	void Comp_Vsrt(MIPSOpcode op) override;
+	void Comp_Vf2h(MIPSOpcode op) override;
 
 	int Replace_fabsf() override;
-	void DoState(PointerWrap &p);
+	// Returns true if a loaded state means blocks compiled before it can't run any more.
+	bool DoState(PointerWrap &p);
+	bool UpdateFCR31(u32 fcr31);  // returns true if the block cache needs clearing
 	bool CheckRounding(u32 blockAddress);  // returns true if we need a do-over
 
-	void DoJit(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes, bool preload);
+	// timePhases: time making the IR and the passes (below). Reading the clock isn't free everywhere:
+	// about 0.3 us on a Galaxy S8, whose kernel traps the counter reads.
+	void DoJit(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes, bool timePhases = false);
+	// With timePhases, how long the last DoJit spent making the IR, and running the passes over it, and when it ended.
+	int64_t LastFrontendNanos() const { return lastFrontendNanos_; }
+	int64_t LastPassNanos() const { return lastPassNanos_; }
+	// In time_now_fast_ticks() units.
+	uint64_t LastEnd() const { return lastEnd_; }
 
 	void EatPrefix() override {
 		js.EatPrefix();
@@ -97,6 +118,13 @@ public:
 	void SetOptions(const IROptions &o) {
 		opts = o;
 	}
+
+	// One lane of a Vec4VfpuDot operand: a reg, maybe negated, or a constant (reg < 0).
+	struct DotLane {
+		int reg;
+		float constant;
+		bool negate;
+	};
 
 private:
 	void RestoreRoundingMode(bool force = false);
@@ -119,26 +147,59 @@ private:
 	void BranchVFPUFlag(MIPSOpcode op, IRComparison cc, bool likely);
 	void BranchRSZeroComp(MIPSOpcode op, IRComparison cc, bool andLink, bool likely);
 	void BranchRSRTComp(MIPSOpcode op, IRComparison cc, bool likely);
+	bool CanContinuePastBranch(const BranchInfo &branchInfo, bool constantOperands);
+	bool CompileBranchPair(MIPSOpcode op);
 
 	// Utilities to reduce duplicated code
 	void CompShiftImm(MIPSOpcode op, IROp shiftType, int sa);
 	void CompShiftVar(MIPSOpcode op, IROp shiftType);
 
 	void ApplyPrefixST(u8 *vregs, u32 prefix, VectorSize sz, int tempReg);
-	void ApplyPrefixD(const u8 *vregs, VectorSize sz);
+	void ApplyPrefixD(u8 *vregs, VectorSize sz, int vectorReg);
+	void ApplyPrefixDMask(u8 *vregs, VectorSize sz, int vectorReg);
 	void GetVectorRegsPrefixS(u8 *regs, VectorSize sz, int vectorReg);
 	void GetVectorRegsPrefixT(u8 *regs, VectorSize sz, int vectorReg);
 	void GetVectorRegsPrefixD(u8 *regs, VectorSize sz, int vectorReg);
 	void GetVectorRegs(u8 regs[4], VectorSize N, int vectorReg);
 	void GetMatrixRegs(u8 regs[16], MatrixSize N, int matrixReg);
 
+	static DotLane DotReg(int reg, bool negate = false) { return DotLane{ reg, 0.0f, negate }; }
+	static DotLane DotConst(float f) { return DotLane{ -1, f, false }; }
+	// Puts both operands of a Vec4VfpuDot in Vec4 regs, building them in free temps where they
+	// aren't one already. avoid is a Vec4 temp that must not be used (or -1). Returns false if
+	// there aren't enough free temps, and then nothing was written.
+	bool BuildDotOperands(const DotLane s[4], const DotLane t[4], int avoid, u8 *sVec, u8 *tVec);
+	// One dot for TryMultiDot(): its operands' lanes, and where the result goes.
+	struct MultiDot {
+		DotLane a[4];
+		DotLane b[4];
+		int dest;
+	};
+	// Writes up to four dots as one Vec4VfpuMultiDot, if they fit it: one operand shared, the others
+	// lanes of one 4x4 block, terms past the count zero, and no dot reading what an earlier one wrote.
+	// With destScratch, a Vec4 that has dot k's result at lane k may be written whole. avoid is a Vec4
+	// temp not to use (or -1). Returns false, having written nothing, if they don't fit.
+	bool TryMultiDot(const MultiDot *dots, int count, int terms, int avoid, bool destScratch);
+
 	// State
 	JitState js;
 	IRWriter ir;
+	// The IR after the passes. A member to keep its capacity.
+	IRWriter simplified_;
 	IROptions opts{};
 
 	int dontLogBlocks = 0;
 	int logBlocks = 0;
+
+	int64_t lastFrontendNanos_ = 0;
+	int64_t lastPassNanos_ = 0;
+	uint64_t lastEnd_ = 0;
+
+private:
+	bool IsMediaEngine() const;
+	MIPSOpcode ReadOp(u32 addr) const;
+
+	const Memory::AddressSpace *space_ = nullptr;
 };
 
 }  // namespace

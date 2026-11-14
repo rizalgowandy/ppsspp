@@ -17,13 +17,16 @@
 
 #include "Common/Data/Encoding/Base64.h"
 #include "Common/File/FileUtil.h"
+#include "Core/Core.h"
 #include "Core/Debugger/WebSocket/GPURecordSubscriber.h"
 #include "Core/Debugger/WebSocket/WebSocketUtils.h"
 #include "Core/System.h"
 #include "GPU/Debugger/Record.h"
+#include "GPU/GPU.h"
+#include "GPU/GPUCommon.h"
 
 struct WebSocketGPURecordState : public DebuggerSubscriber {
-	~WebSocketGPURecordState() override;
+	~WebSocketGPURecordState();
 	void Dump(DebuggerRequest &req);
 
 	void Broadcast(net::WebSocketServer *ws) override;
@@ -31,20 +34,25 @@ struct WebSocketGPURecordState : public DebuggerSubscriber {
 protected:
 	bool pending_ = false;
 	std::string lastTicket_;
-	std::string lastFilename_;
+	Path lastFilename_;
 };
 
 DebuggerSubscriber *WebSocketGPURecordInit(DebuggerEventHandlerMap &map) {
 	auto p = new WebSocketGPURecordState();
-	map["gpu.record.dump"] = std::bind(&WebSocketGPURecordState::Dump, p, std::placeholders::_1);
+	map["gpu.record.dump"] = [p](DebuggerRequest &req) { p->Dump(req); };
 
 	return p;
 }
 
 WebSocketGPURecordState::~WebSocketGPURecordState() {
-	// Clear the callback to hopefully avoid a crash.
-	if (pending_)
-		GPURecord::SetCallback(nullptr);
+	// Clear the callback to hopefully avoid a crash. On the CPU thread, since gpu itself is
+	// destroyed over there - see Core_RunOnCPUThread() in Core.h.
+	if (pending_) {
+		Core_RunOnCPUThread([&] {
+			if (gpu)
+				gpu->GetRecorder()->ClearCallback();
+		});
+	}
 }
 
 // Begin recording (gpu.record.dump)
@@ -56,17 +64,28 @@ WebSocketGPURecordState::~WebSocketGPURecordState() {
 //
 // Note: recording may take a moment.
 void WebSocketGPURecordState::Dump(DebuggerRequest &req) {
-	if (!PSP_IsInited())
-		return req.Fail("CPU not started");
+	// gpu is created and destroyed on the CPU thread, so ask it for a recording over there rather
+	// than dereferencing it from this WebSocket handler thread.
+	bool started = false;
+	bool haveGPU = false;
+	Core_RunOnCPUThread([&] {
+		haveGPU = PSP_GetBootState() == BootState::Complete && gpu != nullptr;
+		if (!haveGPU)
+			return;
+		started = gpu->GetRecorder()->RecordNextFrame([=](const Path &filename) {
+			lastFilename_ = filename;
+			pending_ = false;
+		});
+	});
 
-	if (!GPURecord::Activate())
+	if (!haveGPU) {
+		return req.Fail("CPU not started");
+	}
+	if (!started) {
 		return req.Fail("Recording already in progress");
+	}
 
 	pending_ = true;
-	GPURecord::SetCallback([=](const std::string &filename) {
-		lastFilename_ = filename;
-		pending_ = false;
-	});
 
 	const JsonNode *value = req.data.get("ticket");
 	lastTicket_ = value ? json_stringify(value) : "";

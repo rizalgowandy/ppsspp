@@ -26,15 +26,25 @@
 #include "GPU/Common/VertexShaderGenerator.h"
 #include "GPU/Common/FragmentShaderGenerator.h"
 
+class DrawEngineGLES;
 class Shader;
+class Path;
+struct ShaderLanguageDesc;
+
+namespace File {
+class IOFile;
+}
 
 class LinkedShader {
 public:
+	LinkedShader(const LinkedShader &) = delete;
+	LinkedShader &operator=(const LinkedShader &) = delete;
 	LinkedShader(GLRenderManager *render, VShaderID VSID, Shader *vs, FShaderID FSID, Shader *fs, bool useHWTransform, bool preloading = false);
 	~LinkedShader();
 
-	void use(const ShaderID &VSID);
-	void UpdateUniforms(u32 vertType, const ShaderID &VSID, bool useBufferedRendering);
+	void use(const ShaderID &VSID) const;
+	void UpdateUniforms(const ShaderID &VSID, const ShaderLanguageDesc &shaderLanguage, bool pixelMapped);
+	void Delete();
 
 	GLRenderManager *render_;
 	Shader *vs_;
@@ -51,21 +61,19 @@ public:
 	int u_stencilReplaceValue;
 	int u_tex;
 	int u_proj;
-	int u_proj_through;
+	int u_xywh;
+	int u_vpScale;
+	int u_vpOffset;
 	int u_texenv;
 	int u_view;
 	int u_texmtx;
 	int u_world;
-	int u_depthRange;   // x,y = viewport xscale/xcenter. z,w=clipping minz/maxz (?)
-	int u_cullRangeMin;
-	int u_cullRangeMax;
+	int u_mipBias;
+	int u_texLodBias;
+	int u_NaN;
 
-#ifdef USE_BONE_ARRAY
-	int u_bone;  // array, size is numBones
-#else
-	int u_bone[8];
-#endif
-	int numBones;
+	int u_rasterOffset;
+	int u_minZmaxZ;
 
 	// Shader blending.
 	int u_fbotex;
@@ -89,8 +97,10 @@ public:
 	int u_uvscaleoffset;
 	int u_texclamp;
 	int u_texclampoff;
+	int u_texNoAlphaMul;
 
 	// Lighting
+	int u_lightControl;
 	int u_ambient;
 	int u_matambientalpha;
 	int u_matdiffuse;
@@ -103,23 +113,25 @@ public:
 	int u_lightdiffuse[4];  // each light consist of vec4[3]
 	int u_lightspecular[4];  // attenuation
 	int u_lightambient[4];  // attenuation
-
-	// Spline Tessellation
-	int u_tess_points; // Control Points
-	int u_tess_weights_u;
-	int u_tess_weights_v;
-	int u_spline_counts;
 };
 
 // Real public interface
 
+struct ShaderDescGLES {
+	uint32_t glShaderType;
+	uint32_t attrMask;
+	uint64_t uniformMask;
+	bool useHWTransform;
+};
+
 class Shader {
 public:
-	Shader(GLRenderManager *render, const char *code, const std::string &desc, uint32_t glShaderType, bool useHWTransform, uint32_t attrMask, uint64_t uniformMask);
+	Shader(const Shader &) = delete;
+	Shader &operator=(const Shader &) = delete;
+	Shader(GLRenderManager *render, const char *code, const std::string &desc, const ShaderDescGLES &params);
 	~Shader();
 	GLRShader *shader;
 
-	bool Failed() const { return failed_; }
 	bool UseHWTransform() const { return useHWTransform_; }  // only relevant for vtx shaders
 
 	std::string GetShaderString(DebugShaderStringType type, ShaderID id) const;
@@ -130,42 +142,41 @@ public:
 private:
 	GLRenderManager *render_;
 	std::string source_;
-	bool failed_;
 	bool useHWTransform_;
 	bool isFragment_;
 	uint32_t attrMask_; // only used in vertex shaders
 	uint64_t uniformMask_;
 };
 
+class VertexDecoder;
+
+enum class ClipInfoFlags;
+
 class ShaderManagerGLES : public ShaderManagerCommon {
 public:
 	ShaderManagerGLES(Draw::DrawContext *draw);
 	~ShaderManagerGLES();
 
-	void ClearCache(bool deleteThem);  // TODO: deleteThem currently not respected
+	void ClearShaders() override;
 
 	// This is the old ApplyShader split into two parts, because of annoying information dependencies.
 	// If you call ApplyVertexShader, you MUST call ApplyFragmentShader soon afterwards.
-	Shader *ApplyVertexShader(bool useHWTransform, bool useHWTessellation, u32 vertType, bool weightsAsFloat, VShaderID *VSID);
-	LinkedShader *ApplyFragmentShader(VShaderID VSID, Shader *vs, u32 vertType, bool useBufferedRendering);
+	Shader *ApplyVertexShader(bool useHWTransform, u32 vertexType, ClipInfoFlags clipInfoFlags, VShaderID *VSID);
+	LinkedShader *ApplyFragmentShader(VShaderID VSID, Shader *vs, const ComputedPipelineState &pipelineState, ClipInfoFlags clipInfoFlags, bool pixelMapped);
 
-	void DeviceLost();
-	void DeviceRestore(Draw::DrawContext *draw);
-
-	void DirtyShader();
-	void DirtyLastShader() override;
+	void DeviceLost() override;
+	void DeviceRestore(Draw::DrawContext *draw) override;
 
 	int GetNumVertexShaders() const { return (int)vsCache_.size(); }
 	int GetNumFragmentShaders() const { return (int)fsCache_.size(); }
 	int GetNumPrograms() const { return (int)linkedShaderCache_.size(); }
 
-	std::vector<std::string> DebugGetShaderIDs(DebugShaderType type);
-	std::string DebugGetShaderString(std::string id, DebugShaderType type, DebugShaderStringType stringType);
+	std::vector<std::string> DebugGetShaderIDs(DebugShaderType type) override;
+	std::string DebugGetShaderString(std::string id, DebugShaderType type, DebugShaderStringType stringType) override;
 
-	void Load(const std::string &filename);
-	bool ContinuePrecompile(float sliceTime = 1.0f / 60.0f);
-	void CancelPrecompile();
-	void Save(const std::string &filename);
+	static bool LoadCacheFlags(File::IOFile &f, DrawEngineGLES *drawEngine);
+	bool LoadCache(File::IOFile &f);
+	void SaveCache(const Path &filename, DrawEngineGLES *drawEngine);
 
 private:
 	void Clear();
@@ -185,43 +196,18 @@ private:
 	GLRenderManager *render_;
 	LinkedShaderCache linkedShaderCache_;
 
-	bool lastVShaderSame_;
+	bool lastVShaderSame_ = false;
 
-	FShaderID lastFSID_;
-	VShaderID lastVSID_;
+	FShaderID lastFSID_{};
+	VShaderID lastVSID_{};
 
 	LinkedShader *lastShader_ = nullptr;
 	u64 shaderSwitchDirtyUniforms_ = 0;
 	char *codeBuffer_;
 
-	typedef DenseHashMap<FShaderID, Shader *, nullptr> FSCache;
+	typedef DenseHashMap<FShaderID, Shader *> FSCache;
 	FSCache fsCache_;
 
-	typedef DenseHashMap<VShaderID, Shader *, nullptr> VSCache;
+	typedef DenseHashMap<VShaderID, Shader *> VSCache;
 	VSCache vsCache_;
-
-	bool diskCacheDirty_ = false;
-	struct {
-		std::vector<VShaderID> vert;
-		std::vector<FShaderID> frag;
-		std::vector<std::pair<VShaderID, FShaderID>> link;
-
-		size_t vertPos = 0;
-		size_t fragPos = 0;
-		size_t linkPos = 0;
-		double start;
-
-		void Clear() {
-			vert.clear();
-			frag.clear();
-			link.clear();
-			vertPos = 0;
-			fragPos = 0;
-			linkPos = 0;
-		}
-
-		bool Done() {
-			return vertPos >= vert.size() && fragPos >= frag.size() && linkPos >= link.size();
-		}
-	} diskCachePending_;
 };

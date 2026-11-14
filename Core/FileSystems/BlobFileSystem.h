@@ -17,12 +17,14 @@
 
 #pragma once
 
-// This is used for opening a debug file as a blob, and mounting it.
+// This is used for opening a file as a blob, and mounting it.
 // Importantly, uses a fileLoader for all access, so http:// URLs are supported.
-// As of writing, only used by GE dump replay.
+// Used by GE dump replay, and for the EBOOT a PS1 disc image is presented as.
 
 #include <map>
 #include <string>
+
+#include "Common/File/Path.h"
 #include "Core/Loaders.h"
 #include "Core/FileSystems/FileSystem.h"
 
@@ -32,7 +34,7 @@ public:
 	~BlobFileSystem();
 
 	void DoState(PointerWrap &p) override;
-	std::vector<PSPFileInfo> GetDirListing(std::string path) override;
+	std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) override;
 	int      OpenFile(std::string filename, FileAccess access, const char *devicename = nullptr) override;
 	void     CloseFile(u32 handle) override;
 	size_t   ReadFile(u32 handle, u8 *pointer, s64 size) override;
@@ -41,17 +43,20 @@ public:
 	size_t   WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec) override;
 	size_t   SeekFile(u32 handle, s32 position, FileMove type) override;
 	PSPFileInfo GetFileInfo(std::string filename) override;
+	PSPFileInfo GetFileInfoByHandle(u32 handle) override;
 	bool     OwnsHandle(u32 handle) override;
 	int      Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen, int &usec) override;
 	PSPDevType DevType(u32 handle) override;
-	FileSystemFlags Flags() override { return FileSystemFlags::FLASH; }
+	FileSystemFlags Flags() const override { return FileSystemFlags::FLASH; }
 
 	bool MkDir(const std::string &dirname) override;
 	bool RmDir(const std::string &dirname) override;
 	int  RenameFile(const std::string &from, const std::string &to) override;
 	bool RemoveFile(const std::string &filename) override;
-	bool GetHostPath(const std::string &inpath, std::string &outpath) override;
-	u64 FreeSpace(const std::string &path) override;
+	u64 FreeDiskSpace(const std::string &path) override;
+
+	bool ComputeRecursiveDirSizeIfFast(const std::string &path, int64_t *size) override { return false; }
+	void Describe(char *buf, size_t size) const override { snprintf(buf, size, "%s", "Blob"); }
 
 private:
 	// File positions.

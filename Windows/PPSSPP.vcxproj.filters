@@ -29,12 +29,6 @@
     <Filter Include="Windows\GE Debugger">
       <UniqueIdentifier>{15f0e146-e39c-4bad-ba10-3c714a7dbf74}</UniqueIdentifier>
     </Filter>
-    <Filter Include="Other Platforms\Qt">
-      <UniqueIdentifier>{45191b1f-33c8-405c-a410-35fe2344d1d1}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="Other Platforms\Qt\Debugger">
-      <UniqueIdentifier>{1d0cc0ee-fdbd-419e-b322-b35075d9d9db}</UniqueIdentifier>
-    </Filter>
     <Filter Include="Other Platforms\SDL">
       <UniqueIdentifier>{5bfed059-8636-4b1e-a3cf-f948d645babb}</UniqueIdentifier>
     </Filter>
@@ -52,6 +46,24 @@
     </Filter>
     <Filter Include="Other Platforms\UWP">
       <UniqueIdentifier>{21c262bc-bc21-49d7-a332-2e2614e89217}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Build\Actions">
+      <UniqueIdentifier>{14abd855-ec8b-47a5-8b4c-eadcff122dc8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Build\CMake">
+      <UniqueIdentifier>{8f39c005-9738-41c5-a8d8-cfc05bf178e8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Windows\Darkmode">
+      <UniqueIdentifier>{e6f1a7f6-807b-484e-9595-bdb58ecaa2ae}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Other Platforms\Mac">
+      <UniqueIdentifier>{e2dd8951-ccb6-4575-996a-69c6832fafbf}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Windows\Input\Hid">
+      <UniqueIdentifier>{55d277d0-1afa-464d-9bde-672334ad73fe}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="assets">
+      <UniqueIdentifier>{a5b85611-e50f-4179-814d-426816c1e04d}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -76,26 +88,14 @@
     <ClCompile Include="W32Util\Misc.cpp">
       <Filter>Windows\W32Util</Filter>
     </ClCompile>
-    <ClCompile Include="W32Util\PropertySheet.cpp">
-      <Filter>Windows\W32Util</Filter>
-    </ClCompile>
     <ClCompile Include="W32Util\ShellUtil.cpp">
       <Filter>Windows\W32Util</Filter>
     </ClCompile>
     <ClCompile Include="InputBox.cpp">
       <Filter>Windows\UI</Filter>
     </ClCompile>
-    <ClCompile Include="DSoundStream.cpp">
-      <Filter>Windows\System</Filter>
-    </ClCompile>
-    <ClCompile Include="WindowsHost.cpp">
-      <Filter>Windows\System</Filter>
-    </ClCompile>
     <ClCompile Include="Debugger\Debugger_Disasm.cpp">
       <Filter>Windows\Debugger</Filter>
-    </ClCompile>
-    <ClCompile Include="EmuThread.cpp">
-      <Filter>Windows</Filter>
     </ClCompile>
     <ClCompile Include="XinputDevice.cpp">
       <Filter>Windows\Input</Filter>
@@ -109,9 +109,6 @@
       <Filter>Other Platforms</Filter>
     </ClCompile>
     <ClCompile Include="..\android\jni\Arm64EmitterTest.cpp">
-      <Filter>Other Platforms</Filter>
-    </ClCompile>
-    <ClCompile Include="..\android\jni\TestRunner.cpp">
       <Filter>Other Platforms</Filter>
     </ClCompile>
     <ClCompile Include="DinputDevice.cpp">
@@ -166,47 +163,26 @@
     <ClCompile Include="MainWindow.cpp">
       <Filter>Windows\UI</Filter>
     </ClCompile>
-    <ClCompile Include="GPU\D3D9Context.cpp">
-      <Filter>Windows\System</Filter>
-    </ClCompile>
     <ClCompile Include="GPU\WindowsGLContext.cpp">
       <Filter>Windows\System</Filter>
-    </ClCompile>
-    <ClCompile Include="..\Qt\mainwindow.cpp">
-      <Filter>Other Platforms\Qt</Filter>
     </ClCompile>
     <ClCompile Include="GPU\D3D11Context.cpp">
       <Filter>Windows\System</Filter>
     </ClCompile>
-    <ClCompile Include="..\Qt\QtHost.cpp">
-      <Filter>Other Platforms\Qt</Filter>
-    </ClCompile>
     <ClCompile Include="WindowsAudio.cpp">
       <Filter>Windows\System</Filter>
     </ClCompile>
-    <ClCompile Include="WASAPIStream.cpp">
+    <ClCompile Include="WASAPIContext.cpp">
+      <Filter>Windows\System</Filter>
+    </ClCompile>
+    <ClCompile Include="WASAPIMicrophone.cpp">
       <Filter>Windows\System</Filter>
     </ClCompile>
     <ClCompile Include="CaptureDevice.cpp">
       <Filter>Windows\Input</Filter>
     </ClCompile>
-    <ClCompile Include="GPU\WindowsVulkanContext.cpp">
-      <Filter>Windows\System</Filter>
-    </ClCompile>
-    <ClCompile Include="..\android\jni\AndroidEGLContext.cpp">
-      <Filter>Other Platforms\Android</Filter>
-    </ClCompile>
-    <ClCompile Include="..\android\jni\AndroidJavaGLContext.cpp">
-      <Filter>Other Platforms\Android</Filter>
-    </ClCompile>
-    <ClCompile Include="..\android\jni\AndroidVulkanContext.cpp">
-      <Filter>Other Platforms\Android</Filter>
-    </ClCompile>
     <ClCompile Include="..\android\jni\app-android.cpp">
       <Filter>Other Platforms\Android</Filter>
-    </ClCompile>
-    <ClCompile Include="..\ios\SmartKeyboardMap.cpp">
-      <Filter>Other Platforms\iOS</Filter>
     </ClCompile>
     <ClCompile Include="..\libretro\LibretroGraphicsContext.cpp">
       <Filter>Other Platforms\libretro</Filter>
@@ -217,7 +193,7 @@
     <ClCompile Include="..\libretro\libretro.cpp">
       <Filter>Other Platforms\libretro</Filter>
     </ClCompile>
-    <ClCompile Include="..\libretro\libretro_vulkan.cpp">
+    <ClCompile Include="..\libretro\LibretroVulkanPresentation.cpp">
       <Filter>Other Platforms\libretro</Filter>
     </ClCompile>
     <ClCompile Include="..\libretro\LibretroD3D11Context.cpp">
@@ -225,9 +201,6 @@
     </ClCompile>
     <ClCompile Include="..\libretro\LibretroGLContext.cpp">
       <Filter>Other Platforms\libretro</Filter>
-    </ClCompile>
-    <ClCompile Include="..\Qt\QtMain.cpp">
-      <Filter>Other Platforms\Qt</Filter>
     </ClCompile>
     <ClCompile Include="..\SDL\SDLGLGraphicsContext.cpp">
       <Filter>Other Platforms\SDL</Filter>
@@ -238,12 +211,6 @@
     <ClCompile Include="..\SDL\SDLMain.cpp">
       <Filter>Other Platforms\SDL</Filter>
     </ClCompile>
-    <ClCompile Include="..\SDL\SDLVulkanGraphicsContext.cpp">
-      <Filter>Other Platforms\SDL</Filter>
-    </ClCompile>
-    <ClCompile Include="..\UWP\UWPHost.cpp">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClCompile>
     <ClCompile Include="..\UWP\NKCodeFromWindowsSystem.cpp">
       <Filter>Other Platforms\UWP</Filter>
     </ClCompile>
@@ -253,13 +220,7 @@
     <ClCompile Include="..\UWP\App.cpp">
       <Filter>Other Platforms\UWP</Filter>
     </ClCompile>
-    <ClCompile Include="..\UWP\StorageFolderBrowser.cpp">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClCompile>
     <ClCompile Include="..\UWP\XAudioSoundStream.cpp">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClCompile>
-    <ClCompile Include="..\UWP\StorageFileLoader.cpp">
       <Filter>Other Platforms\UWP</Filter>
     </ClCompile>
     <ClCompile Include="..\UWP\pch.cpp">
@@ -268,8 +229,41 @@
     <ClCompile Include="..\android\jni\AndroidAudio.cpp">
       <Filter>Other Platforms\Android</Filter>
     </ClCompile>
-    <ClCompile Include="..\android\jni\OpenSLContext.cpp">
+    <ClCompile Include="..\android\jni\OboeContext.cpp">
       <Filter>Other Platforms\Android</Filter>
+    </ClCompile>
+    <ClCompile Include="W32Util\ContextMenu.cpp">
+      <Filter>Windows\W32Util</Filter>
+    </ClCompile>
+    <ClCompile Include="..\libretro\LibretroGLCoreContext.cpp">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClCompile>
+    <ClCompile Include="W32Util\DarkMode.cpp">
+      <Filter>Windows\W32Util</Filter>
+    </ClCompile>
+    <ClCompile Include="W32Util\UAHMenuBar.cpp">
+      <Filter>Windows\W32Util</Filter>
+    </ClCompile>
+    <ClCompile Include="Debugger\WatchItemWindow.cpp">
+      <Filter>Windows\Debugger</Filter>
+    </ClCompile>
+    <ClCompile Include="Debugger\EditSymbolsWindow.cpp">
+      <Filter>Windows\Debugger</Filter>
+    </ClCompile>
+    <ClCompile Include="HID\DualShock.cpp">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClCompile>
+    <ClCompile Include="HID\SwitchPro.cpp">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClCompile>
+    <ClCompile Include="HID\DualSense.cpp">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClCompile>
+    <ClCompile Include="Hid\HidInputDevice.cpp">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClCompile>
+    <ClCompile Include="Hid\HidCommon.cpp">
+      <Filter>Windows\Input\Hid</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -294,28 +288,16 @@
     <ClInclude Include="W32Util\Misc.h">
       <Filter>Windows\W32Util</Filter>
     </ClInclude>
-    <ClInclude Include="W32Util\PropertySheet.h">
-      <Filter>Windows\W32Util</Filter>
-    </ClInclude>
     <ClInclude Include="W32Util\ShellUtil.h">
       <Filter>Windows\W32Util</Filter>
     </ClInclude>
     <ClInclude Include="InputBox.h">
       <Filter>Windows\UI</Filter>
     </ClInclude>
-    <ClInclude Include="DSoundStream.h">
-      <Filter>Windows\System</Filter>
-    </ClInclude>
-    <ClInclude Include="WindowsHost.h">
-      <Filter>Windows\System</Filter>
-    </ClInclude>
     <ClInclude Include="main.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="Debugger\Debugger_Disasm.h">
       <Filter>Windows\Debugger</Filter>
-    </ClInclude>
-    <ClInclude Include="EmuThread.h">
-      <Filter>Windows</Filter>
     </ClInclude>
     <ClInclude Include="InputDevice.h">
       <Filter>Windows\Input</Filter>
@@ -328,9 +310,6 @@
       <Filter>Other Platforms</Filter>
     </ClInclude>
     <ClInclude Include="..\android\jni\Arm64EmitterTest.h">
-      <Filter>Other Platforms</Filter>
-    </ClInclude>
-    <ClInclude Include="..\android\jni\TestRunner.h">
       <Filter>Other Platforms</Filter>
     </ClInclude>
     <ClInclude Include="DinputDevice.h">
@@ -381,28 +360,19 @@
     <ClInclude Include="MainWindow.h">
       <Filter>Windows\UI</Filter>
     </ClInclude>
-    <ClInclude Include="GPU\D3D9Context.h">
-      <Filter>Windows\System</Filter>
-    </ClInclude>
     <ClInclude Include="GPU\WindowsGLContext.h">
       <Filter>Windows\System</Filter>
-    </ClInclude>
-    <ClInclude Include="GPU\WindowsGraphicsContext.h">
-      <Filter>Windows\System</Filter>
-    </ClInclude>
-    <ClInclude Include="..\Qt\mainwindow.h">
-      <Filter>Other Platforms\Qt</Filter>
     </ClInclude>
     <ClInclude Include="GPU\D3D11Context.h">
       <Filter>Windows\System</Filter>
     </ClInclude>
-    <ClInclude Include="..\Qt\QtHost.h">
-      <Filter>Other Platforms\Qt</Filter>
-    </ClInclude>
     <ClInclude Include="WindowsAudio.h">
       <Filter>Windows\System</Filter>
     </ClInclude>
-    <ClInclude Include="WASAPIStream.h">
+    <ClInclude Include="WASAPIContext.h">
+      <Filter>Windows\System</Filter>
+    </ClInclude>
+    <ClInclude Include="WASAPIMicrophone.h">
       <Filter>Windows\System</Filter>
     </ClInclude>
     <ClInclude Include="..\ppsspp_config.h" />
@@ -412,31 +382,10 @@
     <ClInclude Include="BufferLock.h">
       <Filter>Windows\Input</Filter>
     </ClInclude>
-    <ClInclude Include="GPU\WindowsVulkanContext.h">
-      <Filter>Windows\System</Filter>
-    </ClInclude>
-    <ClInclude Include="..\android\jni\AndroidEGLContext.h">
-      <Filter>Other Platforms\Android</Filter>
-    </ClInclude>
-    <ClInclude Include="..\android\jni\AndroidGraphicsContext.h">
-      <Filter>Other Platforms\Android</Filter>
-    </ClInclude>
-    <ClInclude Include="..\android\jni\AndroidJavaGLContext.h">
-      <Filter>Other Platforms\Android</Filter>
-    </ClInclude>
-    <ClInclude Include="..\android\jni\AndroidVulkanContext.h">
-      <Filter>Other Platforms\Android</Filter>
-    </ClInclude>
     <ClInclude Include="..\android\jni\app-android.h">
       <Filter>Other Platforms\Android</Filter>
     </ClInclude>
     <ClInclude Include="..\ios\ViewController.h">
-      <Filter>Other Platforms\iOS</Filter>
-    </ClInclude>
-    <ClInclude Include="..\ios\PPSSPPUIApplication.h">
-      <Filter>Other Platforms\iOS</Filter>
-    </ClInclude>
-    <ClInclude Include="..\ios\DisplayManager.h">
       <Filter>Other Platforms\iOS</Filter>
     </ClInclude>
     <ClInclude Include="..\ios\AppDelegate.h">
@@ -454,9 +403,6 @@
     <ClInclude Include="..\ios\iOSCoreAudio.h">
       <Filter>Other Platforms\iOS</Filter>
     </ClInclude>
-    <ClInclude Include="..\ios\SmartKeyboardMap.hpp">
-      <Filter>Other Platforms\iOS</Filter>
-    </ClInclude>
     <ClInclude Include="..\ios\SubtleVolume.h">
       <Filter>Other Platforms\iOS</Filter>
     </ClInclude>
@@ -467,6 +413,9 @@
       <Filter>Other Platforms\libretro</Filter>
     </ClInclude>
     <ClInclude Include="..\libretro\LibretroVulkanContext.h">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClInclude>
+    <ClInclude Include="..\libretro\LibretroVulkanPresentation.h">
       <Filter>Other Platforms\libretro</Filter>
     </ClInclude>
     <ClInclude Include="..\libretro\libretro.h">
@@ -481,12 +430,6 @@
     <ClInclude Include="..\libretro\LibretroD3D11Context.h">
       <Filter>Other Platforms\libretro</Filter>
     </ClInclude>
-    <ClInclude Include="..\Qt\QtMain.h">
-      <Filter>Other Platforms\Qt</Filter>
-    </ClInclude>
-    <ClInclude Include="..\Qt\NKCodeFromQt.h">
-      <Filter>Other Platforms\Qt</Filter>
-    </ClInclude>
     <ClInclude Include="..\SDL\NKCodeFromSDL.h">
       <Filter>Other Platforms\SDL</Filter>
     </ClInclude>
@@ -499,15 +442,6 @@
     <ClInclude Include="..\SDL\SDLJoystick.h">
       <Filter>Other Platforms\SDL</Filter>
     </ClInclude>
-    <ClInclude Include="..\SDL\SDLMain.h">
-      <Filter>Other Platforms\SDL</Filter>
-    </ClInclude>
-    <ClInclude Include="..\SDL\SDLVulkanGraphicsContext.h">
-      <Filter>Other Platforms\SDL</Filter>
-    </ClInclude>
-    <ClInclude Include="..\UWP\UWPHost.h">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClInclude>
     <ClInclude Include="..\UWP\NKCodeFromWindowsSystem.h">
       <Filter>Other Platforms\UWP</Filter>
     </ClInclude>
@@ -517,16 +451,10 @@
     <ClInclude Include="..\UWP\App.h">
       <Filter>Other Platforms\UWP</Filter>
     </ClInclude>
-    <ClInclude Include="..\UWP\StorageFolderBrowser.h">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClInclude>
     <ClInclude Include="..\UWP\UWPUtil.h">
       <Filter>Other Platforms\UWP</Filter>
     </ClInclude>
     <ClInclude Include="..\UWP\XAudioSoundStream.h">
-      <Filter>Other Platforms\UWP</Filter>
-    </ClInclude>
-    <ClInclude Include="..\UWP\StorageFileLoader.h">
       <Filter>Other Platforms\UWP</Filter>
     </ClInclude>
     <ClInclude Include="..\UWP\pch.h">
@@ -535,8 +463,71 @@
     <ClInclude Include="..\android\jni\AndroidAudio.h">
       <Filter>Other Platforms\Android</Filter>
     </ClInclude>
-    <ClInclude Include="..\android\jni\OpenSLContext.h">
+    <ClInclude Include="..\android\jni\OboeContext.h">
       <Filter>Other Platforms\Android</Filter>
+    </ClInclude>
+    <ClInclude Include="..\android\jni\AndroidContentURI.h">
+      <Filter>Other Platforms\Android</Filter>
+    </ClInclude>
+    <ClInclude Include="W32Util\ContextMenu.h">
+      <Filter>Windows\W32Util</Filter>
+    </ClInclude>
+    <ClInclude Include="..\libretro\libretro_core_options.h">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClInclude>
+    <ClInclude Include="..\libretro\libretro_core_options_intl.h">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClInclude>
+    <ClInclude Include="..\libretro\LibretroGLCoreContext.h">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClInclude>
+    <ClInclude Include="..\libretro\retro_inline.h">
+      <Filter>Other Platforms\libretro</Filter>
+    </ClInclude>
+    <ClInclude Include="W32Util\DarkMode.h">
+      <Filter>Windows\W32Util</Filter>
+    </ClInclude>
+    <ClInclude Include="W32Util\IatHook.h">
+      <Filter>Windows\W32Util</Filter>
+    </ClInclude>
+    <ClInclude Include="W32Util\UAHMenuBar.h">
+      <Filter>Windows\W32Util</Filter>
+    </ClInclude>
+    <ClInclude Include="Debugger\WatchItemWindow.h">
+      <Filter>Windows\Debugger</Filter>
+    </ClInclude>
+    <ClInclude Include="Debugger\EditSymbolsWindow.h">
+      <Filter>Windows\Debugger</Filter>
+    </ClInclude>
+    <ClInclude Include="..\SDL\CocoaBarItems.h">
+      <Filter>Other Platforms\Mac</Filter>
+    </ClInclude>
+    <ClInclude Include="..\UI\PSPNSApplicationDelegate.h">
+      <Filter>Other Platforms\Mac</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Core\Util\DarwinFileSystemServices.h">
+      <Filter>Other Platforms\iOS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ios\ViewControllerCommon.h">
+      <Filter>Other Platforms\iOS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ios\ViewControllerMetal.h">
+      <Filter>Other Platforms\iOS</Filter>
+    </ClInclude>
+    <ClInclude Include="HID\DualShock.h">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClInclude>
+    <ClInclude Include="HID\SwitchPro.h">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClInclude>
+    <ClInclude Include="HID\DualSense.h">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClInclude>
+    <ClInclude Include="Hid\HidInputDevice.h">
+      <Filter>Windows\Input\Hid</Filter>
+    </ClInclude>
+    <ClInclude Include="Hid\HidCommon.h">
+      <Filter>Windows\Input\Hid</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -550,44 +541,10 @@
       <Filter>Resource Files</Filter>
     </None>
     <None Include="..\README.md" />
-    <None Include="git-version-gen.cmd" />
-    <None Include="aboutbox.rc">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="version.rc">
-      <Filter>Resource Files</Filter>
-    </None>
     <None Include="..\assets\knownfuncs.ini">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="PPSSPP.manifest">
-      <Filter>Resource Files</Filter>
-    </None>
-    <None Include="..\Qt\Native.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\PPSSPP.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\PPSSPPQt.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\Settings.pri">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\Common.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\Core.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\GPU.pro">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\Qt\assets.qrc">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="pspmode.png">
       <Filter>Resource Files</Filter>
     </None>
     <None Include="..\assets\langregion.ini">
@@ -602,12 +559,6 @@
     <None Include="..\CMakeLists.txt">
       <Filter>Build</Filter>
     </None>
-    <None Include="..\.travis.sh">
-      <Filter>Build</Filter>
-    </None>
-    <None Include="..\.travis.yml">
-      <Filter>Build</Filter>
-    </None>
     <None Include="..\appveyor.yml">
       <Filter>Build</Filter>
     </None>
@@ -615,6 +566,9 @@
       <Filter>Build</Filter>
     </None>
     <None Include="..\b.sh">
+      <Filter>Build</Filter>
+    </None>
+    <None Include="..\build_fontatlas.sh">
       <Filter>Build</Filter>
     </None>
     <None Include="..\build_ppgeatlas.sh">
@@ -657,9 +611,6 @@
     <None Include="..\android\git-version-gen.sh">
       <Filter>Build</Filter>
     </None>
-    <None Include="..\ios\PPSSPPUIApplication.mm">
-      <Filter>Other Platforms\iOS</Filter>
-    </None>
     <None Include="..\ios\AppDelegate.mm">
       <Filter>Other Platforms\iOS</Filter>
     </None>
@@ -669,14 +620,8 @@
     <None Include="..\ios\CameraHelper.mm">
       <Filter>Other Platforms\iOS</Filter>
     </None>
-    <None Include="..\ios\DisplayManager.mm">
-      <Filter>Other Platforms\iOS</Filter>
-    </None>
     <None Include="..\ios\iOSCoreAudio.mm">
       <Filter>Other Platforms\iOS</Filter>
-    </None>
-    <None Include="..\ios\macbundle.sh">
-      <Filter>Build</Filter>
     </None>
     <None Include="..\ios\PPSSPP-Info.plist">
       <Filter>Other Platforms\iOS</Filter>
@@ -696,21 +641,121 @@
     <None Include="..\libretro\jni\Application.mk">
       <Filter>Other Platforms\libretro</Filter>
     </None>
-    <None Include="..\Qt\macbundle.sh">
-      <Filter>Other Platforms\Qt</Filter>
-    </None>
-    <None Include="..\SDL\macbundle.sh">
-      <Filter>Other Platforms\SDL</Filter>
-    </None>
     <None Include="..\SDL\SDLCocoaMetalLayer.mm">
       <Filter>Other Platforms\SDL</Filter>
     </None>
-    <None Include="..\SDL\SDLMain.mm">
-      <Filter>Other Platforms\SDL</Filter>
+    <None Include="..\assets\compatvr.ini">
+      <Filter>Resource Files</Filter>
     </None>
-    <None Include="..\SDL\buildassets.sh">
-      <Filter>Other Platforms\SDL</Filter>
+    <None Include="git-version-gen.cmd">
+      <Filter>Build</Filter>
     </None>
+    <None Include="zipup.cmd">
+      <Filter>Build</Filter>
+    </None>
+    <None Include="..\Dockerfile">
+      <Filter>Build</Filter>
+    </None>
+    <None Include="..\gradle.properties">
+      <Filter>Other Platforms\Android</Filter>
+    </None>
+    <None Include="..\.github\workflows\build.yml">
+      <Filter>Build\Actions</Filter>
+    </None>
+    <None Include="..\.github\workflows\manual_generate_apk.yml">
+      <Filter>Build\Actions</Filter>
+    </None>
+    <None Include="..\.github\workflows\tarball.yml">
+      <Filter>Build\Actions</Filter>
+    </None>
+    <None Include="..\.github\workflows\generateDockerLayer.yml">
+      <Filter>Build\Actions</Filter>
+    </None>
+    <None Include="..\ios\Launch Screen.storyboard">
+      <Filter>Other Platforms\iOS</Filter>
+    </None>
+    <None Include="..\ios\macbundle.sh">
+      <Filter>Other Platforms\iOS</Filter>
+    </None>
+    <None Include="..\ios\README.md">
+      <Filter>Other Platforms\iOS</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindMINIUPNPC.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindSnappy.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindWayland.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindZSTD.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\ccache.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindFFmpeg.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Modules\FindLIBZIP.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\raspberry.armv6.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\raspberry.armv7.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\raspberry.armv8.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\vero4k.armv8.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\beagleboard.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\generic.armv7.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\ios.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\cmake\Toolchains\nvidiajetsonsdl.armv8.cmake">
+      <Filter>Build\CMake</Filter>
+    </None>
+    <None Include="..\SDL\CocoaBarItems.mm">
+      <Filter>Other Platforms\Mac</Filter>
+    </None>
+    <None Include="..\UI\PSPNSApplicationDelegate.mm">
+      <Filter>Other Platforms\Mac</Filter>
+    </None>
+    <None Include="..\Core\Util\DarwinFileSystemServices.mm">
+      <Filter>Other Platforms\iOS</Filter>
+    </None>
+    <None Include="..\ios\ViewControllerMetal.mm">
+      <Filter>Other Platforms\iOS</Filter>
+    </None>
+    <None Include="..\scripts\websocket-test.py">
+      <Filter>Other Platforms</Filter>
+    </None>
+    <None Include="..\assets\adhoc-servers.json">
+      <Filter>assets</Filter>
+    </None>
+    <None Include="..\assets\infra-dns.json">
+      <Filter>assets</Filter>
+    </None>
+    <None Include="..\assets\redump.csv">
+      <Filter>assets</Filter>
+    </None>
+    <None Include="..\assets\shaders\defaultshaders.ini">
+      <Filter>assets</Filter>
+    </None>
+    <None Include="..\assets\cheats.json">
+      <Filter>assets</Filter>
+    </None>
+    <None Include="..\AGENTS.md" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ppsspp.rc">
@@ -719,6 +764,9 @@
   </ItemGroup>
   <ItemGroup>
     <Image Include="ppsspp_gold.ico">
+      <Filter>Resource Files</Filter>
+    </Image>
+    <Image Include="BreakpointSmall.ico">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>
@@ -731,6 +779,19 @@
     </Text>
     <Text Include="..\libretro\README_WINDOWS.txt">
       <Filter>Other Platforms\libretro</Filter>
+    </Text>
+    <Text Include="debugger.txt" />
+    <Text Include="..\font_atlasscript.txt">
+      <Filter>Build</Filter>
+    </Text>
+    <Text Include="..\asciifont_atlasscript.txt">
+      <Filter>Build</Filter>
+    </Text>
+    <Text Include="..\SDL\README.TXT">
+      <Filter>Other Platforms\SDL</Filter>
+    </Text>
+    <Text Include="..\assets\gamecontrollerdb.txt">
+      <Filter>assets</Filter>
     </Text>
   </ItemGroup>
 </Project>

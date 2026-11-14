@@ -18,11 +18,27 @@
 #pragma once
 
 #include <vector>
+#include <list>
 #include <string>
 
-#include "GPU/GPU.h"
-#include "GPU/GPUInterface.h"
+#include "Common/Math/expression_parser.h"
 #include "Core/MemMap.h"
+#include "GPU/GPU.h"
+#include "GPU/GPUDefinitions.h"
+#include "GPU/GPUState.h"
+#include "GPU/ge_constants.h"
+#include "GPU/Debugger/Debugger.h"
+
+class FramebufferManagerCommon;
+class TextureCacheCommon;
+
+struct VirtualFramebuffer;
+struct DisplayList;
+
+namespace GPURecord {
+class Recorder;
+}
+class GPUBreakpoints;
 
 struct GPUDebugOp {
 	u32 pc;
@@ -58,9 +74,6 @@ enum GPUDebugBufferFormat {
 	GPU_DBG_FORMAT_8BIT = 0x12,
 	GPU_DBG_FORMAT_24BIT_8X = 0x13,
 	GPU_DBG_FORMAT_24X_8BIT = 0x14,
-
-	GPU_DBG_FORMAT_FLOAT_DIV_256 = 0x18,
-	GPU_DBG_FORMAT_24BIT_8X_DIV_256 = 0x1B,
 
 	// This is used for screenshots, mainly.
 	GPU_DBG_FORMAT_888_RGB = 0x20,
@@ -106,6 +119,8 @@ struct GPUDebugBuffer {
 		height_ = other.height_;
 		stride_ = other.stride_;
 		flipped_ = other.flipped_;
+		isBackBuffer_ = other.isBackBuffer_;
+		scaleFactor_ = other.scaleFactor_;
 		fmt_ = other.fmt_;
 		other.alloc_ = false;
 		other.data_ = nullptr;
@@ -115,7 +130,7 @@ struct GPUDebugBuffer {
 		Free();
 	}
 
-	GPUDebugBuffer &operator = (GPUDebugBuffer &&other) noexcept {
+	GPUDebugBuffer &operator =(GPUDebugBuffer &&other) noexcept {
 		if (this != &other) {
 			Free();
 			alloc_ = other.alloc_;
@@ -124,6 +139,8 @@ struct GPUDebugBuffer {
 			stride_ = other.stride_;
 			flipped_ = other.flipped_;
 			fmt_ = other.fmt_;
+			isBackBuffer_ = other.isBackBuffer_;
+			scaleFactor_ = other.scaleFactor_;
 			other.alloc_ = false;
 			other.data_ = nullptr;
 		}
@@ -135,12 +152,14 @@ struct GPUDebugBuffer {
 	void Allocate(u32 stride, u32 height, GPUDebugBufferFormat fmt, bool flipped = false);
 	void Free();
 
-	u8 *GetData() {
-		return data_;
-	}
+	void ZeroBytes();
 
 	u32 GetRawPixel(int x, int y) const;
 	void SetRawPixel(int x, int y, u32 c);
+
+	u8 *GetData() {
+		return data_;
+	}
 
 	const u8 *GetData() const {
 		return data_;
@@ -164,6 +183,11 @@ struct GPUDebugBuffer {
 
 	u32 PixelSize() const;
 
+	void SetIsBackbuffer(bool isBackBuffer) { isBackBuffer_ = isBackBuffer; }
+	bool IsBackBuffer() const { return isBackBuffer_; }
+	void SetScaleFactor(int scaleFactor) { scaleFactor_ = scaleFactor; }
+	int GetScaleFactor() const { return scaleFactor_; }
+
 private:
 	bool alloc_ = false;
 	u8 *data_ = nullptr;
@@ -171,82 +195,48 @@ private:
 	u32 height_ = 0;
 	GPUDebugBufferFormat fmt_ = GPU_DBG_FORMAT_INVALID;
 	bool flipped_ = false;
+	bool isBackBuffer_ = false;
+	int scaleFactor_ = 0;
 };
 
+// This is used to represent both pre- and post transformed vertices, so is a bit of a mess.
 struct GPUDebugVertex {
 	float u;
 	float v;
+
 	float x;
 	float y;
 	float z;
-	u8 c[4];
+	float w;
+
+	union {
+		u8 c0[4];
+		u32 color0_32;
+	};
+	union {
+		u8 c1[4];
+		u32 color1_32;
+	};
+
+	float fog;
+
 	float nx;
 	float ny;
 	float nz;
+
+	float weights[8];
 };
 
-class GPUDebugInterface {
-public:
-	virtual bool GetCurrentDisplayList(DisplayList &list) = 0;
-	virtual std::vector<DisplayList> ActiveDisplayLists() = 0;
-	virtual void ResetListPC(int listID, u32 pc) = 0;
-	virtual void ResetListStall(int listID, u32 stall) = 0;
-	virtual void ResetListState(int listID, DisplayListState state) = 0;
-
-	GPUDebugOp DissassembleOp(u32 pc) {
-		return DissassembleOp(pc, Memory::Read_U32(pc));
-	}
-	virtual GPUDebugOp DissassembleOp(u32 pc, u32 op) = 0;
-	virtual std::vector<GPUDebugOp> DissassembleOpRange(u32 startpc, u32 endpc) = 0;
-
-	// Enter/exit stepping mode.  Mainly for better debug stats on time taken.
-	virtual void NotifySteppingEnter() = 0;
-	virtual void NotifySteppingExit() = 0;
-
-	virtual u32 GetRelativeAddress(u32 data) = 0;
-	virtual u32 GetVertexAddress() = 0;
-	virtual u32 GetIndexAddress() = 0;
-	virtual GPUgstate GetGState() = 0;
-	// Needs to be called from the GPU thread.
-	// Calling from a separate thread (e.g. UI) may fail.
-	virtual void SetCmdValue(u32 op) = 0;
-
-	virtual bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices) {
-		return false;
-	}
-
-	// Needs to be called from the GPU thread, so on the same thread as a notification is fine.
-	// Calling from a separate thread (e.g. UI) may fail.
-	virtual bool GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes = -1) {
-		// False means unsupported.
-		return false;
-	}
-
-	// Similar to GetCurrentFramebuffer().
-	virtual bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer) {
-		return false;
-	}
-
-	// Similar to GetCurrentFramebuffer().
-	virtual bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer) {
-		return false;
-	}
-
-	// Similar to GetCurrentFramebuffer(), with texture level specification.
-	virtual bool GetCurrentTexture(GPUDebugBuffer &buffer, int level) {
-		return false;
-	}
-
-	virtual bool GetCurrentClut(GPUDebugBuffer &buffer) {
-		return false;
-	}
-
-	virtual bool GetOutputFramebuffer(GPUDebugBuffer &buffer) {
-		return false;
-	}
-
-	// TODO:
-	// cached framebuffers / textures / vertices?
-	// get content of specific framebuffer / texture?
-	// vertex / texture decoding?
+enum class DebugVertexFlags {
+	Transformed = 1 << 0,
+	Clipped = 1 << 1,
+	DrawCoords = 1 << 2,  // if not set, output X/Y will be in screen coords.
 };
+ENUM_CLASS_BITOPS(DebugVertexFlags);
+
+class StringWriter;
+class GPUCommon;
+
+bool GPUDebugInitExpression(GPUCommon *g, const char *str, PostfixExpression &exp);
+bool GPUDebugExecExpression(GPUCommon *g, PostfixExpression &exp, uint32_t &result);
+bool GPUDebugExecExpression(GPUCommon *g, const char *str, uint32_t &result);

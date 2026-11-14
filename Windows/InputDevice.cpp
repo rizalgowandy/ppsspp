@@ -20,50 +20,93 @@
 #include <atomic>
 
 #include "Common/Input/InputState.h"
+#include "Common/System/System.h"
 #include "Common/Thread/ThreadUtil.h"
 #include "Core/Config.h"
-#include "Core/Host.h"
 #include "Windows/InputDevice.h"
 
-static std::atomic_flag threadRunningFlag;
-static std::thread inputThread;
-static std::atomic_bool focused = ATOMIC_VAR_INIT(true);
+#if !PPSSPP_PLATFORM(UWP)
+#include "Windows/DinputDevice.h"
+#include "Windows/Hid/HidInputDevice.h"
+#include "Windows/XinputDevice.h"
+#endif
 
-inline static void ExecuteInputPoll() {
-	if (host && (focused.load(std::memory_order_relaxed) || !g_Config.bGamepadOnlyFocused)) {
-		host->PollControllers();
+InputManager g_InputManager;
+
+void InputManager::InputThread() {
+	SetCurrentThreadName("Input");
+
+	for (auto &device : devices_) {
+		device->Init();
 	}
-}
-
-static void RunInputThread() {
-	setCurrentThreadName("Input");
 
 	// NOTE: The keyboard and mouse buttons are handled via raw input, not here.
 	// This is mainly for controllers which need to be polled, instead of generating events.
-
-	while (threadRunningFlag.test_and_set(std::memory_order_relaxed)) {
-		ExecuteInputPoll();
+	while (runThread_.load(std::memory_order_relaxed)) {
+		bool noSleep = false;
+		if (focused_.load(std::memory_order_relaxed) || !g_Config.bGamepadOnlyFocused) {
+			System_Notify(SystemNotification::POLL_CONTROLLERS);
+			for (const auto &device : devices_) {
+				const int state = device->UpdateState();
+				if (state == InputDevice::UPDATESTATE_SKIP_PAD)
+					break;
+				if (state == InputDevice::UPDATESTATE_NO_SLEEP) {
+					// Sleep was handled automatically.
+					noSleep = true;
+				}
+			}
+		}
 
 		// Try to update 250 times per second.
-		Sleep(4);
+		if (!noSleep)
+			Sleep(4);
+	}
+
+	for (auto &device : devices_) {
+		device->Shutdown();
 	}
 }
 
-void InputDevice::BeginPolling() {
-	threadRunningFlag.test_and_set(std::memory_order_relaxed);
-	inputThread = std::thread(&RunInputThread);
+void InputManager::BeginPolling() {
+	runThread_.store(true, std::memory_order_relaxed);
+	inputThread_ = std::thread([this]() {
+		// In UWP, we add the devices from the main thread, before launching the thread.
+		// This is a bit awkward but worth the startup speed boost on non-UWP until we refactor it.
+#if !PPSSPP_PLATFORM(UWP)
+		//add first XInput device to respond
+		AddDevice(new XinputDevice());
+		AddDevice(new DInputMetaDevice());
+		AddDevice(new HidInputDevice());
+#endif
+		InputThread();
+	});
 }
 
-void InputDevice::StopPolling() {
-	threadRunningFlag.clear(std::memory_order_relaxed);
-
-	inputThread.join();
+void InputManager::StopPolling() {
+	INFO_LOG(Log::System, "Stopping the input thread");
+	runThread_.store(false, std::memory_order_relaxed);
+#if !PPSSPP_PLATFORM(UWP)
+	// The HID pads are read with a blocking ReadFile, which never returns if the pad stops sending
+	// reports, and then the join below waits forever with the window already gone. Cancel whatever
+	// I/O the thread is blocked in. Repeat it, since a cancel that lands just before a read starts
+	// does nothing.
+	HANDLE thread = (HANDLE)inputThread_.native_handle();
+	for (int tries = 0; WaitForSingleObject(thread, 100) == WAIT_TIMEOUT; tries++) {
+		if (tries == 0) {
+			WARN_LOG(Log::System, "Input thread didn't stop, cancelling its I/O");
+		}
+		CancelSynchronousIo(thread);
+	}
+#endif
+	inputThread_.join();
+	INFO_LOG(Log::System, "Input thread stopped");
 }
 
-void InputDevice::GainFocus() {
-	focused.store(true, std::memory_order_relaxed);
-}
-
-void InputDevice::LoseFocus() {
-	focused.store(false, std::memory_order_relaxed);
+bool InputManager::AnyAccelerometer() const {
+	for (const auto &device : devices_) {
+		if (device->HasAccelerometer()) {
+			return true;
+		}
+	}
+	return false;
 }

@@ -2,52 +2,74 @@
 
 #include <condition_variable>
 #include <mutex>
-#include <string>
+#include <string_view>
 #include <cstring>
 #include <thread>
 #include <vector>
 #include <cstdlib>
 
 #include "Common/File/DirListing.h"
+#include "Common/File/Path.h"
 
-// Abstraction above path that lets you navigate easily.
+// Abstraction above path that lets you navigate easily and get listings off-thread.
 // "/" is a special path that means the root of the file system. On Windows,
-// listing this will yield drives.
+// listing "/" will yield drives.
 class PathBrowser {
 public:
 	PathBrowser() {}
-	PathBrowser(std::string path) { SetPath(path); }
 	~PathBrowser();
 
-	void SetPath(const std::string &path);
-	bool IsListingReady();
-	bool GetListing(std::vector<FileInfo> &fileInfo, const char *filter = nullptr, bool *cancel = nullptr);
-
-	bool CanNavigateUp();
-	void NavigateUp();
-	void Navigate(const std::string &path);
-
-	std::string GetPath() const {
-		if (path_ != "/")
-			return path_;
-		else
-			return "";
+	void SetPath(const Path &path);
+	void Refresh() {
+		HandlePath();
 	}
-	std::string GetFriendlyPath() const;
+	bool IsListingReady() const {
+		std::lock_guard<std::mutex> guard(pendingLock_);
+		return ready_;
+	}
+
+	// If called before IsListingReady() returns true, will block (becomes synchronous). Don't do that.
+	bool GetListing(std::vector<File::FileInfo> &fileInfo, const char *filter = nullptr, bool *cancel = nullptr);
+
+	bool CanNavigateUp() const;
+	void NavigateUp();
+
+	void Navigate(std::string_view subdir);
+
+	const Path &GetPath() const {
+		return path_;
+	}
+
+	void SetUserAgent(std::string_view s) {
+		std::lock_guard<std::mutex> guard(pendingLock_);
+		userAgent_ = s;
+	}
+	void RestrictToRoot(const Path &root);
+	bool empty() const {
+		return path_.empty();
+	}
+	bool Success() const {
+		std::lock_guard<std::mutex> guard(pendingLock_);
+		return success_;
+	}
 
 private:
 	void HandlePath();
-	void ResetPending();
+	void ApplyRestriction();
 
-	std::string path_;
-	std::string pendingPath_;
-	std::vector<FileInfo> pendingFiles_;
+	Path path_;
+	Path pendingPath_;
+	Path restrictedRoot_;
+	std::string userAgent_;
+	std::vector<File::FileInfo> pendingFiles_;
 	std::condition_variable pendingCond_;
-	std::mutex pendingLock_;
+	mutable std::mutex pendingLock_;
 	std::thread pendingThread_;
 	bool pendingActive_ = false;
 	bool pendingCancel_ = false;
 	bool pendingStop_ = false;
+	// Abandons a slow listing (network) when the path changes.
+	bool listingAbort_ = false;
 	bool ready_ = false;
+	bool success_ = true;
 };
-

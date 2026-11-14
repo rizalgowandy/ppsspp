@@ -4,43 +4,18 @@
 
 #include <vector>
 #include <cstdint>
+#include <cmath>
 
+#include "Common/Common.h"
 #include "Common/Data/Color/RGBAUtil.h"
 #include "Common/Render/TextureAtlas.h"
 #include "Common/Math/geom2d.h"
 #include "Common/Math/lin/matrix4x4.h"
+#include "Common/Math/math_util.h"
 #include "Common/GPU/thin3d.h"
+#include "Common/Render/DrawEnum.h"
 
 struct Atlas;
-
-enum {
-	ALIGN_LEFT = 0,
-	ALIGN_RIGHT = 16,
-	ALIGN_TOP = 0,
-	ALIGN_BOTTOM = 1,
-	ALIGN_HCENTER = 4,
-	ALIGN_VCENTER = 8,
-	ALIGN_VBASELINE = 32,	// text only, possibly not yet working
-
-	ALIGN_CENTER = ALIGN_HCENTER | ALIGN_VCENTER,
-	ALIGN_TOPLEFT = ALIGN_TOP | ALIGN_LEFT,
-	ALIGN_TOPRIGHT = ALIGN_TOP | ALIGN_RIGHT,
-	ALIGN_BOTTOMLEFT = ALIGN_BOTTOM | ALIGN_LEFT,
-	ALIGN_BOTTOMRIGHT = ALIGN_BOTTOM | ALIGN_RIGHT,
-
-	// Only for text drawing
-	ROTATE_90DEG_LEFT = 256,
-	ROTATE_90DEG_RIGHT = 512,
-	ROTATE_180DEG = 1024,
-
-	// For "uncachable" text like debug log.
-	// Avoids using system font drawing as it's too slow.
-	// Not actually used here but is reserved for whatever system wraps DrawBuffer.
-	FLAG_DYNAMIC_ASCII = 2048,
-	FLAG_NO_PREFIX = 4096,  // means to not process ampersands
-	FLAG_WRAP_TEXT = 8192,
-	FLAG_ELLIPSIZE_TEXT = 16384,
-};
 
 namespace Draw {
 	class Pipeline;
@@ -53,8 +28,17 @@ struct GradientStop {
 
 class TextDrawer;
 
+const char *RoundRectCornerImageName(int radiusIndex, RoundRectStyle style);
+// The corner image is (center + 1) texels square. The arc is centered on texel corner (center, center),
+// and the last row and column are the straight edge profile.
+inline int RoundRectCornerCenter(float radiusPx) {
+	return (int)ceilf(radiusPx) + 1;
+}
+
 class DrawBuffer {
 public:
+	DrawBuffer(const DrawBuffer &) = delete;
+	DrawBuffer &operator=(const DrawBuffer &) = delete;
 	DrawBuffer();
 	~DrawBuffer();
 
@@ -73,30 +57,52 @@ public:
 	void Rect(float x, float y, float w, float h, uint32_t color, int align = ALIGN_TOPLEFT);
 	void hLine(float x1, float y, float x2, uint32_t color);
 	void vLine(float x, float y1, float y2, uint32_t color);
-	void vLineAlpha50(float x, float y1, float y2, uint32_t color);
 
 	void Line(ImageID atlas_image, float x1, float y1, float x2, float y2, float thickness, uint32_t color);
 
 	void RectOutline(float x, float y, float w, float h, uint32_t color, int align = ALIGN_TOPLEFT);
 
-	void RectVGradient(float x, float y, float w, float h, uint32_t colorTop, uint32_t colorBottom);
+	// NOTE: This one takes x2/y2 instead of w/h, better for gap-free graphics.
+	void RectVGradient(float x1, float y1, float x2, float y2, uint32_t colorTop, uint32_t colorBottom);
 	void RectVDarkFaded(float x, float y, float w, float h, uint32_t colorTop) {
-		RectVGradient(x, y, w, h, colorTop, darkenColor(colorTop));
+		RectVGradient(x, y, x + w, y + h, colorTop, darkenColor(colorTop));
 	}
 
-	void MultiVGradient(float x, float y, float w, float h, GradientStop *stops, int numStops);
+	void MultiVGradient(float x, float y, float w, float h, const GradientStop *stops, int numStops);
 
 	void RectCenter(float x, float y, float w, float h, uint32_t color) {
 		Rect(x - w/2, y - h/2, w, h, color);
 	}
 	void Rect(float x, float y, float w, float h, float u, float v, float uw, float uh, uint32_t color);
 
-	void V(float x, float y, float z, uint32_t color, float u, float v);
+	void V(float x, float y, float z, uint32_t color, float u, float v) {
+		_dbg_assert_msg_(count_ < MAX_VERTS, "Overflowed the DrawBuffer");
+		if (count_ >= MAX_VERTS) {
+			// _dbg_assert_msg_ above is compiled out in release builds - don't write
+			// past the end of verts_ there either, just drop the vertex.
+			return;
+		}
+
+#ifdef _DEBUG
+		if (my_isnanorinf(x) || my_isnanorinf(y) || my_isnanorinf(z)) {
+			_assert_(false);
+		}
+#endif
+		Vertex *vert = &verts_[count_++];
+		vert->x = x;
+		vert->y = y;
+		vert->z = z;
+		vert->rgba = alpha_ == 1.0f ? color : alphaMul(color, alpha_);
+		vert->u = u;
+		vert->v = v;
+	}
 	void V(float x, float y, uint32_t color, float u, float v) {
 		V(x, y, curZ_, color, u, v);
 	}
 
+	void CircleSegment(float x, float y, float radius, float thickness, int segments, float startAngle, float endAngle, uint32_t color, float u_mul);
 	void Circle(float x, float y, float radius, float thickness, int segments, float startAngle, uint32_t color, float u_mul);
+	void FillCircle(float x, float y, float radius, int segments, uint32_t color);
 
 	// New drawing APIs
 
@@ -105,6 +111,10 @@ public:
 		atlas = _atlas;
 	}
 	const Atlas *GetAtlas() const { return atlas; }
+	void SetFontAtlas(const Atlas *_atlas) {
+		fontAtlas_ = _atlas;
+	}
+	const Atlas *GetFontAtlas() const { return fontAtlas_; }
 	bool MeasureImage(ImageID atlas_image, float *w, float *h);
 	void DrawImage(ImageID atlas_image, float x, float y, float scale, Color color = COLOR(0xFFFFFF), int align = ALIGN_TOPLEFT);
 
@@ -116,24 +126,34 @@ public:
 		DrawImageStretch(atlas_image, bounds.x, bounds.y, bounds.x2(), bounds.y2(), color);
 	}
 	void DrawImageRotated(ImageID atlas_image, float x, float y, float scale, float angle, Color color = COLOR(0xFFFFFF), bool mirror_h = false);	// Always centers
+	void DrawImageRotatedStretch(ImageID atlas_image, const Bounds &bounds, float scales[2], float angle, Color color = COLOR(0xFFFFFF), bool mirror_h = false);
 	void DrawTexRect(float x1, float y1, float x2, float y2, float u1, float v1, float u2, float v2, Color color);
 	void DrawTexRect(const Bounds &bounds, float u1, float v1, float u2, float v2, Color color) {
 		DrawTexRect(bounds.x, bounds.y, bounds.x2(), bounds.y2(), u1, v1, u2, v2, color);
 	}
 	// Results in 18 triangles. Kind of expensive for a button.
 	void DrawImage4Grid(ImageID atlas_image, float x1, float y1, float x2, float y2, Color color = COLOR(0xFFFFFF), float corner_scale = 1.0);
+	void DrawImage4Grid(ImageID atlas_image, const Bounds &bounds, Color color = COLOR(0xFFFFFF), float corner_scale = 1.0) {
+		DrawImage4Grid(atlas_image, bounds.x, bounds.y, bounds.x2(), bounds.y2(), color, corner_scale);
+	}
+
+	// Uses the nearest precomputed corner radius, scaled to fit, so outlines get thinner or thicker
+	// when radius isn't one of ROUND_RECT_RADII. 18 triangles filled, 16 outlined.
+	// Corners not in `corners` are drawn square, from the edge profiles, so they match the rounded ones.
+	void DrawRoundRect(float x1, float y1, float x2, float y2, float radius, Color color, RoundRectStyle style = RoundRectStyle::Filled, RoundCorners corners = RoundCorners::All);
+	void DrawRoundRect(const Bounds &bounds, float radius, Color color, RoundRectStyle style = RoundRectStyle::Filled, RoundCorners corners = RoundCorners::All) {
+		DrawRoundRect(bounds.x, bounds.y, bounds.x2(), bounds.y2(), radius, color, style, corners);
+	}
+
 	// This is only 6 triangles, much cheaper.
 	void DrawImage2GridH(ImageID atlas_image, float x1, float y1, float x2, Color color = COLOR(0xFFFFFF), float scale = 1.0);
 
-	void MeasureText(FontID font, const char *text, float *w, float *h);
+	void MeasureText(FontID font, std::string_view text, float *w, float *h);
+	void MeasureTextRect(FontID font, std::string_view text, float maxWidth, float *w, float *h, int align = 0);
 
-	// NOTE: Count is in plain chars not utf-8 chars!
-	void MeasureTextCount(FontID font, const char *text, int count, float *w, float *h);
-	void MeasureTextRect(FontID font, const char *text, int count, const Bounds &bounds, float *w, float *h, int align = 0);
-
-	void DrawTextRect(FontID font, const char *text, float x, float y, float w, float h, Color color = 0xFFFFFFFF, int align = 0);
-	void DrawText(FontID font, const char *text, float x, float y, Color color = 0xFFFFFFFF, int align = 0);
-	void DrawTextShadow(FontID font, const char *text, float x, float y, Color color = 0xFFFFFFFF, int align = 0);
+	void DrawTextRect(FontID font, std::string_view text, float x, float y, float w, float h, Color color = 0xFFFFFFFF, int align = 0);
+	void DrawText(FontID font, std::string_view text, float x, float y, Color color = 0xFFFFFFFF, int align = 0);
+	void DrawTextShadow(FontID font, std::string_view text, float x, float y, Color color = 0xFFFFFFFF, int align = 0);
 
 	void SetFontScale(float xs, float ys) {
 		fontscalex = xs;
@@ -170,6 +190,16 @@ public:
 		curZ_ = curZ;
 	}
 
+	void SetTintSaturation(float tint, float saturation) {
+		tint_ = tint;
+		saturation_ = saturation;
+	}
+
+	enum {
+		// TODO: Can probably shrink this. Currently consumes 1.5MB.
+		MAX_VERTS = 65536,
+	};
+
 private:
 	struct Vertex {
 		float x, y, z;
@@ -183,18 +213,26 @@ private:
 	float alpha_ = 1.0f;
 	std::vector<float> alphaStack_;
 
-	Draw::DrawContext *draw_;
-	Draw::Buffer *vbuf_;
-	Draw::Pipeline *pipeline_;
+	Draw::DrawContext *draw_ = nullptr;
+	Draw::Pipeline *pipeline_ = nullptr;
 
 	Vertex *verts_;
-	int count_;
-	const Atlas *atlas;
+	int count_ = 0;
+	const Atlas *atlas = nullptr;
+	const Atlas *fontAtlas_ = nullptr;
 
-	bool inited_;
-	float fontscalex;
-	float fontscaley;
+	// Atlas lookups are linear searches by name, so the corner images are looked up once per atlas.
+	// One corner cell of a round rect, drawn square. xs/ys/us/vs point at the cell's two entries, ox/oy select the outer corner.
+	void DrawSquareCorner(const float *xs, const float *ys, const float *us, const float *vs, int ox, int oy, float edgeU, float edgeV, Color color);
 
+	const AtlasImage *roundRectCorners_[ROUND_RECT_RADIUS_COUNT][(int)RoundRectStyle::COUNT]{};
+	const AtlasImage *roundRectAtlasImages_ = nullptr;
+
+	bool inited_ = false;
+	float fontscalex = 1.0f;
+	float fontscaley = 1.0f;
+
+	float tint_ = 0.0f;
+	float saturation_ = 1.0f;
 	float curZ_ = 0.0f;
 };
-

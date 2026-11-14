@@ -14,6 +14,17 @@ template<class K>
 inline uint32_t HashKey(const K &k) {
 	return XXH3_64bits(&k, sizeof(k)) & 0xFFFFFFFF;
 }
+// 32-bit keys (PCs, IDs) are mixed inline, with MurmurHash3's finalizer: much cheaper than a call.
+template<>
+inline uint32_t HashKey<uint32_t>(const uint32_t &k) {
+	uint32_t h = k;
+	h ^= h >> 16;
+	h *= 0x85EBCA6B;
+	h ^= h >> 13;
+	h *= 0xC2B2AE35;
+	h ^= h >> 16;
+	return h;
+}
 template<class K>
 inline bool KeyEquals(const K &a, const K &b) {
 	return !memcmp(&a, &b, sizeof(K));
@@ -29,7 +40,7 @@ enum class BucketState : uint8_t {
 // we always use very small values, so it's probably better to have them in the same
 // cache-line as the corresponding key.
 // Enforces that value are pointers to make sure that combined storage makes sense.
-template <class Key, class Value, Value NullValue>
+template <class Key, class Value>
 class DenseHashMap {
 public:
 	DenseHashMap(int initialCapacity) : capacity_(initialCapacity) {
@@ -37,30 +48,57 @@ public:
 		state.resize(initialCapacity);
 	}
 
-	// Returns nullptr if no entry was found.
-	Value Get(const Key &key) {
+	// Returns true if the entry was found, and writes the entry to *value.
+	// Returns false and does not write to value if no entry was found.
+	// Note that nulls can be stored.
+	bool Get(const Key &key, Value *value) const {
 		uint32_t mask = capacity_ - 1;
 		uint32_t pos = HashKey(key) & mask;
 		// No? Let's go into search mode. Linear probing.
 		uint32_t p = pos;
 		while (true) {
-			if (state[p] == BucketState::TAKEN && KeyEquals(key, map[p].key))
-				return map[p].value;
-			else if (state[p] == BucketState::FREE)
-				return NullValue;
+			if (state[p] == BucketState::TAKEN && KeyEquals(key, map[p].key)) {
+				*value = map[p].value;
+				return true;
+			} else if (state[p] == BucketState::FREE) {
+				return false;
+			}
 			p = (p + 1) & mask;  // If the state is REMOVED, we just keep on walking. 
 			if (p == pos) {
+				// We looped around the whole map.
 				_assert_msg_(false, "DenseHashMap: Hit full on Get()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
-		return NullValue;
+		return false;
 	}
 
-	// Returns false if we already had the key! Which is a bit different.
+	// Only works if Value can be nullptr
+	Value GetOrNull(const Key &key) const {
+		Value value;
+		if (Get(key, &value)) {
+			return value;
+		} else {
+			return (Value)nullptr;
+		}
+	}
+
+	bool ContainsKey(const Key &key) const {
+		// Slightly wasteful, though compiler might optimize it.
+		Value value;
+		return Get(key, &value);
+	}
+
+	// Asserts if we already had the key!
 	bool Insert(const Key &key, Value value) {
 		// Check load factor, resize if necessary. We never shrink.
-		if (count_ > capacity_ / 2) {
-			Grow(2);
+		// Tombstones take up probe slots exactly like live entries do, so they have to count
+		// towards the load factor as well. Otherwise a workload that inserts and removes distinct
+		// keys keeps count_ low forever while REMOVED fills the table, and once no FREE bucket is
+		// left, probing has nothing to terminate on.
+		if (count_ + removedCount_ > capacity_ / 2) {
+			// Mostly tombstones? Compacting in place is enough. Otherwise we need more room.
+			Grow(removedCount_ > count_ ? 1 : 2);
 		}
 		uint32_t mask = capacity_ - 1;
 		uint32_t pos = HashKey(key) & mask;
@@ -69,7 +107,7 @@ public:
 			if (state[p] == BucketState::TAKEN) {
 				if (KeyEquals(key, map[p].key)) {
 					// Bad! We already got this one. Let's avoid this case.
-					_assert_msg_(false, "DenseHashMap: Duplicate key inserted");
+					_assert_msg_(false, "DenseHashMap: Duplicate key of size %d inserted", (int)sizeof(Key));
 					return false;
 				}
 				// continue looking....
@@ -81,6 +119,7 @@ public:
 			if (p == pos) {
 				// FULL! Error. Should not happen thanks to Grow().
 				_assert_msg_(false, "DenseHashMap: Hit full on Insert()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
 		if (state[p] == BucketState::REMOVED) {
@@ -109,11 +148,13 @@ public:
 			if (p == pos) {
 				// FULL! Error. Should not happen.
 				_assert_msg_(false, "DenseHashMap: Hit full on Remove()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
 		return false;
 	}
 
+	// This will never crash if you call it without locking - but, the value might not be right.
 	size_t size() const {
 		return count_;
 	}
@@ -127,6 +168,16 @@ public:
 		}
 	}
 
+	template<class T>
+	inline void IterateMut(T func) {
+		for (size_t i = 0; i < map.size(); i++) {
+			if (state[i] == BucketState::TAKEN) {
+				func(map[i].key, map[i].value);
+			}
+		}
+	}
+
+	// Note! Does NOT delete any pointed-to data (in case you stored pointers in the map).
 	void Clear() {
 		memset(state.data(), (int)BucketState::FREE, state.size());
 		count_ = 0;
@@ -180,7 +231,7 @@ private:
 
 // Like the above, uses linear probing for cache-friendliness.
 // Does not perform hashing at all so expects well-distributed keys.
-template <class Value, Value NullValue>
+template <class Value>
 class PrehashMap {
 public:
 	PrehashMap(int initialCapacity) : capacity_(initialCapacity) {
@@ -189,29 +240,37 @@ public:
 	}
 
 	// Returns nullptr if no entry was found.
-	Value Get(uint32_t hash) {
+	bool Get(uint32_t hash, Value *value) {
 		uint32_t mask = capacity_ - 1;
 		uint32_t pos = hash & mask;
 		// No? Let's go into search mode. Linear probing.
 		uint32_t p = pos;
 		while (true) {
-			if (state[p] == BucketState::TAKEN && hash == map[p].hash)
-				return map[p].value;
-			else if (state[p] == BucketState::FREE)
-				return NullValue;
+			if (state[p] == BucketState::TAKEN && hash == map[p].hash) {
+				*value = map[p].value;
+				return true;
+			} else if (state[p] == BucketState::FREE) {
+				return false;
+			}
 			p = (p + 1) & mask;  // If the state is REMOVED, we just keep on walking. 
 			if (p == pos) {
 				_assert_msg_(false, "PrehashMap: Hit full on Get()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
-		return NullValue;
+		return false;
 	}
 
 	// Returns false if we already had the key! Which is a bit different.
 	bool Insert(uint32_t hash, Value value) {
 		// Check load factor, resize if necessary. We never shrink.
-		if (count_ > capacity_ / 2) {
-			Grow(2);
+		// Tombstones take up probe slots exactly like live entries do, so they have to count
+		// towards the load factor as well. Otherwise a workload that inserts and removes distinct
+		// keys keeps count_ low forever while REMOVED fills the table, and once no FREE bucket is
+		// left, probing has nothing to terminate on.
+		if (count_ + removedCount_ > capacity_ / 2) {
+			// Mostly tombstones? Compacting in place is enough. Otherwise we need more room.
+			Grow(removedCount_ > count_ ? 1 : 2);
 		}
 		uint32_t mask = capacity_ - 1;
 		uint32_t pos = hash & mask;
@@ -228,6 +287,7 @@ public:
 			if (p == pos) {
 				// FULL! Error. Should not happen thanks to Grow().
 				_assert_msg_(false, "PrehashMap: Hit full on Insert()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
 		if (state[p] == BucketState::REMOVED) {
@@ -255,6 +315,7 @@ public:
 			p = (p + 1) & mask;
 			if (p == pos) {
 				_assert_msg_(false, "PrehashMap: Hit full on Remove()");
+				return false;  // Can't happen now that tombstones count towards the load factor, but don't spin if it does.
 			}
 		}
 		return false;
@@ -313,7 +374,7 @@ private:
 				Insert(old[i].hash, old[i].value);
 			}
 		}
-		INFO_LOG(G3D, "Grew hashmap capacity from %d to %d", oldCapacity, capacity_);
+		INFO_LOG(Log::G3D, "Grew hashmap capacity from %d to %d", oldCapacity, capacity_);
 		_assert_msg_(oldCount == count_, "PrehashMap: count should not change in Grow()");
 	}
 	struct Pair {

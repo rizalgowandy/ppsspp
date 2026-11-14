@@ -17,23 +17,38 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "Common/File/Path.h"
 #include "Core/Compatibility.h"
-#include "Core/Config.h"
+#include "Core/Loaders.h"
 
-enum GPUCore {
-	GPUCORE_GLES,
-	GPUCORE_SOFTWARE,
-	GPUCORE_DIRECTX9,
-	GPUCORE_DIRECTX11,
-	GPUCORE_VULKAN,
+enum GPUCore : int {
+	GPUCORE_GLES = 0,
+	GPUCORE_SOFTWARE = 1,
+	GPUCORE_DIRECTX11 = 3,
+	GPUCORE_VULKAN = 4,
+	GPUCORE_NULL = 5,  // Draws nothing, see GPU_Null.h.
+	GPUCORE_METAL = 6,
+};
+
+// The XMB session a game was started from.
+struct VSHLaunch {
+	Path vshmain;  // Host path of vshmain.prx.
+	std::vector<u8> vshmainArgs;  // What the XMB passed when it launched the game.
 };
 
 enum class FPSLimit {
 	NORMAL = 0,
 	CUSTOM1 = 1,
 	CUSTOM2 = 2,
+	ANALOG = 3,
+	// Set over the WebSocket debugger (game.speed.set). Deliberately its own mode instead of
+	// reusing CUSTOM1/2: those read their rate from g_Config, which is persisted per game, so a
+	// debugger session would permanently overwrite the user's configured alternative speed.
+	DEBUGGER = 4,
 };
 
 class FileLoader;
@@ -47,36 +62,60 @@ enum class CPUCore;
 
 // PSP_CoreParameter()
 struct CoreParameter {
-	CoreParameter() {}
-
 	CPUCore cpuCore;
 	GPUCore gpuCore;
 
+	// Independent of cpuCore. Standalone turns it on wherever the host can JIT; headless keeps it
+	// off, since the test references were recorded with the C++ vertex decoder.
+	bool bUseVertexDecoderJit = false;
+
 	GraphicsContext *graphicsContext = nullptr;  // TODO: Find a better place.
-	bool enableSound;  // there aren't multiple sound cores.
+	bool enableSound = true;  // there aren't multiple sound cores.
 
-	std::string fileToStart;
-	std::string mountIso;  // If non-empty, and fileToStart is an ELF or PBP, will mount this ISO in the background to umd1:.
-	std::string mountRoot;  // If non-empty, and fileToStart is an ELF or PBP, mount this as host0: / umd0:.
+	Path fileToStart;
+
+	Path mountIso;  // If non-empty, and fileToStart is an ELF or PBP, will mount this ISO in the background to umd1:.
+	Path mountRoot;  // If non-empty, and fileToStart is an ELF or PBP, mount this as host0:.
+	// Overrides the VSH's "UMD auto-start" setting (bVshUmdAutoboot) for this boot.
+	std::optional<bool> umdAutoboot;
+
+	// Set when the XMB started this game, which then boots the XMB again when it exits.
+	std::optional<VSHLaunch> launchedFromVSH;
+	// For a boot of vshmain.prx: what its module_start gets, which tells it it's coming back from a game.
+	std::vector<u8> vshmainArgs;
+
+	Path nandRoot;  // If non-empty, use this directory as the root above flash0:-flash3: (which are hosted in subdirectories flash0-flash3 of it).
+
 	std::string errorString;
+	bool loadGameConfigs = true;
 
-	bool startBreak;
-	bool printfEmuLog;  // writes "emulator:" logging to stdout
-	std::string *collectEmuLog = nullptr;
-	bool headLess;   // Try to avoid messageboxes etc
+	bool startBreak = false;
+	std::string *collectDebugOutput = nullptr;
+	bool headLess = false;   // Try to avoid messageboxes etc
+	// Headless only: allows booting a savestate without its game, for measuring performance.
+	bool bootFromState = false;
+	// Headless leaves out compat settings when replaying frame dumps, unless this is set.
+	bool dumpCompat = false;
+	// Headless: GPU_USE_ feature bits to turn off, to test the fallbacks for GPUs without them.
+	u32 disabledGPUFeatures = 0;
 
 	// Internal PSP rendering resolution and scale factor.
-	int renderScaleFactor;
-	int renderWidth;
-	int renderHeight;
+	int renderScaleFactor = 1;
+	int renderWidth = 0;
+	int renderHeight = 0;
 
 	// Actual output resolution in pixels.
-	int pixelWidth;
-	int pixelHeight;
+	int pixelWidth = 0;
+	int pixelHeight = 0;
 
-	// Can be modified at runtime.
-	bool unthrottle = false;
+	// Can be modified at runtime. Do not belong here.
+	bool fastForward = false;
 	FPSLimit fpsLimit = FPSLimit::NORMAL;
+	int analogFpsLimit = 0;
+	// Target FPS for FPSLimit::DEBUGGER. Lives here rather than in g_Config on purpose - see the
+	// enum. Resets with the rest of this struct on every boot, so a debugger can't leave a game
+	// permanently slowed down.
+	int debuggerFpsLimit = 0;
 
 	bool updateRecent = true;
 
@@ -85,6 +124,7 @@ struct CoreParameter {
 	bool frozen = false;
 
 	FileLoader *mountIsoLoader = nullptr;
+	IdentifiedFileType fileType = IdentifiedFileType::UNKNOWN;
 
 	Compatibility compat;
 };

@@ -16,13 +16,22 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
+
 #include <deque>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <set>
 #include <cstdlib>
 #include <cstdarg>
+#include <cstring>
+#include <memory>
+
+// for crc32
+extern "C" {
+#include "zlib.h"
+}
 
 #include "Core/Reporting.h"
 #include "Common/File/VFS/VFS.h"
@@ -30,6 +39,13 @@
 #include "Common/File/FileUtil.h"
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/StringUtils.h"
+#include "Common/System/OSD.h"
+#include "Common/System/System.h"
+#include "Common/Data/Text/I18n.h"
+#include "Common/Net/HTTPClient.h"
+#include "Common/Net/Resolve.h"
+#include "Common/Net/URL.h"
+#include "Common/Thread/ThreadUtil.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/Config.h"
@@ -37,18 +53,18 @@
 #include "Core/Loaders.h"
 #include "Core/SaveState.h"
 #include "Core/System.h"
+#include "Core/MIPS/MIPS.h"
+#include "Core/ELF/ParamSFO.h"
 #include "Core/FileSystems/BlockDevices.h"
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/HLE/Plugins.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernelMemory.h"
-#include "Core/ELF/ParamSFO.h"
-#include "GPU/GPUInterface.h"
+#include "Core/HLE/sceKernelModule.h"
+#include "Core/HLE/scePower.h"
+#include "Core/HW/Display.h"
+#include "Core/Util/PSARUnpack.h"
+#include "GPU/GPUCommon.h"
 #include "GPU/GPUState.h"
-#include "Common/Net/HTTPClient.h"
-#include "Common/Net/Resolve.h"
-#include "Common/Net/URL.h"
-#include "Common/Thread/ThreadUtil.h"
 
 namespace Reporting
 {
@@ -58,12 +74,6 @@ namespace Reporting
 
 	// Internal limiter on number of requests per instance.
 	static u32 spamProtectionCount = 0;
-	// Temporarily stores a reference to the hostname.
-	static std::string lastHostname;
-	// Keeps track of report-only-once identifiers.  Since they're always constants, a pointer is okay.
-	static std::map<const char *, int> logNTimes;
-	static std::mutex logNTimesLock;
-
 	// Keeps track of whether a harmful setting was ever used.
 	static bool everUnsupported = false;
 	// Support is cached here to avoid checking it on every single request.
@@ -73,64 +83,101 @@ namespace Reporting
 	// The latest compatibility result from the server.
 	static std::vector<std::string> lastCompatResult;
 
-	static std::mutex pendingMessageLock;
-	static std::condition_variable pendingMessageCond;
-	static std::deque<int> pendingMessages;
-	static bool pendingMessagesDone = false;
-	static std::thread messageThread;
-	static std::thread compatThread;
+	static std::string lastModuleName;
+	static int lastModuleVersion;
+	static uint32_t lastModuleCrc;
 
-	enum class RequestType
-	{
+	enum class RequestType {
 		NONE,
 		MESSAGE,
 		COMPAT,
 	};
 
-	struct Payload
-	{
+	struct Payload {
 		RequestType type;
 		std::string string1;
 		std::string string2;
 		int int1;
 		int int2;
 		int int3;
+		// Where to send it, if not the configured server.
+		std::string host;
 	};
-	static Payload payloadBuffer[PAYLOAD_BUFFER_SIZE];
-	static int payloadBufferPos = 0;
+
+	// The server the settings enable.
+	static const char *const DEFAULT_HOST = "report.ppsspp.org";
 
 	static std::mutex crcLock;
 	static std::condition_variable crcCond;
-	static std::string crcFilename;
-	static std::map<std::string, u32> crcResults;
-	static volatile bool crcPending = false;
-	static volatile bool crcCancel = false;
+	static Path crcFilename;
+	static std::map<Path, u32> crcResults;
+	static std::atomic<bool> crcPending{};
+	static std::atomic<bool> crcCancel{};
 	static std::thread crcThread;
 
-	static int CalculateCRCThread() {
-		setCurrentThreadName("ReportCRC");
+	static u32 CalculateCRC(BlockDevice *blockDevice, std::atomic<bool> *cancel) {
+		auto ga = GetI18NCategory(I18NCat::GAME);
 
-		// TODO: Use the blockDevice from pspFileSystem?
-		FileLoader *fileLoader = ConstructFileLoader(crcFilename);
-		BlockDevice *blockDevice = constructBlockDevice(fileLoader);
+		u32 crc = crc32(0, Z_NULL, 0);
+
+		u8 block[2048];
+		u32 numBlocks = blockDevice->GetNumBlocks();
+		for (u32 i = 0; i < numBlocks; ++i) {
+			if (cancel && *cancel) {
+				g_OSD.RemoveProgressBar("crc", false, 0.0f);
+				return 0;
+			}
+			if (!blockDevice->ReadBlock(i, block, true)) {
+				ERROR_LOG(Log::FileSystem, "Failed to read block for CRC");
+				g_OSD.RemoveProgressBar("crc", false, 0.0f);
+				return 0;
+			}
+			crc = crc32(crc, block, 2048);
+			g_OSD.SetProgressBar("crc", std::string(ga->T("Calculate CRC")), 0.0f, (float)numBlocks, (float)i, 0.5f);
+		}
+
+		g_OSD.RemoveProgressBar("crc", true, 0.0f);
+		return crc;
+	}
+
+	static int CalculateCRCThread() {
+		SetCurrentThreadName("ReportCRC");
+
+		AndroidJNIThreadContext jniContext;
+
+		IdentifiedFileType type;
+
+		std::string errorString;
+		FileLoader *fileLoader = ResolveFileLoaderTarget(ConstructFileLoader(crcFilename), &type, &errorString);
+		if (!fileLoader) {
+			ERROR_LOG(Log::Loader, "Failed to construct file loader for CRC: %s", errorString.c_str());
+			std::lock_guard<std::mutex> guard(crcLock);
+			crcResults[crcFilename] = 0;
+			crcPending = false;
+			crcCond.notify_one();
+			return 0;
+		}
+
+		std::unique_ptr<BlockDevice> blockDevice(ConstructBlockDevice(fileLoader, &errorString));
 
 		u32 crc = 0;
 		if (blockDevice) {
-			crc = blockDevice->CalculateCRC(&crcCancel);
+			crc = CalculateCRC(blockDevice.get(), &crcCancel);
+		} else {
+			ERROR_LOG(Log::Loader, "Failed to read from block device for CRC: %s", errorString.c_str());
 		}
 
-		delete blockDevice;
+		blockDevice.reset();
 		delete fileLoader;
 
 		std::lock_guard<std::mutex> guard(crcLock);
 		crcResults[crcFilename] = crc;
 		crcPending = false;
 		crcCond.notify_one();
-
 		return 0;
 	}
 
-	void QueueCRC(const std::string &gamePath) {
+	void QueueCRC(const Path &gamePath) {
 		std::lock_guard<std::mutex> guard(crcLock);
 
 		auto it = crcResults.find(gamePath);
@@ -141,22 +188,23 @@ namespace Reporting
 		}
 
 		if (crcPending) {
-			// Already in process.
+			// Already in process. This is OK - on the crash screen we call this in a polling fashion.
 			return;
 		}
 
+		INFO_LOG(Log::System, "Starting CRC calculation");
 		crcFilename = gamePath;
 		crcPending = true;
 		crcCancel = false;
 		crcThread = std::thread(CalculateCRCThread);
 	}
 
-	bool HasCRC(const std::string &gamePath) {
+	bool HasCRC(const Path &gamePath) {
 		std::lock_guard<std::mutex> guard(crcLock);
 		return crcResults.find(gamePath) != crcResults.end();
 	}
 
-	uint32_t RetrieveCRC(const std::string &gamePath) {
+	uint32_t RetrieveCRC(const Path &gamePath) {
 		QueueCRC(gamePath);
 
 		std::unique_lock<std::mutex> guard(crcLock);
@@ -166,12 +214,14 @@ namespace Reporting
 			it = crcResults.find(gamePath);
 		}
 
-		if (crcThread.joinable())
+		if (crcThread.joinable()) {
+			INFO_LOG(Log::System, "Finished CRC calculation");
 			crcThread.join();
+		}
 		return it->second;
 	}
 
-	static uint32_t RetrieveCRCUnlessPowerSaving(const std::string &gamePath) {
+	static uint32_t RetrieveCRCUnlessPowerSaving(const Path &gamePath) {
 		// It's okay to use it if we have it already.
 		if (Core_GetPowerSaving() && !HasCRC(gamePath)) {
 			return 0;
@@ -182,31 +232,38 @@ namespace Reporting
 
 	static void PurgeCRC() {
 		std::unique_lock<std::mutex> guard(crcLock);
-		crcCancel = true;
-		while (crcPending) {
-			crcCond.wait(guard);
+		if (crcPending) {
+			INFO_LOG(Log::System, "Cancelling CRC calculation");
+			crcCancel = true;
+			while (crcPending) {
+				crcCond.wait(guard);
+			}
+		} else {
+			DEBUG_LOG(Log::System, "No CRC pending");
 		}
 
 		if (crcThread.joinable())
 			crcThread.join();
 	}
 
-	// Returns the full host (e.g. report.ppsspp.org:80.)
-	std::string ServerHost()
-	{
+	void CancelCRC() {
+		PurgeCRC();
+	}
+
+	// Returns the full host
+	std::string ServerHost() {
 		if (g_Config.sReportHost.compare("default") == 0)
 			return "";
 		return g_Config.sReportHost;
 	}
 
 	// Returns the length of the hostname part (e.g. before the :80.)
-	static size_t ServerHostnameLength()
+	static size_t ServerHostnameLength(const std::string &hostString)
 	{
-		if (!IsEnabled())
-			return g_Config.sReportHost.npos;
+		if (hostString.empty())
+			return hostString.npos;
 
 		// IPv6 literal?
-		std::string hostString = ServerHost();
 		if (hostString[0] == '[')
 		{
 			size_t length = hostString.find("]:");
@@ -219,30 +276,20 @@ namespace Reporting
 	}
 
 	// Returns only the hostname part (e.g. "report.ppsspp.org".)
-	static const char *ServerHostname()
-	{
-		if (!IsEnabled())
-			return NULL;
-
-		std::string host = ServerHost();
-		size_t length = ServerHostnameLength();
+	static std::string ServerHostname(const std::string &host) {
+		size_t length = ServerHostnameLength(host);
 
 		// This means there's no port number - it's already the hostname.
 		if (length == host.npos)
-			lastHostname = host;
+			return host;
 		else
-			lastHostname = host.substr(0, length);
-		return lastHostname.c_str();
+			return host.substr(0, length);
 	}
 
 	// Returns only the port part (e.g. 80) as an int.
-	static int ServerPort()
+	static int ServerPort(const std::string &host)
 	{
-		if (!IsEnabled())
-			return 0;
-
-		std::string host = ServerHost();
-		size_t offset = ServerHostnameLength();
+		size_t offset = ServerHostnameLength(host);
 		// If there's no port, use the default one.
 		if (offset == host.npos)
 			return DEFAULT_PORT;
@@ -258,31 +305,19 @@ namespace Reporting
 		return ++spamProtectionCount >= SPAM_LIMIT;
 	}
 
-	bool SendReportRequest(const char *uri, const std::string &data, const std::string &mimeType, Buffer *output = NULL)
-	{
-		http::Client http;
-		Buffer theVoid;
-
-		if (output == NULL)
-			output = &theVoid;
-
-		const char *serverHost = ServerHostname();
-		if (!serverHost)
-			return false;
-
-		if (http.Resolve(serverHost, ServerPort())) {
-			http.Connect();
-			int result = http.POST(uri, data, mimeType, output);
-			http.Disconnect();
-
-			return result >= 200 && result < 300;
-		} else {
-			return false;
+	// host is "hostname" or "hostname:port".
+	static void SendReportRequest(const std::string &host, const char *uri, const std::string &data, const std::string &mimeType, std::function<void(http::Request &)> callback) {
+		if (host.empty()) {
+			return;
 		}
+		char url[1024];
+		std::string hostname = ServerHostname(host);
+		int port = ServerPort(host);
+		snprintf(url, sizeof(url), "http://%s:%d%s", hostname.c_str(), port, uri);
+		g_DownloadManager.AsyncPostWithCallback(url, data, mimeType, http::RequestFlags::Default, callback);
 	}
 
-	std::string StripTrailingNull(const std::string &str)
-	{
+	std::string StripTrailingNull(const std::string &str) {
 		size_t pos = str.find_first_of('\0');
 		if (pos != str.npos)
 			return str.substr(0, pos);
@@ -298,10 +333,10 @@ namespace Reporting
 		return "Windows ARM64";
 #elif defined(_WIN64)
 		return "Windows 64";
-#elif defined(_WIN32) && defined(_M_ARM)
-		return "Windows ARM32";
 #elif defined(_WIN32)
 		return "Windows";
+#elif PPSSPP_PLATFORM(TVOS)
+		return "tvOS";
 #elif PPSSPP_PLATFORM(IOS)
 		return "iOS";
 #elif defined(__APPLE__)
@@ -329,34 +364,30 @@ namespace Reporting
 #endif
 	}
 
-	void Init()
-	{
+	bool MessageAllowed();
+	void SendReportMessage(const char *message, const char *formatted);
+
+	void Init() {
 		// New game, clean slate.
 		spamProtectionCount = 0;
-		logNTimes.clear();
+		ResetCounts();
 		everUnsupported = false;
 		currentSupported = IsSupported();
-		pendingMessagesDone = false;
+		Reporting::SetupCallbacks(&MessageAllowed, &SendReportMessage);
+
+		lastModuleName.clear();
+		lastModuleVersion = 0;
+		lastModuleCrc = 0;
 	}
 
-	void Shutdown()
-	{
-		pendingMessageLock.lock();
-		pendingMessagesDone = true;
-		pendingMessageCond.notify_one();
-		pendingMessageLock.unlock();
-		if (compatThread.joinable())
-			compatThread.join();
-		if (messageThread.joinable())
-			messageThread.join();
+	void Shutdown() {
 		PurgeCRC();
 
 		// Just so it can be enabled in the menu again.
 		Init();
 	}
 
-	void DoState(PointerWrap &p)
-	{
+	void DoState(PointerWrap &p) {
 		const int LATEST_VERSION = 1;
 		auto s = p.Section("Reporting", 0, LATEST_VERSION);
 		if (!s || s < LATEST_VERSION) {
@@ -365,37 +396,28 @@ namespace Reporting
 			return;
 		}
 
+		bool reportingWasUnsupported = everUnsupported;
 		Do(p, everUnsupported);
-	}
-
-	void UpdateConfig()
-	{
-		currentSupported = IsSupported();
-		if (!currentSupported && PSP_IsInited())
-			everUnsupported = true;
-	}
-
-	bool ShouldLogNTimes(const char *identifier, int count)
-	{
-		// True if it wasn't there already -> so yes, log.
-		std::lock_guard<std::mutex> lock(logNTimesLock);
-		auto iter = logNTimes.find(identifier);
-		if (iter == logNTimes.end()) {
-			logNTimes.insert(std::pair<const char*, int>(identifier, 1));
-			return true;
-		} else {
-			if (iter->second >= count) {
-				return false;
-			} else {
-				iter->second++;
-				return true;
-			}
+		if (!reportingWasUnsupported && everUnsupported) {
+			INFO_LOG(Log::System, "Reporting became unsupported due to loading an old savestate.");
 		}
 	}
 
-	void ResetCounts() {
-		std::lock_guard<std::mutex> lock(logNTimesLock);
-		logNTimes.clear();
+	void UpdateConfig() {
+		currentSupported = IsSupported();
+		if (!currentSupported && PSP_GetBootState() == BootState::Complete)
+			everUnsupported = true;
+	}
+
+	void NotifyDebugger() {
+		currentSupported = false;
+		everUnsupported = true;
+	}
+
+	void NotifyExecModule(const char *name, int ver, uint32_t crc) {
+		lastModuleName = name;
+		lastModuleVersion = ver;
+		lastModuleCrc = crc;
 	}
 
 	std::string CurrentGameID()
@@ -406,11 +428,47 @@ namespace Reporting
 		return disc_id + "_" + disc_version;
 	}
 
+	// The container the game image is in, from its header: "cso", "chd", "pbp" or "iso". Empty for
+	// a directory. Cached, since it only changes with the game.
+	static std::string DiscContainer(const Path &path) {
+		static std::mutex cacheLock;
+		static Path cachedPath;
+		static std::string cachedContainer;
+
+		std::lock_guard<std::mutex> guard(cacheLock);
+		if (path == cachedPath) {
+			return cachedContainer;
+		}
+		cachedPath = path;
+		cachedContainer.clear();
+
+		std::unique_ptr<FileLoader> loader(ConstructFileLoader(path));
+		char header[8]{};
+		if (!loader || !loader->Exists() || loader->IsDirectory() || loader->ReadAt(0, 1, 8, header) != 8) {
+			return cachedContainer;
+		}
+		if (!memcmp(header, "CISO", 4)) {
+			cachedContainer = "cso";
+		} else if (!memcmp(header, "MComprHD", 8)) {
+			cachedContainer = "chd";
+		} else if (!memcmp(header, "\0PBP", 4)) {
+			cachedContainer = "pbp";
+		} else {
+			cachedContainer = "iso";
+		}
+		return cachedContainer;
+	}
+
 	void AddGameInfo(UrlEncoder &postdata)
 	{
 		postdata.Add("game", CurrentGameID());
+		postdata.Add("file_type", IdentifiedFileTypeToString(PSP_CoreParameter().fileType));
+		postdata.Add("disc_container", DiscContainer(PSP_CoreParameter().fileToStart));
 		postdata.Add("game_title", StripTrailingNull(g_paramSFO.GetValueString("TITLE")));
 		postdata.Add("sdkver", sceKernelGetCompiledSdkVersion());
+		postdata.Add("module_name", lastModuleName);
+		postdata.Add("module_ver", lastModuleVersion);
+		postdata.Add("module_crc", lastModuleCrc);
 	}
 
 	void AddSystemInfo(UrlEncoder &postdata)
@@ -424,6 +482,20 @@ namespace Reporting
 		postdata.Add("gpu_full", gpuFull);
 		postdata.Add("cpu", cpu_info.Summarize());
 		postdata.Add("platform", GetPlatformIdentifer());
+#if PPSSPP_PLATFORM(ANDROID)
+		// On Android, SYSPROP_NAME is the device: "MANUFACTURER:MODEL".
+		postdata.Add("os", StringFromFormat("Android API %d", (int)System_GetPropertyInt(SYSPROP_SYSTEMVERSION)));
+		postdata.Add("device_model", System_GetProperty(SYSPROP_NAME));
+#else
+		postdata.Add("os", System_GetProperty(SYSPROP_NAME));
+		postdata.Add("device_model", System_GetProperty(SYSPROP_DEVICE_MODEL));
+#endif
+		postdata.Add("os_build", System_GetProperty(SYSPROP_SYSTEMBUILD));
+
+		// Empty when there's no full firmware install (nothing, or just fonts pulled off a disc).
+		InstalledFirmwareInfo firmware;
+		ReadInstalledFirmwareInfo(g_Config.nandRootDirectory, &firmware, false);
+		postdata.Add("firmware", firmware.version);
 	}
 
 	void AddConfigInfo(UrlEncoder &postdata)
@@ -437,7 +509,11 @@ namespace Reporting
 	void AddGameplayInfo(UrlEncoder &postdata)
 	{
 		// Just to get an idea of how long they played.
-		postdata.Add("ticks", (const uint64_t)CoreTiming::GetTicks());
+		if (PSP_GetBootState() == BootState::Complete) {
+			postdata.Add("ticks", (const uint64_t)CoreTiming::GetTicks(currentMIPS));
+			// Emulated seconds. Ticks alone don't say this, since games change the CPU clock.
+			postdata.Add("seconds_played", (double)CoreTiming::PeekGlobalTimeUs() / 1000000.0);
+		}
 
 		float vps, fps;
 		__DisplayGetAveragedFPS(&vps, &fps);
@@ -447,11 +523,12 @@ namespace Reporting
 		postdata.Add("savestate_used", SaveState::HasLoadedState());
 	}
 
-	void AddScreenshotData(MultipartFormDataEncoder &postdata, std::string filename)
+	void AddScreenshotData(MultipartFormDataEncoder &postdata, const Path &filename)
 	{
 		std::string data;
-		if (!filename.empty() && readFileToString(false, filename.c_str(), data))
+		if (!filename.empty() && File::ReadBinaryFileToString(filename, &data)) {
 			postdata.Add("screenshot", data, "screenshot.jpg", "image/jpeg");
+		}
 
 		const std::string iconFilename = "disc0:/PSP_GAME/ICON0.PNG";
 		std::vector<u8> iconData;
@@ -460,12 +537,13 @@ namespace Reporting
 		}
 	}
 
-	int Process(int pos)
-	{
-		setCurrentThreadName("Report");
-
-		Payload &payload = payloadBuffer[pos];
+	int Process(const Payload &payload) {
 		Buffer output;
+
+		std::string host = payload.host;
+		if (host.empty() && IsEnabled()) {
+			host = ServerHost();
+		}
 
 		MultipartFormDataEncoder postdata;
 		AddSystemInfo(postdata);
@@ -473,21 +551,18 @@ namespace Reporting
 		AddConfigInfo(postdata);
 		AddGameplayInfo(postdata);
 
-		switch (payload.type)
-		{
+		switch (payload.type) {
 		case RequestType::MESSAGE:
 			// TODO: Add CRC?
 			postdata.Add("message", payload.string1);
 			postdata.Add("value", payload.string2);
 			// We tend to get corrupted data, this acts as a very primitive verification check.
 			postdata.Add("verify", payload.string1 + payload.string2);
-			payload.string1.clear();
-			payload.string2.clear();
 
 			postdata.Finish();
-			serverWorking = true;
-			if (!SendReportRequest("/report/message", postdata.ToString(), postdata.GetMimeType()))
-				serverWorking = false;
+			SendReportRequest(host, "/report/message", postdata.ToString(), postdata.GetMimeType(), [=](http::Request &req) {
+				serverWorking = !req.Failed();
+			});
 			break;
 
 		case RequestType::COMPAT:
@@ -499,41 +574,38 @@ namespace Reporting
 			postdata.Add("gameplay", StringFromFormat("%d", payload.int3));
 			postdata.Add("crc", StringFromFormat("%08x", RetrieveCRCUnlessPowerSaving(PSP_CoreParameter().fileToStart)));
 			postdata.Add("suggestions", payload.string1 != "perfect" && payload.string1 != "playable" ? "1" : "0");
-			AddScreenshotData(postdata, payload.string2);
-			payload.string1.clear();
-			payload.string2.clear();
+			AddScreenshotData(postdata, Path(payload.string2));
 
 			postdata.Finish();
 			serverWorking = true;
-			if (!SendReportRequest("/report/compat", postdata.ToString(), postdata.GetMimeType(), &output)) {
-				serverWorking = false;
-			} else {
-				std::string result;
-				output.TakeAll(&result);
+			SendReportRequest(host, "/report/compat", postdata.ToString(), postdata.GetMimeType(), [=](http::Request &req) {
+				if (req.Failed()) {
+					serverWorking = false;
+					return;
+				}
+				serverWorking = true;
 
+				std::string result;
+				req.buffer().TakeAll(&result);
 				lastCompatResult.clear();
 				if (result.empty() || result[0] == '0')
 					serverWorking = false;
 				else if (result[0] != '1')
 					SplitString(result, '\n', lastCompatResult);
-			}
+			});
 			break;
-
 		case RequestType::NONE:
 			break;
 		}
-
-		payload.type = RequestType::NONE;
-
 		return 0;
 	}
 
 	bool IsSupported()
 	{
 		// Disabled when using certain hacks, because they make for poor reports.
-		if (CheatsInEffect() || HLEPlugins::HasEnabled())
+		if (CheatsOrPluginsInEffect())
 			return false;
-		if (g_Config.iLockedCPUSpeed != 0)
+		if (GetLockedCPUSpeedMhz() != 0)
 			return false;
 		if (g_Config.uJitDisableFlags != 0)
 			return false;
@@ -543,26 +615,19 @@ namespace Reporting
 		// Don't report from games without a version ID (i.e. random hashed homebrew IDs.)
 		// The problem is, these aren't useful because the hashes end up different for different people.
 		// TODO: Should really hash the ELF instead of the path, but then that affects savestates/cheats.
-		if (g_paramSFO.GetValueString("DISC_VERSION").empty())
+		if (PSP_GetBootState() == BootState::Complete && g_paramSFO.GetValueString("DISC_VERSION").empty())
 			return false;
-
-		// Some users run the exe from a zip or something, and don't have fonts.
-		// This breaks things, but let's not report it since it's confusing.
-#if defined(USING_WIN_UI) || defined(APPLE)
-		if (!File::Exists(g_Config.flash0Directory + "/font/jpn0.pgf"))
+		// Firmware updaters only run far enough to crash: their VSH libraries want memory partitions a
+		// game boot doesn't set up. They're for installing the firmware (InstallUpdateScreen), not running.
+		if (PSP_GetBootState() != BootState::Off && g_paramSFO.GetValueString("DISC_ID") == "MSTKUPDATE")
 			return false;
-#else
-		FileInfo fo;
-		if (!VFSGetFileInfo("flash0/font/jpn0.pgf", &fo))
-			return false;
-#endif
 
 		return !everUnsupported;
 	}
 
 	bool IsEnabled()
 	{
-		if (g_Config.sReportHost.empty() || (!currentSupported && PSP_IsInited()))
+		if (g_Config.sReportHost.empty() || (!currentSupported && PSP_GetBootState() == BootState::Complete))
 			return false;
 		// Disabled by default for now.
 		if (g_Config.sReportHost.compare("default") == 0)
@@ -570,7 +635,7 @@ namespace Reporting
 		return true;
 	}
 
-	bool Enable(bool flag, std::string host)
+	bool Enable(bool flag, const std::string &host)
 	{
 		if (IsSupported() && IsEnabled() != flag)
 		{
@@ -587,118 +652,33 @@ namespace Reporting
 		g_Config.sReportHost = "default";
 	}
 
-	ReportStatus GetStatus()
-	{
+	ReportStatus GetStatus() {
 		if (!serverWorking)
 			return ReportStatus::FAILING;
-
-		for (int pos = 0; pos < PAYLOAD_BUFFER_SIZE; ++pos)
-		{
-			if (payloadBuffer[pos].type != RequestType::NONE)
-				return ReportStatus::BUSY;
-		}
-
 		return ReportStatus::WORKING;
 	}
 
-	int NextFreePos()
-	{
-		int start = payloadBufferPos % PAYLOAD_BUFFER_SIZE;
-		do
-		{
-			int pos = payloadBufferPos++ % PAYLOAD_BUFFER_SIZE;
-			if (payloadBuffer[pos].type == RequestType::NONE)
-				return pos;
-		}
-		while (payloadBufferPos != start);
-
-		return -1;
-	}
-
-	int ProcessPending() {
-		setCurrentThreadName("Report");
-
-		std::unique_lock<std::mutex> guard(pendingMessageLock);
-		while (!pendingMessagesDone) {
-			while (!pendingMessages.empty() && !pendingMessagesDone) {
-				int pos = pendingMessages.front();
-				pendingMessages.pop_front();
-
-				guard.unlock();
-				Process(pos);
-				guard.lock();
-			}
-			if (pendingMessagesDone) {
-				break;
-			}
-			pendingMessageCond.wait(guard);
-		}
-
-		return 0;
-	}
-
-	void ReportMessage(const char *message, ...)
-	{
+	bool MessageAllowed() {
 		if (!IsEnabled() || CheckSpamLimited())
-			return;
-		int pos = NextFreePos();
-		if (pos == -1)
-			return;
-
-		const int MESSAGE_BUFFER_SIZE = 65536;
-		char temp[MESSAGE_BUFFER_SIZE];
-
-		va_list args;
-		va_start(args, message);
-		vsnprintf(temp, MESSAGE_BUFFER_SIZE - 1, message, args);
-		temp[MESSAGE_BUFFER_SIZE - 1] = '\0';
-		va_end(args);
-
-		Payload &payload = payloadBuffer[pos];
-		payload.type = RequestType::MESSAGE;
-		payload.string1 = message;
-		payload.string2 = temp;
-
-		std::lock_guard<std::mutex> guard(pendingMessageLock);
-		pendingMessages.push_back(pos);
-		pendingMessageCond.notify_one();
-
-		if (!messageThread.joinable()) {
-			messageThread = std::thread(ProcessPending);
-		}
+			return false;
+		return true;
 	}
 
-	void ReportMessageFormatted(const char *message, const char *formatted)
-	{
-		if (!IsEnabled() || CheckSpamLimited())
-			return;
-		int pos = NextFreePos();
-		if (pos == -1)
-			return;
+	void SendReportMessage(const char *message, const char *formatted) {
+		// MessageAllowed is checked first.
 
-		Payload &payload = payloadBuffer[pos];
+		Payload payload{};
 		payload.type = RequestType::MESSAGE;
 		payload.string1 = message;
 		payload.string2 = formatted;
 
-		std::lock_guard<std::mutex> guard(pendingMessageLock);
-		pendingMessages.push_back(pos);
-		pendingMessageCond.notify_one();
-
-		if (!messageThread.joinable()) {
-			messageThread = std::thread(ProcessPending);
-		}
+		Process(payload);
 	}
 
-	void ReportCompatibility(const char *compat, int graphics, int speed, int gameplay, const std::string &screenshotFilename)
-	{
+	void ReportCompatibility(const char *compat, int graphics, int speed, int gameplay, const std::string &screenshotFilename) {
 		if (!IsEnabled())
 			return;
-		int pos = NextFreePos();
-		if (pos == -1)
-			return;
-
-		Payload &payload = payloadBuffer[pos];
+		Payload payload{};
 		payload.type = RequestType::COMPAT;
 		payload.string1 = compat;
 		payload.string2 = screenshotFilename;
@@ -706,12 +686,109 @@ namespace Reporting
 		payload.int2 = speed;
 		payload.int3 = gameplay;
 
-		if (compatThread.joinable())
-			compatThread.join();
-		compatThread = std::thread(Process, pos);
+		Process(payload);
 	}
 
 	std::vector<std::string> CompatibilitySuggestions() {
 		return lastCompatResult;
+	}
+
+	bool CanReportCrashManually() {
+		return !IsEnabled() && IsSupported();
+	}
+
+	bool CheatsOrPluginsInEffect() {
+		return CheatsInEffect() || HLEPlugins::HasEnabled();
+	}
+
+	bool CrashReportsOff() {
+		// The VSH crashes too often for its reports to be worth having.
+		return __KernelIsRunningVSH();
+	}
+
+	// Crashes reported this run, by game ID and formatted crash. Resuming, resetting or loading a
+	// state often runs straight back into the same crash, which the server doesn't need twice.
+	static std::mutex reportedCrashesLock;
+	static std::set<std::string> reportedCrashes;
+
+	// The message is what the server groups reports by, so the details only go in formatted.
+	static bool FormatCrash(const MIPSExceptionInfo &info, const char **outMessage, std::string *outFormatted) {
+		const char *message = nullptr;
+		char formatted[1024];
+		switch (info.type) {
+		case MIPSExceptionType::MEMORY:
+			message = "Crash: %s at %08x (PC %08x)";
+			snprintf(formatted, sizeof(formatted), message, MemoryExceptionTypeAsString(info.memory_type), info.address, info.pc);
+			break;
+		case MIPSExceptionType::BAD_EXEC_ADDR:
+			message = "Crash: %s to %08x (PC %08x, RA %08x)";
+			snprintf(formatted, sizeof(formatted), message, ExecExceptionTypeAsString(info.exec_type), info.address, info.pc, info.ra);
+			break;
+		case MIPSExceptionType::FPU:
+			message = "Crash: FPU %s (PC %08x)";
+			snprintf(formatted, sizeof(formatted), message, FPUExceptionTypeAsString(info.fpu_type), info.pc);
+			break;
+		case MIPSExceptionType::BREAK:
+			message = "Crash: break instruction (PC %08x)";
+			snprintf(formatted, sizeof(formatted), message, info.pc);
+			break;
+		case MIPSExceptionType::HLE:
+			message = "Crash: HLE error: %s (PC %08x, RA %08x)";
+			snprintf(formatted, sizeof(formatted), message, info.info.c_str(), info.pc, info.ra);
+			break;
+		default:
+			return false;
+		}
+		*outMessage = message;
+		*outFormatted = formatted;
+		return true;
+	}
+
+	static std::string CrashKey(const std::string &formatted) {
+		return CurrentGameID() + " " + formatted;
+	}
+
+	bool CrashAlreadyReported(const MIPSExceptionInfo &info) {
+		const char *message;
+		std::string formatted;
+		if (!FormatCrash(info, &message, &formatted)) {
+			return false;
+		}
+		std::lock_guard<std::mutex> guard(reportedCrashesLock);
+		return reportedCrashes.count(CrashKey(formatted)) != 0;
+	}
+
+	void ReportCrash(const MIPSExceptionInfo &info, bool userRequested) {
+		// Checked directly too: currentSupported, which MessageAllowed() relies on, can be stale.
+		if (CrashReportsOff() || CheatsOrPluginsInEffect() || (userRequested ? !CanReportCrashManually() : !MessageAllowed())) {
+			return;
+		}
+
+		const char *message;
+		std::string formatted;
+		if (!FormatCrash(info, &message, &formatted)) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> guard(reportedCrashesLock);
+			if (!reportedCrashes.insert(CrashKey(formatted)).second) {
+				return;
+			}
+		}
+
+		std::string value = formatted;
+		if (!info.stackTrace.empty()) {
+			value += "\n";
+			value += info.stackTrace.substr(0, 2000);
+		}
+
+		Payload payload{};
+		payload.type = RequestType::MESSAGE;
+		payload.string1 = message;
+		payload.string2 = value;
+		if (userRequested) {
+			payload.host = DEFAULT_HOST;
+		}
+		Process(payload);
 	}
 }

@@ -1,28 +1,53 @@
 #pragma once
 #include <atomic>
 
-#include "libretro/libretro.h"
-#include "Common/GraphicsContext.h"
+#include <libretro.h>
+#include "Common/GPU/GraphicsContext.h"
 #include "Common/GPU/thin3d_create.h"
 
+#include "Common/CommonTypes.h"
+#include "Core/Config.h"
 #include "Core/System.h"
 #include "GPU/GPUState.h"
+#include "GPU/Software/SoftGpu.h"
+#include "headless/Compare.h"
+#include "Common/Data/Convert/ColorConv.h"
+
+#define NATIVEWIDTH  480
+#define NATIVEHEIGHT 272
+#define SOFT_BMP_SIZE NATIVEWIDTH * NATIVEHEIGHT * 4
+
+namespace Libretro {
+// Frame size to hand to video_cb. Normally the backbuffer size (passed in), but smaller when
+// we present a game's source image for the frontend to scale. Updates the geometry when that changes.
+void GetFrameSize(unsigned *width, unsigned *height);
+}
 
 class LibretroGraphicsContext : public GraphicsContext {
 public:
 	LibretroGraphicsContext() {}
-	~LibretroGraphicsContext() override { Shutdown(); }
+	~LibretroGraphicsContext() override { ShutdownAPI(); }
 
-	virtual bool Init() = 0;
 	virtual void SetRenderTarget() {}
 	virtual GPUCore GetGPUCore() = 0;
 	virtual const char *Ident() = 0;
 
-	void Shutdown() override {
+	void ShutdownAPI() override {
 		DestroyDrawContext();
 	}
-	void SwapInterval(int interval) override {}
+	virtual void SwapBuffers() = 0;
 	void Resize() override {}
+	// True if ThreadFrame() has queued work to run (emu thread backends only).
+	virtual bool ThreadFramePending() { return false; }
+
+	// For a frontend that shares its context with us only while we hold a lock on it (D3D11 interface
+	// version 2). LockContext/UnlockContext nest. BeginFrameAccess is called at the top of retro_run, and
+	// what it takes, SwapBuffers lets go of before handing the frame over; EndFrameAccess lets go of it on
+	// the paths that don't swap. All no-ops elsewhere.
+	virtual void LockContext() {}
+	virtual void UnlockContext() {}
+	virtual void BeginFrameAccess() {}
+	virtual void EndFrameAccess() {}
 
 	virtual void GotBackbuffer();
 	virtual void LostBackbuffer();
@@ -48,12 +73,13 @@ protected:
 class LibretroHWRenderContext : public LibretroGraphicsContext {
 public:
 	LibretroHWRenderContext(retro_hw_context_type context_type, unsigned version_major = 0, unsigned version_minor = 0);
-	bool Init(bool cache_context);
+	bool InitHW(bool cache_context);
 	void SetRenderTarget() override {}
 	void SwapBuffers() override {
-		if (!gstate_c.skipDrawReason) {
-			video_cb(RETRO_HW_FRAME_BUFFER_VALID, PSP_CoreParameter().pixelWidth, PSP_CoreParameter().pixelHeight, 0);
-		}
+		unsigned w = PSP_CoreParameter().pixelWidth;
+		unsigned h = PSP_CoreParameter().pixelHeight;
+		Libretro::GetFrameSize(&w, &h);
+		video_cb(RETRO_HW_FRAME_BUFFER_VALID, w, h, 0);
 	}
 	virtual void ContextReset();
 	virtual void ContextDestroy();
@@ -62,38 +88,43 @@ protected:
 	retro_hw_render_callback hw_render_ = {};
 };
 
-#ifdef _WIN32
-class LibretroD3D9Context : public LibretroHWRenderContext {
-public:
-	LibretroD3D9Context() : LibretroHWRenderContext(RETRO_HW_CONTEXT_DIRECT3D, 9) {}
-	bool Init() override { return false; }
-
-	void CreateDrawContext() override {
-		draw_ = Draw::T3DCreateDX9Context(nullptr, nullptr, 0, nullptr, nullptr);
-		draw_->CreatePresets();
-	}
-
-	GPUCore GetGPUCore() override { return GPUCORE_DIRECTX9; }
-	const char *Ident() override { return "DirectX 9"; }
-};
-#endif
+std::vector<u32> ConvertFramebufferForLibretro(const GPUDebugBuffer *buffer, u32 stride, u32 h);
 
 class LibretroSoftwareContext : public LibretroGraphicsContext {
 public:
 	LibretroSoftwareContext() {}
-	bool Init() override { return true; }
-	void SwapBuffers() override { video_cb(NULL, PSP_CoreParameter().pixelWidth, PSP_CoreParameter().pixelHeight, 0); }
+	void SwapBuffers() override {
+		GPUDebugBuffer buf;
+		unsigned w = NATIVEWIDTH;
+		unsigned h = NATIVEHEIGHT;
+		if (gpu) {
+			gpu->GetOutputFramebuffer(buf);
+		}
+		Libretro::GetFrameSize(&w, &h);
+		u32 offset = 0;
+		if (w == NATIVEWIDTH && g_Config.bDisplayCropTo16x9) {
+			offset = w << 1;
+			h -= 2;
+		}
+		if (gpu) {
+			const std::vector<u32> pixels = ConvertFramebufferForLibretro(&buf, w, w == NATIVEWIDTH ? NATIVEHEIGHT : h);
+			memcpy(soft_bmp, pixels.data(), pixels.size() * sizeof(u32));
+		}
+		video_cb(soft_bmp + offset, w, h, w << 2);
+    }
 	GPUCore GetGPUCore() override { return GPUCORE_SOFTWARE; }
 	const char *Ident() override { return "Software"; }
+
+	u16 soft_bmp[SOFT_BMP_SIZE] = {0};
 };
 
 namespace Libretro {
 extern LibretroGraphicsContext *ctx;
 extern retro_environment_t environ_cb;
+extern retro_hw_context_type backend;
 
 enum class EmuThreadState {
 	DISABLED,
-	START_REQUESTED,
 	RUNNING,
 	PAUSE_REQUESTED,
 	PAUSED,
@@ -102,6 +133,24 @@ enum class EmuThreadState {
 };
 extern bool useEmuThread;
 extern std::atomic<EmuThreadState> emuThreadState;
+
+// Holds the graphics context (see LibretroGraphicsContext::LockContext) for a scope.
+class ScopedContextLock {
+public:
+	ScopedContextLock() : ctx_(ctx) {
+		if (ctx_) {
+			ctx_->LockContext();
+		}
+	}
+	~ScopedContextLock() {
+		if (ctx_) {
+			ctx_->UnlockContext();
+		}
+	}
+
+private:
+	LibretroGraphicsContext *ctx_;
+};
 void EmuThreadStart();
 void EmuThreadStop();
 void EmuThreadPause();

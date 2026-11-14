@@ -22,12 +22,11 @@
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/HLE/sceAtrac.h"
-#include "Core/Config.h"
+#include "Core/HLE/scePower.h"
 #include "Core/Reporting.h"
 #include "Core/Util/AudioFormat.h"
+#include "Core/System.h"
 #include "SasAudio.h"
-
-// #define AUDIO_TO_FILE
 
 static const u8 f[16][2] = {
 	{   0,   0 },
@@ -35,8 +34,7 @@ static const u8 f[16][2] = {
 	{ 115,  52 },
 	{  98,  55 },
 	{ 122,  60 },
-	// TODO: The below values could use more testing, but match initial tests.
-	// Not sure if they are used by games, found by tests.
+	// Everything past index 4 is the hardware reading off the end of its own table, so this is garbage extra values.
 	{   0,   0 },
 	{   0,   0 },
 	{  52,   0 },
@@ -64,19 +62,21 @@ void VagDecoder::Start(u32 data, u32 vagSize, bool loopEnabled) {
 	s_2 = 0;
 }
 
-void VagDecoder::DecodeBlock(u8 *&read_pointer) {
+void VagDecoder::DecodeBlock(const u8 *&read_pointer) {
 	if (curBlock_ == numBlocks_ - 1) {
 		end_ = true;
 		return;
 	}
 
-	u8 *readp = read_pointer;
+	_dbg_assert_(curBlock_ < numBlocks_);
+
+	const u8 *readp = read_pointer;
 	int predict_nr = *readp++;
 	int shift_factor = predict_nr & 0xf;
 	predict_nr >>= 4;
 	int flags = *readp++;
 	if (flags == 7) {
-		VERBOSE_LOG(SASMIX, "VAG ending block at %d", curBlock_);
+		VERBOSE_LOG(Log::SasMix, "VAG ending block at %d", curBlock_);
 		end_ = true;
 		return;
 	}
@@ -120,17 +120,18 @@ void VagDecoder::GetSamples(s16 *outSamples, int numSamples) {
 		memset(outSamples, 0, numSamples * sizeof(s16));
 		return;
 	}
-	if (!Memory::IsValidAddress(read_)) {
-		WARN_LOG(SASMIX, "Bad VAG samples address?");
+	if (!Memory::IsValidRange(read_, numBlocks_ * 16)) {
+		WARN_LOG_REPORT_ONCE(badvagaddr, Log::SasMix, "Bad VAG samples address? %08x / %d", read_, numBlocks_);
 		return;
 	}
-	u8 *readp = Memory::GetPointerUnchecked(read_);
-	u8 *origp = readp;
+
+	const u8 *readp = Memory::GetPointerUnchecked(read_);
+	const u8 *origp = readp;
 
 	for (int i = 0; i < numSamples; i++) {
 		if (curSample == 28) {
 			if (loopAtNextBlock_) {
-				VERBOSE_LOG(SASMIX, "Looping VAG from block %d/%d to %d", curBlock_, numBlocks_, loopStartBlock_);
+				VERBOSE_LOG(Log::SasMix, "Looping VAG from block %d/%d to %d", curBlock_, numBlocks_, loopStartBlock_);
 				// data_ starts at curBlock = -1.
 				read_ = data_ + 16 * loopStartBlock_ + 16;
 				readp = Memory::GetPointerUnchecked(read_);
@@ -145,6 +146,7 @@ void VagDecoder::GetSamples(s16 *outSamples, int numSamples) {
 				return;
 			}
 		}
+		_dbg_assert_(curSample < 28);
 		outSamples[i] = samples[curSample++];
 	}
 
@@ -170,6 +172,13 @@ void VagDecoder::DoState(PointerWrap &p) {
 		}
 	}
 	Do(p, curSample);
+	// States from before 2018 saved idle voices uninitialized, so this can be garbage. The voice
+	// is ended instead, as GetSamples would index samples with it.
+	const bool badSample = curSample < 0 || curSample > (int)ARRAY_SIZE(samples);
+	if (badSample) {
+		WARN_LOG(Log::SaveState, "Bad VAG sample position %d, ending the voice", curSample);
+		curSample = (int)ARRAY_SIZE(samples);
+	}
 
 	Do(p, data_);
 	Do(p, read_);
@@ -183,11 +192,25 @@ void VagDecoder::DoState(PointerWrap &p) {
 	Do(p, loopEnabled_);
 	Do(p, loopAtNextBlock_);
 	Do(p, end_);
+	// GetSamples checks the read position against the blocks once, but loops back by block number
+	// without checking again.
+	const bool badBlocks = numBlocks_ < 0 || curBlock_ > numBlocks_ || loopStartBlock_ >= numBlocks_ ||
+		!Memory::IsValidRange(data_, (u32)numBlocks_ * 16);
+	if (p.mode == p.MODE_READ && badBlocks && !end_) {
+		WARN_LOG(Log::SaveState, "Bad VAG blocks (%d of %d, loop %d), ending the voice", curBlock_, numBlocks_, loopStartBlock_);
+		end_ = true;
+	}
+	if (badSample) {
+		end_ = true;
+	}
 }
 
-int SasAtrac3::setContext(u32 context) {
-	contextAddr_ = context;
-	atracID_ = _AtracGetIDByContext(context);
+// The context pointer is assumed to be valid.
+int SasAtrac3::SetContext(u32 contextAddr) {
+	contextAddr_ = contextAddr;
+	// Note: On hardware, atracID_ is also stored in the loopNum member of the context.
+	// But we don't actually mirror our struct to memory, so it doesn't really matter.
+	atracID_ = AtracSasBindContextAndGetID(contextAddr);
 	if (!sampleQueue_)
 		sampleQueue_ = new BufferQueue();
 	sampleQueue_->clear();
@@ -195,20 +218,23 @@ int SasAtrac3::setContext(u32 context) {
 	return 0;
 }
 
-void SasAtrac3::getNextSamples(s16 *outbuf, int wantedSamples) {
+void SasAtrac3::GetNextSamples(s16 *outbuf, int wantedSamples) {
 	if (atracID_ < 0) {
 		end_ = true;
 		return;
 	}
-	u32 finish = 0;
+
+	if (!buf_) {
+		buf_ = new s16[0x800];
+	}
+
+	int finish = 0;
 	int wantedbytes = wantedSamples * sizeof(s16);
 	while (!finish && sampleQueue_->getQueueSize() < wantedbytes) {
-		u32 numSamples = 0;
-		int remains = 0;
-		static s16 buf[0x800];
-		_AtracDecodeData(atracID_, (u8*)buf, 0, &numSamples, &finish, &remains);
+		int numSamples = 0;
+		AtracSasDecodeData(atracID_, (u8*)buf_, &numSamples, &finish);
 		if (numSamples > 0)
-			sampleQueue_->push((u8*)buf, numSamples * sizeof(s16));
+			sampleQueue_->push((u8*)buf_, numSamples * sizeof(s16));
 		else
 			finish = 1;
 	}
@@ -216,9 +242,9 @@ void SasAtrac3::getNextSamples(s16 *outbuf, int wantedSamples) {
 	end_ = finish == 1;
 }
 
-int SasAtrac3::addStreamData(u32 bufPtr, u32 addbytes) {
-	if (atracID_ > 0) {
-		_AtracAddStreamData(atracID_, bufPtr, addbytes);
+int SasAtrac3::Concatenate(u32 bufPtr, u32 addbytes) {
+	if (atracID_ >= 0) {
+		AtracSasAddStreamData(atracID_, bufPtr, addbytes);
 	}
 	return 0;
 }
@@ -317,29 +343,57 @@ static int getSustainLevel(int bitfield1) {
 	return ((bitfield1 & 0x000F) + 1) << 26;
 }
 
+void ADSREnvelope::SetEnvelope(int flag, int a, int d, int s, int r) {
+	if ((flag & 0x1) != 0)
+		attackType = (SasADSRCurveMode)a;
+	if ((flag & 0x2) != 0)
+		decayType = (SasADSRCurveMode)d;
+	if ((flag & 0x4) != 0)
+		sustainType = (SasADSRCurveMode)s;
+	if ((flag & 0x8) != 0)
+		releaseType = (SasADSRCurveMode)r;
+
+	if (PSP_CoreParameter().compat.flags().RockmanDash2SoundFix && sustainType == PSP_SAS_ADSR_CURVE_MODE_LINEAR_INCREASE) {
+		sustainType = PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE;
+	}
+}
+
+void ADSREnvelope::SetRate(int flag, int a, int d, int s, int r) {
+	if ((flag & 0x1) != 0)
+		attackRate = a;
+	if ((flag & 0x2) != 0)
+		decayRate = d;
+	if ((flag & 0x4) != 0)
+		sustainRate = s;
+	if ((flag & 0x8) != 0)
+		releaseRate = r;
+}
+
 void ADSREnvelope::SetSimpleEnvelope(u32 ADSREnv1, u32 ADSREnv2) {
 	attackRate 		= getAttackRate(ADSREnv1);
-	attackType 		= getAttackType(ADSREnv1);
+	attackType 		= (SasADSRCurveMode)getAttackType(ADSREnv1);
 	decayRate 		= getDecayRate(ADSREnv1);
 	decayType 		= PSP_SAS_ADSR_CURVE_MODE_EXPONENT_DECREASE;
 	sustainRate 	= getSustainRate(ADSREnv2);
-	sustainType 	= getSustainType(ADSREnv2);
+	sustainType 	= (SasADSRCurveMode)getSustainType(ADSREnv2);
 	releaseRate 	= getReleaseRate(ADSREnv2);
-	releaseType 	= getReleaseType(ADSREnv2);
+	releaseType 	= (SasADSRCurveMode)getReleaseType(ADSREnv2);
 	sustainLevel 	= getSustainLevel(ADSREnv1);
 
+	if (PSP_CoreParameter().compat.flags().RockmanDash2SoundFix && sustainType == PSP_SAS_ADSR_CURVE_MODE_LINEAR_INCREASE) {
+		sustainType = PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE;
+	}
+
 	if (attackRate < 0 || decayRate < 0 || sustainRate < 0 || releaseRate < 0) {
-		ERROR_LOG_REPORT(SASMIX, "Simple ADSR resulted in invalid rates: %04x, %04x", ADSREnv1, ADSREnv2);
+		ERROR_LOG_REPORT(Log::SasMix, "Simple ADSR resulted in invalid rates: %04x, %04x", ADSREnv1, ADSREnv2);
 	}
 }
 
 SasInstance::SasInstance() {
-#ifdef AUDIO_TO_FILE
-	audioDump = fopen("D:\\audio.raw", "wb");
-#endif
 	memset(&waveformEffect, 0, sizeof(waveformEffect));
 	waveformEffect.type = PSP_SAS_EFFECT_TYPE_OFF;
 	waveformEffect.isDryOn = 1;
+	memset(mixTemp_, 0, sizeof(mixTemp_));  // just to avoid a static analysis warning.
 }
 
 SasInstance::~SasInstance() {
@@ -352,18 +406,36 @@ void SasInstance::GetDebugText(char *text, size_t bufsize) {
 	char *p = voiceBuf;
 	for (int i = 0; i < maxVoices; i++) {
 		if (voices[i].playing) {
-			p += snprintf(p, sizeof(voiceBuf) - (p - voiceBuf), " %d: Pitch %d L/R,FX: %d,%d|%d,%d VAG: %08x:%d:%08x Height:%d%%\n", i, voices[i].pitch, voices[i].volumeLeft, voices[i].volumeRight, voices[i].effectLeft, voices[i].effectRight, voices[i].vagAddr, voices[i].vagSize, voices[i].vag.GetReadPtr(), (int)((int64_t)voices[i].envelope.GetHeight() * 100 / PSP_SAS_ENVELOPE_HEIGHT_MAX));
+			uint32_t readAddr = voices[i].GetReadAddress();
+			const char *indicator = "";
+			switch (voices[i].type) {
+			case VOICETYPE_VAG:
+				if (readAddr < voices[i].vagAddr || readAddr > voices[i].vagAddr + voices[i].vagSize) {
+					indicator = " (BAD!)";
+				}
+				break;
+			default:
+				break;
+			}
+			p += snprintf(p, sizeof(voiceBuf) - (p - voiceBuf), " %d: Pitch %04x L/R,FX: %d,%d|%d,%d VAG: %08x:%d:%08x%s Height:%d%%\n", i,
+				voices[i].pitch, voices[i].volumeLeft, voices[i].volumeRight, voices[i].effectLeft, voices[i].effectRight,
+				voices[i].vagAddr, voices[i].vagSize, voices[i].GetReadAddress(), indicator, (int)((int64_t)voices[i].envelope.GetHeight() * 100 / PSP_SAS_ENVELOPE_HEIGHT_MAX));
+			p += snprintf(p, sizeof(voiceBuf) - (p - voiceBuf), "  - ADSR: %s/%s/%s/%s\n",
+				ADSRCurveModeAsString(voices[i].envelope.attackType),
+				ADSRCurveModeAsString(voices[i].envelope.decayType),
+				ADSRCurveModeAsString(voices[i].envelope.sustainType),
+				ADSRCurveModeAsString(voices[i].envelope.releaseType)
+			);
 		}
 	}
 
 	snprintf(text, bufsize,
 		"SR: %d Mode: %s Grain: %d\n"
-		"Effect: Type: %d Dry: %d Wet: %d L: %d R: %d Delay: %d Feedback: %d\n"
+		"Effect: Type: %s Dry: %d Wet: %d L: %d R: %d Delay: %d Feedback: %d\n"
 		"\n%s\n",
 		sampleRate, outputMode == PSP_SAS_OUTPUTMODE_RAW ? "Raw" : "Mixed", grainSize,
-		waveformEffect.type, waveformEffect.isDryOn, waveformEffect.isWetOn, waveformEffect.leftVol, waveformEffect.rightVol, waveformEffect.delay, waveformEffect.feedback,
+		SasReverb::GetPresetName(waveformEffect.type), waveformEffect.isDryOn, waveformEffect.isWetOn, waveformEffect.leftVol, waveformEffect.rightVol, waveformEffect.delay, waveformEffect.feedback,
 		voiceBuf);
-
 }
 
 void SasInstance::ClearGrainSize() {
@@ -396,20 +468,34 @@ void SasInstance::SetGrainSize(int newGrainSize) {
 	memset(sendBufferProcessed, 0, sizeof(s16) * grainSize * 2);
 }
 
+// How long the Media Engine takes to mix one grain. Measured on a PSP (pspautotests
+// audio/timing/sastiming) at 222MHz: a fixed 110us plus 0.49us per sample of grain, plus per
+// playing voice and sample 0.445us + 0.0675us per unit of pitch ratio for VAG (a faster voice
+// decodes more ADPCM), 0.405us + 0.0675us for PCM and 0.41us for noise, plus 0.64us per sample
+// when a reverb type is set (the type doesn't matter; wet with no reverb type is free). Linear to
+// within 1% from 64 to 2048 samples and 0 to 32 voices - 32 VAG voices at 512 samples take 8.7ms.
 int SasInstance::EstimateMixUs() {
-	int voicesPlayingCount = 0;
-
+	float us = 110.0f + 0.49f * grainSize;
 	for (int v = 0; v < PSP_SAS_VOICES_MAX; v++) {
-		SasVoice &voice = voices[v];
-		if (!voice.playing || voice.paused)
+		const SasVoice &voice = voices[v];
+		if (!voice.playing || voice.paused) {
 			continue;
-		voicesPlayingCount++;
+		}
+		const float pitchRatio = voice.pitch / (float)PSP_SAS_PITCH_BASE;
+		float perSample;
+		switch (voice.type) {
+		case VOICETYPE_PCM: perSample = 0.405f + 0.0675f * pitchRatio; break;
+		case VOICETYPE_NOISE:
+		case VOICETYPE_TRIWAVE:
+		case VOICETYPE_PULSEWAVE: perSample = 0.41f; break;
+		default: perSample = 0.445f + 0.0675f * pitchRatio; break;
+		}
+		us += perSample * grainSize;
 	}
-
-	// Each voice costs extra time, and each byte of grain costs extra time.
-	int cycles = 20 + voicesPlayingCount * 68 + (grainSize * 60) / 100;
-	// Cap to 1200 to fix FFT, see issue #9956.
-	return std::min(cycles, 1200);
+	if (waveformEffect.type >= 0 && waveformEffect.isWetOn) {
+		us += 0.64f * grainSize;
+	}
+	return PowerScaleFromDefaultClock((int)us);
 }
 
 void SasVoice::ReadSamples(s16 *output, int numSamples) {
@@ -446,7 +532,7 @@ void SasVoice::ReadSamples(s16 *output, int numSamples) {
 		}
 		break;
 	case VOICETYPE_ATRAC3:
-		atrac3.getNextSamples(output, numSamples);
+		atrac3.GetNextSamples(output, numSamples);
 		break;
 	default:
 		memset(output, 0, numSamples * sizeof(s16));
@@ -476,10 +562,12 @@ void SasInstance::MixVoice(SasVoice &voice) {
 		if (voice.type == VOICETYPE_VAG && !voice.vagAddr)
 			break;
 		// else fallthrough! Don't change the check above.
+		[[fallthrough]];
 	case VOICETYPE_PCM:
 		if (voice.type == VOICETYPE_PCM && !voice.pcmAddr)
 			break;
 		// else fallthrough! Don't change the check above.
+		[[fallthrough]];
 	default:
 		// This feels a bit hacky.  The first 32 samples after a keyon are 0s.
 		int delay = 0;
@@ -503,7 +591,7 @@ void SasInstance::MixVoice(SasVoice &voice) {
 		u32 sampleFrac = voice.sampleFrac;
 		int samplesToRead = (sampleFrac + voicePitch * std::max(0, grainSize - delay)) >> PSP_SAS_PITCH_BASE_SHIFT;
 		if (samplesToRead > ARRAY_SIZE(mixTemp_) - 2) {
-			ERROR_LOG(SCESAS, "Too many samples to read (%d)! This shouldn't happen.", samplesToRead);
+			ERROR_LOG(Log::sceSas, "Too many samples to read (%d)! This shouldn't happen.", samplesToRead);
 			samplesToRead = ARRAY_SIZE(mixTemp_) - 2;
 		}
 		int readPos = 2;
@@ -524,17 +612,19 @@ void SasInstance::MixVoice(SasVoice &voice) {
 		for (int i = delay; i < grainSize; i++) {
 			const int16_t *s = mixTemp_ + (sampleFrac >> PSP_SAS_PITCH_BASE_SHIFT);
 
-			// Linear interpolation. Good enough. Need to make resampleHist bigger if we want more.
+			// Two-tap linear interpolation. The hardware does the same, unlike the PSX there's no bicubic lookup table etc.
 			int sample = s[0];
 			if (needsInterp) {
 				int f = sampleFrac & PSP_SAS_PITCH_MASK;
-				sample = (s[0] * (PSP_SAS_PITCH_MASK - f) + s[1] * f) >> PSP_SAS_PITCH_BASE_SHIFT;
+				sample = s[0] - (((s[0] - s[1]) * f) >> PSP_SAS_PITCH_BASE_SHIFT);
 			}
 			sampleFrac += voicePitch;
 
 			// The maximum envelope height (PSP_SAS_ENVELOPE_HEIGHT_MAX) is (1 << 30) - 1.
 			// Reduce it to 14 bits, by shifting off 15.  Round up by adding (1 << 14) first.
-			int envelopeValue = voice.envelope.GetHeight();
+			// A fast decay can leave the height below zero for a sample, as the switch to sustain
+			// doesn't reset it. Don't let that invert the waveform into a full-scale click.
+			int envelopeValue = std::max(voice.envelope.GetHeight(), 0);
 			voice.envelope.Step();
 			envelopeValue = (envelopeValue + (1 << 14)) >> 15;
 
@@ -559,14 +649,14 @@ void SasInstance::MixVoice(SasVoice &voice) {
 		if (voice.HaveSamplesEnded())
 			voice.envelope.End();
 		if (voice.envelope.HasEnded()) {
-			// NOTICE_LOG(SASMIX, "Hit end of envelope");
+			// NOTICE_LOG(Log::SasMix, "Hit end of envelope");
 			voice.playing = false;
 			voice.on = false;
 		}
 	}
 }
 
-void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
+void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol, bool mute) {
 	for (int v = 0; v < PSP_SAS_VOICES_MAX; v++) {
 		SasVoice &voice = voices[v];
 		if (!voice.playing || voice.paused)
@@ -574,12 +664,22 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
 		MixVoice(voice);
 	}
 
+	// Apply mute if needed (note: we try to keep everything else identical to the non-muted case).
+	if (mute) {
+		memset(mixBuffer, 0, grainSize * sizeof(int) * 2);
+		memset(sendBuffer, 0, grainSize * sizeof(int) * 2);
+	}
+
 	// Then mix the send buffer in with the rest.
 
 	// Alright, all voices mixed. Let's convert and clip, and at the same time, wipe mixBuffer for next time. Could also dither.
-	s16 *outp = (s16 *)Memory::GetPointer(outAddr);
-	const s16 *inp = inAddr ? (s16*)Memory::GetPointer(inAddr) : 0;
-	if (outputMode == PSP_SAS_OUTPUTMODE_MIXED) {
+	// Raw mode writes four planes of grainSize samples, mixed mode two interleaved.
+	const u32 outBytes = (outputMode == PSP_SAS_OUTPUTMODE_MIXED ? 4 : 8) * grainSize;
+	s16 *outp = (s16 *)Memory::GetPointerWriteRangeOrException(outAddr, outBytes);
+	const s16 *inp = inAddr ? (const s16 *)Memory::GetPointerRangeOrException(inAddr, 4 * grainSize) : 0;
+	if (!outp) {
+		WARN_LOG_REPORT(Log::sceSas, "Bad SAS Mix output address: %08x, grain=%d", outAddr, grainSize);
+	} else if (outputMode == PSP_SAS_OUTPUTMODE_MIXED) {
 		// Okay, apply effects processing to the Send buffer.
 		WriteMixedOutput(outp, inp, leftVol, rightVol);
 		if (MemBlockInfoDetailed()) {
@@ -592,7 +692,7 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
 		s16 *outpR = outp + grainSize * 1;
 		s16 *outpSendL = outp + grainSize * 2;
 		s16 *outpSendR = outp + grainSize * 3;
-		WARN_LOG_REPORT_ONCE(sasraw, SASMIX, "sceSasCore: raw outputMode");
+		WARN_LOG_REPORT_ONCE(sasraw, Log::SasMix, "sceSasCore: raw outputMode");
 		for (int i = 0; i < grainSize * 2; i += 2) {
 			*outpL++ = clamp_s16(mixBuffer[i + 0]);
 			*outpR++ = clamp_s16(mixBuffer[i + 1]);
@@ -603,12 +703,9 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
 	}
 	memset(mixBuffer, 0, grainSize * sizeof(int) * 2);
 	memset(sendBuffer, 0, grainSize * sizeof(int) * 2);
-
-#ifdef AUDIO_TO_FILE
-	fwrite(Memory::GetPointer(outAddr), 1, grainSize * 2 * 2, audioDump);
-#endif
 }
 
+// Note: leftVol/rightVol here are how much to scale the inp content by, not the mixBuffer.
 void SasInstance::WriteMixedOutput(s16 *outp, const s16 *inp, int leftVol, int rightVol) {
 	const bool dry = waveformEffect.isDryOn != 0;
 	const bool wet = waveformEffect.isWetOn != 0;
@@ -670,18 +767,34 @@ void SasInstance::SetWaveformEffectType(int type) {
 	}
 }
 
+void SasInstance::SetWaveformEffectParams(int delay, int feedback) {
+	waveformEffect.delay = delay;
+	waveformEffect.feedback = feedback;
+	// Echo and Delay compute most of their parameters from these; the rest ignore them.
+	reverb_.SetParams(delay, feedback);
+}
+
 // http://psx.rules.org/spu.txt has some information about setting up the delay time by modifying the delay preset.
 // See http://report.ppsspp.org/logs/kind/772 for a list of games that use different types. Maybe can help us figure out
 // which is which.
 void SasInstance::ApplyWaveformEffect() {
-	// First, downsample the send buffer to 22khz. We do this naively for now.
-	for (int i = 0; i < grainSize / 2; i++) {
-		sendBufferDownsampled[i * 2] = clamp_s16(sendBuffer[i * 4]);
-		sendBufferDownsampled[i * 2 + 1] = clamp_s16(sendBuffer[i * 4 + 1]);
+	// Volume max is 0x1000, while our factor is up to 0x8000. Shifting left by 3 fixes that.
+	const int volLeft = (uint16_t)(waveformEffect.leftVol << 3);
+	const int volRight = (uint16_t)(waveformEffect.rightVol << 3);
+
+	if (reverb_.GetPreset() == -1) {
+		// With no reverb selected, the ME runs a separate loop at the full 44.1khz, so the send
+		// goes straight through (tests/audio/reverb/upsample: a 22.05khz tone survives).
+		for (int i = 0; i < grainSize * 2; i += 2) {
+			sendBufferProcessed[i + 0] = clamp_s16(clamp_s16(sendBuffer[i + 0]) * volLeft >> 15);
+			sendBufferProcessed[i + 1] = clamp_s16(clamp_s16(sendBuffer[i + 1]) * volRight >> 15);
+		}
+		return;
 	}
 
-	// Volume max is 0x1000, while our factor is up to 0x8000. Shifting right by 3 fixes that.
-	reverb_.ProcessReverb(sendBufferProcessed, sendBufferDownsampled, grainSize / 2, waveformEffect.leftVol << 3, waveformEffect.rightVol << 3);
+	// First, downsample the send buffer to 22khz, with a filter the hardware doesn't have.
+	reverb_.DownsampleSend(sendBufferDownsampled, sendBuffer, grainSize / 2);
+	reverb_.ProcessReverb(sendBufferProcessed, sendBufferDownsampled, grainSize / 2, volLeft, volRight);
 }
 
 void SasInstance::DoState(PointerWrap &p) {
@@ -691,6 +804,11 @@ void SasInstance::DoState(PointerWrap &p) {
 
 	Do(p, grainSize);
 	if (p.mode == p.MODE_READ) {
+		if (grainSize > PSP_SAS_MAX_GRAIN) {
+			ERROR_LOG(Log::SaveState, "Bad SAS grain size %d", grainSize);
+			p.SetError(p.ERROR_FAILURE);
+			return;
+		}
 		if (grainSize > 0) {
 			SetGrainSize(grainSize);
 		} else {
@@ -699,6 +817,11 @@ void SasInstance::DoState(PointerWrap &p) {
 	}
 
 	Do(p, maxVoices);
+	if (maxVoices <= 0 || maxVoices > PSP_SAS_VOICES_MAX) {
+		ERROR_LOG(Log::SaveState, "Bad SAS voice count %d", maxVoices);
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
 	Do(p, sampleRate);
 	Do(p, outputMode);
 
@@ -719,13 +842,17 @@ void SasInstance::DoState(PointerWrap &p) {
 	int n = PSP_SAS_VOICES_MAX;
 	Do(p, n);
 	if (n != PSP_SAS_VOICES_MAX) {
-		ERROR_LOG(SAVESTATE, "Wrong number of SAS voices");
+		ERROR_LOG(Log::SaveState, "Wrong number of SAS voices");
+		p.SetError(p.ERROR_FAILURE);
 		return;
 	}
 	DoArray(p, voices, ARRAY_SIZE(voices));
 	Do(p, waveformEffect);
 	if (p.mode == p.MODE_READ) {
 		reverb_.SetPreset(waveformEffect.type);
+		// SetPreset() alone would leave Echo/Delay at their defaults, since those two compute
+		// their parameters from the delay/feedback we just restored.
+		reverb_.SetParams(waveformEffect.delay, waveformEffect.feedback);
 	}
 }
 
@@ -741,7 +868,7 @@ void SasVoice::KeyOn() {
 		if (Memory::IsValidAddress(vagAddr)) {
 			vag.Start(vagAddr, vagSize, loop);
 		} else {
-			ERROR_LOG(SASMIX, "Invalid VAG address %08x", vagAddr);
+			ERROR_LOG(Log::SasMix, "Invalid VAG address %08x", vagAddr);
 			return;
 		}
 		break;
@@ -757,15 +884,6 @@ void SasVoice::KeyOn() {
 void SasVoice::KeyOff() {
 	on = false;
 	envelope.KeyOff();
-}
-
-void SasVoice::ChangedParams(bool changedVag) {
-	if (!playing && on) {
-		playing = true;
-		if (changedVag)
-			vag.Start(vagAddr, vagSize, loop);
-	}
-	// TODO: restart VAG somehow
 }
 
 void SasVoice::DoState(PointerWrap &p) {
@@ -793,6 +911,14 @@ void SasVoice::DoState(PointerWrap &p) {
 
 	Do(p, sampleFrac);
 	Do(p, pitch);
+	// Mixing leaves less than a sample in sampleFrac, and indexes its temp buffer by it and pitch.
+	// ReadSamples() needs the PCM positions inside the buffer.
+	if (sampleFrac >= PSP_SAS_PITCH_BASE || pitch < PSP_SAS_PITCH_MIN || pitch > PSP_SAS_PITCH_MAX ||
+		(type == VOICETYPE_PCM && (pcmSize <= 0 || pcmIndex < 0 || pcmIndex > pcmSize || pcmLoopPos < 0 || pcmLoopPos >= pcmSize))) {
+		ERROR_LOG(Log::SaveState, "Bad SAS voice state");
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
 	Do(p, loop);
 	if (s < 2 && type == VOICETYPE_PCM) {
 		// We set loop incorrectly before, and always looped.
@@ -816,20 +942,6 @@ void SasVoice::DoState(PointerWrap &p) {
 	envelope.DoState(p);
 	vag.DoState(p);
 	atrac3.DoState(p);
-}
-
-ADSREnvelope::ADSREnvelope()
-	: attackRate(0),
-		decayRate(0),
-		sustainRate(0),
-		releaseRate(0),
-		attackType(PSP_SAS_ADSR_CURVE_MODE_LINEAR_INCREASE),
-		decayType(PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE),
-		sustainType(PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE),
-		sustainLevel(0),
-		releaseType(PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE),
-		state_(STATE_OFF),
-		height_(0) {
 }
 
 void ADSREnvelope::WalkCurve(int type, int rate) {
@@ -965,4 +1077,16 @@ void ADSREnvelope::DoState(PointerWrap &p) {
 		Do(p, state_);
 	}
 	Do(p, height_);
+}
+
+const char *ADSRCurveModeAsString(SasADSRCurveMode mode) {
+	switch (mode) {
+	case PSP_SAS_ADSR_CURVE_MODE_DIRECT: return "D";
+	case PSP_SAS_ADSR_CURVE_MODE_LINEAR_INCREASE: return "L+";
+	case PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE: return "L-";
+	case PSP_SAS_ADSR_CURVE_MODE_LINEAR_BENT: return "LB";
+	case PSP_SAS_ADSR_CURVE_MODE_EXPONENT_DECREASE: return "E-";
+	case PSP_SAS_ADSR_CURVE_MODE_EXPONENT_INCREASE: return "E+";
+	default: return "N/A";
+	}
 }

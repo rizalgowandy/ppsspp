@@ -17,21 +17,31 @@
 
 #pragma once
 
-#include <string>
-
 class PointerWrap;
 class KernelObject;
 
 void __IoInit();
 void __IoDoState(PointerWrap &p);
 void __IoShutdown();
+// Waits for async reads and writes still accessing PSP memory on the IO thread.
+void __IoWaitForAsync();
+void __IoVblank();
 
 struct ScePspDateTime;
+struct tm;
 
 u32 sceIoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen);
 
+// Called by sceIoIoctl, which normally applies the delay this function writes to usec.
+// If you need to call sceIoIoctl from a HLE function implementation more than once, use
+// __IoIoctl directly to avoid double-delays.
+int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen, int &usec);
+
 u32 __IoGetFileHandleFromId(u32 id, u32 &outError);
-void __IoCopyDate(ScePspDateTime& date_out, const tm& date_in);
+// What sceIoOpen and sceIoRead charge, for loaders that read whole files without going through them.
+int __IoOpenDelayUs(const char *filename);
+int __IoReadDelayUs(int size);
+void ConvertTmToPspDateTime(ScePspDateTime& date_out, const tm& date_in, int microSeconds);
 
 KernelObject *__KernelFileNodeObject();
 KernelObject *__KernelDirListingObject();
@@ -40,3 +50,4 @@ void Register_IoFileMgrForKernel();
 void Register_IoFileMgrForUser();
 void Register_StdioForKernel();
 void Register_StdioForUser();
+

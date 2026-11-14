@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include "ppsspp_config.h"
 #include <mutex>
 #include "Common/CommonTypes.h"
@@ -29,24 +32,25 @@ typedef u64 HashType;
 typedef u32 HashType;
 #endif
 
-enum DisassemblyLineType { DISTYPE_OPCODE, DISTYPE_MACRO, DISTYPE_DATA, DISTYPE_OTHER };
+enum DisassemblyLineType { DISTYPE_OPCODE, DISTYPE_DATA, DISTYPE_OTHER };
 
-struct DisassemblyLineInfo
-{
+struct DisassemblyLineInfo {
 	DisassemblyLineType type;
 	MIPSAnalyst::MipsOpcodeInfo info;
 	std::string name;
 	std::string params;
 	u32 totalSize;
+
+	void ToString(char *dest, size_t size, u32 curAddress) const;
 };
 
-enum LineType { LINE_UP, LINE_DOWN, LINE_RIGHT };
+enum DisasmLineType { LINE_UP, LINE_DOWN, LINE_RIGHT };
 
 struct BranchLine
 {
 	u32 first;
 	u32 second;
-	LineType type;
+	DisasmLineType type;
 	int laneIndex;
 
 	bool operator<(const BranchLine& other) const
@@ -99,8 +103,7 @@ private:
 class DisassemblyOpcode: public DisassemblyEntry
 {
 public:
-	DisassemblyOpcode(u32 _address, int _num): address(_address), num(_num) { };
-	virtual ~DisassemblyOpcode() { };
+	DisassemblyOpcode(u32 _address, int _num): address(_address), num(_num) { }
 	void recheck() override { };
 	int getNumLines() override { return num; };
 	int getLineNum(u32 address, bool findStart) override { return (address - this->address) / 4; };
@@ -115,44 +118,21 @@ private:
 };
 
 
-class DisassemblyMacro: public DisassemblyEntry
-{
-public:
-	DisassemblyMacro(u32 _address): address(_address) { };
-	virtual ~DisassemblyMacro() { };
-
-	void setMacroLi(u32 _immediate, u8 _rt);
-	void setMacroMemory(std::string _name, u32 _immediate, u8 _rt, int _dataSize);
-
-	void recheck() override { };
-	int getNumLines() override { return 1; };
-	int getLineNum(u32 address, bool findStart) override { return 0; };
-	u32 getLineAddress(int line) override { return address; };
-	u32 getTotalSize() override { return numOpcodes * 4; };
-	bool disassemble(u32 address, DisassemblyLineInfo& dest, bool insertSymbols, DebugInterface *cpuDebug) override;
-private:
-	enum MacroType { MACRO_LI, MACRO_MEMORYIMM };
-
-	MacroType type;
-	std::string name;
-	u32 immediate;
-	u32 address;
-	u32 numOpcodes;
-	u8 rt;
-	int dataSize;
-};
-
-
 class DisassemblyData: public DisassemblyEntry
 {
 public:
 	DisassemblyData(u32 _address, u32 _size, DataType _type);
-	virtual ~DisassemblyData() { };
 
 	void recheck() override;
 	int getNumLines() override { return (int)lines.size(); };
 	int getLineNum(u32 address, bool findStart) override;
-	u32 getLineAddress(int line) override { return lineAddresses[line]; };
+	u32 getLineAddress(int line) override {
+		// A zero-size data symbol leaves lineAddresses empty; fall back to the
+		// symbol's own base address rather than indexing out of bounds.
+		if (line < 0 || (size_t)line >= lineAddresses.size())
+			return address;
+		return lineAddresses[line];
+	};
 	u32 getTotalSize() override { return size; };
 	bool disassemble(u32 address, DisassemblyLineInfo& dest, bool insertSymbols, DebugInterface *cpuDebug) override;
 
@@ -178,8 +158,7 @@ private:
 class DisassemblyComment: public DisassemblyEntry
 {
 public:
-	DisassemblyComment(u32 _address, u32 _size, std::string name, std::string param);
-	virtual ~DisassemblyComment() { };
+	DisassemblyComment(u32 _address, u32 _size, std::string_view name, std::string_view param);
 
 	void recheck() override { };
 	int getNumLines() override { return 1; };
@@ -197,16 +176,15 @@ private:
 
 class DebugInterface;
 
-class DisassemblyManager
-{
+class DisassemblyManager {
 public:
 	~DisassemblyManager();
 
 	void clear();
 
-	void setCpu(DebugInterface* _cpu) { cpu = _cpu; };
+	void setCpu(DebugInterface *cpu);
 	void setMaxParamChars(int num) { maxParamChars = num; clear(); };
-	void getLine(u32 address, bool insertSymbols, DisassemblyLineInfo &dest, DebugInterface *cpuDebug = nullptr);
+	void getLine(u32 address, bool insertSymbols, DisassemblyLineInfo &dest, DebugInterface *cpuDebug);
 	void analyze(u32 address, u32 size);
 	std::vector<BranchLine> getBranchLines(u32 start, u32 size);
 
@@ -214,13 +192,29 @@ public:
 	u32 getNthPreviousAddress(u32 address, int n = 1);
 	u32 getNthNextAddress(u32 address, int n = 1);
 
-	static DebugInterface* getCpu() { return cpu; };
-	static int getMaxParamChars() { return maxParamChars; };
+	DebugInterface *getCpu() { return cpu_; };
+	int getMaxParamChars() { return maxParamChars; };
+
 private:
-	static std::map<u32,DisassemblyEntry*> entries;
-	static std::recursive_mutex entriesLock_;
-	static DebugInterface* cpu;
-	static int maxParamChars;
+	std::map<u32,DisassemblyEntry*> entries;
+	std::recursive_mutex entriesLock_;
+	DebugInterface *cpu_;
+	int maxParamChars = 29;
 };
 
+extern DisassemblyManager g_disassemblyManager;
+
+// Drops the cached disassembly. Call this when what it describes - emulated memory and the symbol
+// map - goes away. DisassemblyManager.cpp isn't built for libretro (see libretro/Makefile.common),
+// so there it's a no-op, the same way the WebSocket debugger entry points are.
+#ifdef __LIBRETRO__
+inline void ClearDisassemblyCache() {}
+#else
+void ClearDisassemblyCache();
+#endif
+
 bool isInInterval(u32 start, u32 size, u32 value);
+bool IsLikelyStringAt(uint32_t addr);
+
+std::string DisassembleRange(u32 start, u32 size, bool displaySymbols, MIPSDebugInterface *debugger);
+bool GetDisasmAddressText(u32 address, char *dest, size_t bufSize, bool abbreviateLabels, bool showData, bool displaySymbols);

@@ -17,14 +17,19 @@
 
 #pragma once
 
+#include <string_view>
 #include "Common/CommonTypes.h"
+#include "Common/File/Path.h"
 #include "Core/CoreParameter.h"
+#include "Core/ConfigValues.h"
+#include "Core/Util/PathUtil.h"
 
 class MetaFileSystem;
 class ParamSFOData;
 
 extern MetaFileSystem pspFileSystem;
 extern ParamSFOData g_paramSFO;
+extern ParamSFOData g_paramSFORaw;
 
 // To synchronize the two UIs, we need to know which state we're in.
 enum GlobalUIState {
@@ -32,25 +37,7 @@ enum GlobalUIState {
 	UISTATE_PAUSEMENU,
 	UISTATE_INGAME,
 	UISTATE_EXIT,
-};
-
-// Use these in conjunction with GetSysDirectory.
-enum PSPDirectories {
-	DIRECTORY_CHEATS,
-	DIRECTORY_SCREENSHOT,
-	DIRECTORY_SYSTEM,
-	DIRECTORY_GAME,
-	DIRECTORY_SAVEDATA,
-	DIRECTORY_PAUTH,
-	DIRECTORY_DUMP,
-	DIRECTORY_SAVESTATE,
-	DIRECTORY_CACHE,
-	DIRECTORY_TEXTURES,
-	DIRECTORY_PLUGINS,
-	DIRECTORY_APP_CACHE,  // Use the OS app cache if available
-	DIRECTORY_VIDEO,
-	DIRECTORY_AUDIO,
-	DIRECTORY_MEMSTICK_ROOT,
+	UISTATE_EXCEPTION,
 };
 
 class GraphicsContext;
@@ -60,69 +47,89 @@ void ResetUIState();
 void UpdateUIState(GlobalUIState newState);
 GlobalUIState GetUIState();
 
-void SetGPUBackend(GPUBackend type, const std::string &device = "");
+void SetGPUBackend(GPUBackend type, std::string_view device = "");
 GPUBackend GetGPUBackend();
 std::string GetGPUBackendDevice();
 
-bool PSP_Init(const CoreParameter &coreParam, std::string *error_string);
-bool PSP_InitStart(const CoreParameter &coreParam, std::string *error_string);
-bool PSP_InitUpdate(std::string *error_string);
-bool PSP_IsIniting();
-bool PSP_IsInited();
-bool PSP_IsQuitting();
-void PSP_Shutdown();
-
-void PSP_BeginHostFrame();
-void PSP_EndHostFrame();
-void PSP_RunLoopWhileState();
-void PSP_RunLoopUntil(u64 globalticks);
-void PSP_RunLoopFor(int cycles);
-
-void PSP_SetLoading(const std::string &reason);
-std::string PSP_GetLoading();
-
-// Used to wait for background loading thread.
-struct PSP_LoadingLock {
-	PSP_LoadingLock();
-	~PSP_LoadingLock();
+enum class BootState {
+	Off,
+	Booting,
+	Complete,
+	Failed,
 };
 
-// Call before PSP_BeginHostFrame() in order to not miss any GPU stats.
-void Core_UpdateDebugStats(bool collectStats);
+BootState PSP_GetBootState();
+inline bool PSP_IsInited() {
+	return PSP_GetBootState() == BootState::Complete;
+}
+// While this is true, the loader thread is writing memory, kernel objects and the symbol map
+// without g_frameMutex, so readers on other threads have to leave them alone even when holding it.
+// A boot only starts inside NativeFrame()'s g_frameMutex span, so it can't begin under a reader
+// that holds the lock and saw this false.
+inline bool PSP_IsBooting() {
+	return PSP_GetBootState() == BootState::Booting;
+}
 
-void Audio_Init();
-void Audio_Shutdown();
-bool IsAudioInitialised();
+// Call this once, then call PSP_InitUpdate repeatedly to monitor progress.
+bool PSP_InitStart(const CoreParameter &coreParam);
+
+// Check the return value of this - if Booting, keep calling.
+// If Complete or Failed, handle as appropriate, and stop calling.
+BootState PSP_InitUpdate(std::string *error_string);
+
+// Blocking wrapper around the two above functions, used for convenience in a couple of places.
+// Should be avoided/removed eventually.
+// Returns either BootState::Complete or BootState::Failed.
+BootState PSP_Init(const CoreParameter &coreParam, std::string *error_string);
+
+BootState PollBootState();
+
+void PSP_Shutdown(bool success);
+
+// A boot the emulated system asks for itself: the XMB starting a game, or a game it started going
+// back to it. The core stops, and the frontend boots this like anything else, so the game gets its
+// PARAM.SFO, compat flags, game config and so on.
+struct BootRequest {
+	Path fileToStart;
+	Path mountIso;
+	std::optional<VSHLaunch> launchedFromVSH;
+	std::vector<u8> vshmainArgs;
+
+	void ApplyTo(CoreParameter *coreParam) const;
+};
+// Called on the CPU thread. Stops the core.
+void PSP_RequestBoot(const BootRequest &request);
+bool PSP_HasBootRequest();
+// For the frontend, once the core has stopped. Takes the pending request, if there is one.
+bool PSP_TakeBootRequest(BootRequest *request);
+
+FileLoader *PSP_LoadedFile();
+
+void PSP_RunLoopWhileState();
+void PSP_RunLoopFor(int cycles);
+
+// Call before gpu->BeginHostFrame() in order to not miss any GPU stats.
+void PSP_UpdateDebugStats(bool collectStats);
+// Increments or decrements an internal counter.  Intended to be used by debuggers.
+void PSP_ForceDebugStats(bool enable);
 
 void UpdateLoadedFile(FileLoader *fileLoader);
 
-std::string GetSysDirectory(PSPDirectories directoryType);
-#ifdef _WIN32
-void InitSysDirectories();
-#endif
+// The game ID in a frame dump's file name (ULUS10064_0001.ppdmp, or with a GitHub issue number in front).
+bool DiscIDFromGEDumpFilename(std::string_view filename, std::string *id);
 
-// RUNNING must be at 0, NEXTFRAME must be at 1.
-enum CoreState {
-	// Emulation is running normally.
-	CORE_RUNNING = 0,
-	// Emulation was running normally, just reached the end of a frame.
-	CORE_NEXTFRAME = 1,
-	// Emulation is paused, CPU thread is sleeping.
-	CORE_STEPPING,  // Can be used for recoverable runtime errors (ignored memory exceptions)
-	// Core is being powered up.
-	CORE_POWERUP,
-	// Core is being powered down.
-	CORE_POWERDOWN,
-	// An error happened at boot.
-	CORE_BOOT_ERROR,
-	// Unrecoverable runtime error. Recoverable errors should use CORE_STEPPING.
-	CORE_RUNTIME_ERROR,
-};
+// NOTE: These are almost all derived from g_Config.memStickDirectory directly -
+// they are not stored anywhere.
+Path GetSysDirectory(PSPDirectories directoryType);
 
-extern bool coreCollectDebugStats;
+bool CreateSysDirectories();
 
-extern volatile CoreState coreState;
-extern volatile bool coreStatePending;
-void Core_UpdateState(CoreState newState);
+extern bool g_coreCollectDebugStats;
 
-CoreParameter &PSP_CoreParameter();
+inline CoreParameter &PSP_CoreParameter() {
+	extern CoreParameter g_CoreParameter;
+	return g_CoreParameter;
+}
+
+// Centralized place for dumping useful files, also takes care of checking for dupes and creating a clickable UI popup.
+void DumpFileIfEnabled(const u8 *dataPtr, const u32 length, std::string_view name, DumpFileType type);

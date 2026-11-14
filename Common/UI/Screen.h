@@ -13,156 +13,158 @@
 
 #pragma once
 
-#include <vector>
-#include <mutex>
+#include <cstdint>
 #include <string>
 
 #include "Common/Common.h"
 #include "Common/Input/InputState.h"
+#include "Common/System/NativeApp.h"
+#include "Common/System/System.h"
 
 namespace UI {
 	class View;
 }
 
-enum DialogResult {
+namespace Draw {
+class DrawContext;
+class Swapchain;
+}
+
+// A display other than the primary one, like a second window or a TV. See docs/multi-swapchain.md.
+struct OutputDisplay {
+	int id;
+	OutputRole role;
+	Draw::Swapchain *swapchain;  // nullptr while there's no draw context.
+};
+
+enum DialogResult : u8 {
+	DR_NONE,
 	DR_OK,
 	DR_CANCEL,
 	DR_YES,
 	DR_NO,
 	DR_BACK,
 };
+const char *DialogResultToString(DialogResult result);
 
 class ScreenManager;
 class UIContext;
 
-namespace Draw {
-	class DrawContext;
-}
+enum class ScreenFocusChange {
+	FOCUS_LOST_TOP,  // Another screen was pushed on top
+	FOCUS_BECAME_TOP,  // Became the top screen again
+};
+
+enum class ScreenRenderMode {
+	DEFAULT = 0,
+	FIRST = 1,
+	BEHIND = 4,
+	TOP = 8,
+};
+ENUM_CLASS_BITOPS(ScreenRenderMode);
+
+enum class ScreenRenderRole {
+	NONE = 0,
+	CAN_BE_BACKGROUND = 1,
+	MUST_BE_FIRST = 2,
+};
+ENUM_CLASS_BITOPS(ScreenRenderRole);
+
+enum class ViewLayoutMode {
+	ApplyInsets = 0,   // For gameplay, option #1
+	IgnoreInsets,  // For gameplay, option #2
+	IgnoreBottomInset,
+	IgnoreSideInsets,
+};
+
+enum class QueuedEventType : u8 {
+	KEY,
+	AXIS,
+	TOUCH,
+};
+
+struct QueuedEvent {
+	QueuedEventType type;
+	union {
+		TouchInput touch;
+		KeyInput key;
+		AxisInput axis;
+	};
+};
+
+enum class ScreenRenderFlags {
+	NONE = 0,
+	HANDLED_THROTTLING = 1,
+};
+ENUM_CLASS_BITOPS(ScreenRenderFlags);
+
+enum class InputMode {
+	None = 0,
+	Keyboard = 1,
+	Mouse = 2,
+	Other = 4,
+	ImDebuggerToggle = 8,  // ugly hack. debugger and pause goes through.
+	AllKeys = 16,  // The screen gets keys that are normally left to the OS, like volume. For key mapping.
+};
+ENUM_CLASS_BITOPS(InputMode);
 
 class Screen {
 public:
-	Screen() : screenManager_(nullptr) { }
-	virtual ~Screen() {
-		screenManager_ = nullptr;
-	}
+	Screen() = default;
+	virtual ~Screen();
 
 	virtual void onFinish(DialogResult reason) {}
 	virtual void update() {}
-	virtual void preRender() {}
-	virtual void render() {}
-	virtual void postRender() {}
+	virtual ScreenRenderFlags PreRender(ScreenRenderMode mode) { return ScreenRenderFlags::NONE; }
+	virtual ScreenRenderFlags render(ScreenRenderMode mode) = 0;
+	// Draws this screen's content for a secondary output, whose swapchain is bound. Returns false if the
+	// screen has nothing for it. The topmost screen that returns true is the one shown.
+	virtual bool renderOutput(const OutputDisplay &output) { return false; }
 	virtual void resized() {}
 	virtual void dialogFinished(const Screen *dialog, DialogResult result) {}
-	virtual bool touch(const TouchInput &touch) { return false;  }
-	virtual bool key(const KeyInput &key) { return false; }
-	virtual bool axis(const AxisInput &touch) { return false; }
-	virtual void sendMessage(const char *msg, const char *value) {}
+	virtual void sendMessage(UIMessage message, const char *value) {}
 	virtual void deviceLost() {}
-	virtual void deviceRestored() {}
+	virtual void deviceRestored(Draw::DrawContext *draw) {}
+	virtual ScreenRenderRole renderRole(bool isTop) const { return ScreenRenderRole::NONE; }
+	virtual bool wantBrightBackground() const { return false; }  // special hack for DisplayLayoutScreen.
+
+	virtual void focusChanged(ScreenFocusChange focusChange);
+
+	virtual bool touch(const TouchInput &touch) = 0;
+	virtual bool key(const KeyInput &key) = 0;
+	virtual void axis(const AxisInput &axis) = 0;
 
 	virtual void RecreateViews() {}
 
+	// NOTE: This is polled every frame, not called on every input event.
+	virtual InputMode PassInputToMapper() const { return InputMode::None; }
+
 	ScreenManager *screenManager() { return screenManager_; }
+	const ScreenManager *screenManager() const { return screenManager_; }
 	void setScreenManager(ScreenManager *sm) { screenManager_ = sm; }
 
-	// This one is icky to use because you can't know what's in it until you know
-	// what screen it is.
-	virtual void *dialogData() { return 0; }
-
-	virtual std::string tag() const { return std::string(""); }
+	virtual const char *tag() const = 0;
 
 	virtual bool isTransparent() const { return false; }
 	virtual bool isTopLevel() const { return false; }
 
 	virtual TouchInput transformTouch(const TouchInput &touch) { return touch; }
+	virtual bool WantsTextInput() const { return false; }
+
+protected:
+	// Requests made while creating views (by the views themselves, or with callbacks that capture them) get a separate
+	// token, so they can be forgotten when the views are deleted, while the screen's own requests stay alive.
+	int GetRequesterToken();
+	void SetCreatingViews(bool creating) { creatingViews_ = creating; }
+	bool IsCreatingViews() const { return creatingViews_; }
+	// Drops the callbacks of pending requests made by the views, which are about to be deleted.
+	void ForgetViewRequests();
 
 private:
-	ScreenManager *screenManager_;
+	ScreenManager *screenManager_ = nullptr;
+	int token_ = -1;
+	int viewsToken_ = -1;
+	bool creatingViews_ = false;
+
 	DISALLOW_COPY_AND_ASSIGN(Screen);
-};
-
-class Transition {
-public:
-	Transition() {}
-};
-
-enum {
-	LAYER_SIDEMENU = 1,
-	LAYER_TRANSPARENT = 2,
-};
-
-typedef void(*PostRenderCallback)(UIContext *ui, void *userdata);
-
-class ScreenManager {
-public:
-	ScreenManager();
-	virtual ~ScreenManager();
-
-	void switchScreen(Screen *screen);
-	void update();
-
-	void setUIContext(UIContext *context) { uiContext_ = context; }
-	UIContext *getUIContext() { return uiContext_; }
-
-	void setDrawContext(Draw::DrawContext *context) { thin3DContext_ = context; }
-	Draw::DrawContext *getDrawContext() { return thin3DContext_; }
-
-	void setPostRenderCallback(PostRenderCallback cb, void *userdata) {
-		postRenderCb_ = cb;
-		postRenderUserdata_ = userdata;
-	}
-
-	void render();
-	void resized();
-	void shutdown();
-
-	void deviceLost();
-	void deviceRestored();
-
-	// Push a dialog box in front. Currently 1-level only.
-	void push(Screen *screen, int layerFlags = 0);
-
-	// Recreate all views
-	void RecreateAllViews();
-
-	// Pops the dialog away.
-	void finishDialog(Screen *dialog, DialogResult result = DR_OK);
-	Screen *dialogParent(const Screen *dialog) const;
-
-	// Instant touch, separate from the update() mechanism.
-	bool touch(const TouchInput &touch);
-	bool key(const KeyInput &key);
-	bool axis(const AxisInput &touch);
-
-	// Generic facility for gross hacks :P
-	void sendMessage(const char *msg, const char *value);
-
-	Screen *topScreen() const;
-
-	std::recursive_mutex inputLock_;
-
-private:
-	void pop();
-	void switchToNext();
-	void processFinishDialog();
-
-	UIContext *uiContext_;
-	Draw::DrawContext *thin3DContext_;
-
-	PostRenderCallback postRenderCb_ = nullptr;
-	void *postRenderUserdata_ = nullptr;
-
-	const Screen *dialogFinished_;
-	DialogResult dialogResult_;
-
-	struct Layer {
-		Screen *screen;
-		int flags;  // From LAYER_ enum above
-		UI::View *focusedView;  // TODO: save focus here. Going for quick solution now to reset focus.
-	};
-
-	// Dialog stack. These are shown "on top" of base screens and the Android back button works as expected.
-	// Used for options, in-game menus and other things you expect to be able to back out from onto something.
-	std::vector<Layer> stack_;
-	std::vector<Layer> nextStack_;
 };

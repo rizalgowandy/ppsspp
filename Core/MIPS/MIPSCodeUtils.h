@@ -29,6 +29,7 @@
 #define MIPS_MAKE_JAL(addr) (0x0C000000 | ((addr)>>2))
 #define MIPS_MAKE_JR_RA()   (0x03e00008)
 #define MIPS_MAKE_NOP()     (0)
+#define MIPS_MAKE_BNEZ(pc, addr, rs) (0x14000000 | (rs << 21) | (u32)(((int)(addr - (pc + 4)) >> 2) & 0xFFFF))
 
 #define MIPS_MAKE_ADDIU(dreg, sreg, immval) ((9 << 26) | ((dreg) << 16) | ((sreg) << 21) | (immval))
 #define MIPS_MAKE_LUI(reg, immval) (0x3c000000 | ((reg) << 16) | (immval))
@@ -53,6 +54,9 @@
 #define MIPS_GET_VS(op) ((op>>8) & 0x7F)
 #define MIPS_GET_VT(op) ((op>>16) & 0x7F)
 
+// ctc1 to fcr31, the only instruction that changes the guest's rounding mode and flush-to-zero.
+#define MIPS_IS_CTC1_FCR31(op) (((op) & 0xFFE0F800) == 0x44C0F800)
+
 inline int32_t SignExtend8ToS32(MIPSOpcode op) {
 	return SignExtend8ToS32(op.encoding);
 }
@@ -67,6 +71,20 @@ inline int32_t SignExtend16ToS32(MIPSOpcode op) {
 
 inline uint32_t SignExtend16ToU32(MIPSOpcode op) {
 	return SignExtend16ToU32(op.encoding);
+}
+
+// The Allegrex bit ops (special3, function 0x20) only decode some bits of the sa field, so every
+// value is one of them (cpu/cpu_alu/allegrex_encodings). Returns the canonical sa: 2 wsbh, 3 wsbw,
+// 16 seb, 20 bitrev, 24 seh.
+inline int AllegrexBitOp(MIPSOpcode op) {
+	int sa = (op >> 6) & 31;
+	if (!(sa & 0x10)) {
+		return 2 | (sa & 1);
+	}
+	if (sa & 4) {
+		return 20;
+	}
+	return (sa & 8) ? 24 : 16;
 }
 
 namespace MIPSCodeUtils

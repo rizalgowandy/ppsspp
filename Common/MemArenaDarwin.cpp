@@ -19,7 +19,6 @@
 
 #if defined(__APPLE__)
 
-#include <string>
 #include <cstdint>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -35,17 +34,21 @@
 #include "Common/MemoryUtil.h"
 #include "Common/MemArena.h"
 
+MemArena::Reservation MemArena::reservations_[MemArena::MAX_RESERVATIONS];
+
 size_t MemArena::roundup(size_t x) {
 	return x;
 }
 
-void MemArena::GrabLowMemSpace(size_t size) {
+bool MemArena::GrabMemSpace(size_t size) {
 	vm_size = size;
 	kern_return_t retval = vm_allocate(mach_task_self(), &vm_mem, size, VM_FLAGS_ANYWHERE);
 	if (retval != KERN_SUCCESS) {
-		ERROR_LOG(MEMMAP, "Failed to grab a block of virtual memory");
+		ERROR_LOG(Log::MemMap, "Failed to grab a block of virtual memory");
+		return false;
 	} else {
-		INFO_LOG(MEMMAP, "Successfully allocated %d bytes at %p", (int)size, (void *)vm_mem);
+		INFO_LOG(Log::MemMap, "Successfully allocated %d bytes at %p", (int)size, (void *)vm_mem);
+		return true;
 	}
 }
 
@@ -59,28 +62,80 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 	mach_port_t self = mach_task_self();
 	vm_address_t target = (vm_address_t)base;
 	uint64_t mask = 0;
-	bool anywhere = false;
+	// Inside a reservation, replace the reserved pages in place.
+	const bool reserved = InReservation(target, size);
+	const int flags = VM_FLAGS_FIXED | (reserved ? VM_FLAGS_OVERWRITE : 0);
 	vm_address_t source = vm_mem + offset;
 	vm_prot_t cur_protection = 0;
 	vm_prot_t max_protection = 0;
 	kern_return_t retval =
-		vm_remap(self, &target, size, mask, anywhere,
+		vm_remap(self, &target, size, mask, flags,
 				 self, source, false,
 				 &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
 	if (retval != KERN_SUCCESS) {
 		// 1 == KERN_INVALID_ADDRESS
 		// 3 == KERN_NO_SPACE (race?)
 		// 4 == KERN_INVALID_ARGUMENT
-		ERROR_LOG(MEMMAP, "vm_remap failed (%d) - could not remap from %llx (offset %llx) of size %llx to %p",
+		ERROR_LOG(Log::MemMap, "vm_remap failed (%d) - could not remap from %llx (offset %llx) of size %llx to %p",
 				  (int)retval, (uint64_t)source, (uint64_t)offset, (uint64_t)size, base);
 		return nullptr;
 	}
 	return (void *)target;
 }
 
-void MemArena::ReleaseView(void* view, size_t size) {
+void MemArena::ReleaseView(s64 offset, void* view, size_t size) {
 	vm_address_t addr = (vm_address_t)view;
+	if (InReservation(addr, size)) {
+		// Put the reserved pages back instead of unmapping. A hole would let another thread's allocation
+		// (Metal maps its command buffer memory at any free address) land in it, and ReleaseViewSpace()
+		// would then unmap that too.
+		kern_return_t retval = vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, MACH_PORT_NULL, 0, false,
+			VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_DEFAULT);
+		if (retval == KERN_SUCCESS) {
+			return;
+		}
+		WARN_LOG(Log::MemMap, "Couldn't restore the reservation under a view at %p (%d)", view, (int)retval);
+	}
 	vm_deallocate(mach_task_self(), addr, size);
+}
+
+u8 *MemArena::ReserveViewSpace(size_t size, size_t alignMask) {
+	int slot = 0;
+	while (slot < MAX_RESERVATIONS && reservations_[slot].size)
+		slot++;
+	if (slot == MAX_RESERVATIONS) {
+		ERROR_LOG(Log::MemMap, "Too many view reservations");
+		return nullptr;
+	}
+	vm_address_t addr = 0;
+	// No access: the gaps between the views should fault, like unmapped memory.
+	kern_return_t retval = vm_map(mach_task_self(), &addr, size, alignMask, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, false,
+		VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_DEFAULT);
+	if (retval != KERN_SUCCESS) {
+		WARN_LOG(Log::MemMap, "Couldn't reserve %llx bytes (alignment mask %llx) for the memory views (%d)", (uint64_t)size, (uint64_t)alignMask, (int)retval);
+		return nullptr;
+	}
+	reservations_[slot].addr = addr;
+	reservations_[slot].size = size;
+	INFO_LOG(Log::MemMap, "Reserved %llx bytes for the memory views at %p", (uint64_t)size, (void *)addr);
+	return (u8 *)addr;
+}
+
+void MemArena::ReleaseViewSpace(u8 *base) {
+	for (Reservation &r : reservations_) {
+		if (r.size && r.addr == (vm_address_t)base) {
+			vm_deallocate(mach_task_self(), r.addr, r.size);
+			r = Reservation();
+		}
+	}
+}
+
+bool MemArena::InReservation(vm_address_t addr, size_t size) {
+	for (const Reservation &r : reservations_) {
+		if (r.size && addr >= r.addr && addr + size <= r.addr + r.size)
+			return true;
+	}
+	return false;
 }
 
 bool MemArena::NeedsProbing() {

@@ -16,6 +16,10 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <shlwapi.h>
+#include <wrl/client.h>
+
+#include "mfapi.h"
+
 #include "Common/Thread/ThreadUtil.h"
 #include "CaptureDevice.h"
 #include "BufferLock.h"
@@ -24,69 +28,93 @@
 #include "Core/HLE/sceUsbCam.h"
 #include "Core/Config.h"
 
+using Microsoft::WRL::ComPtr;
+
 namespace MFAPI {
 	HINSTANCE Mflib;
 	HINSTANCE Mfplatlib;
 	HINSTANCE Mfreadwritelib;
 
+	// NOTE: MFGetAttributeSize is an inline function, so we don't need to load it dynamically.
+
 	typedef HRESULT(WINAPI *MFEnumDeviceSourcesFunc)(IMFAttributes *, IMFActivate ***, UINT32 *);
+	typedef HRESULT(WINAPI *MFStartupFunc)(ULONG, DWORD);
+	typedef HRESULT(WINAPI *MFShutdownFunc)();
+	typedef HRESULT(WINAPI *MFCreateAttributesFunc)(IMFAttributes **, UINT32);
 	typedef HRESULT(WINAPI *MFGetStrideForBitmapInfoHeaderFunc)(DWORD, DWORD, LONG *);
 	typedef HRESULT(WINAPI *MFCreateSourceReaderFromMediaSourceFunc)(IMFMediaSource *, IMFAttributes *, IMFSourceReader **);
 	typedef HRESULT(WINAPI *MFCopyImageFunc)(BYTE *, LONG, const BYTE *, LONG, DWORD, DWORD);
 
 	MFEnumDeviceSourcesFunc EnumDeviceSources;
+	MFStartupFunc Startup;
+	MFShutdownFunc ShutdownFn;
+	MFCreateAttributesFunc CreateAttributes;
 	MFGetStrideForBitmapInfoHeaderFunc GetStrideForBitmapInfoHeader;
 	MFCreateSourceReaderFromMediaSourceFunc CreateSourceReaderFromMediaSource;
 	MFCopyImageFunc CopyImage;
 }
 
-using namespace MFAPI;
 
-bool RegisterCMPTMFApis(){
-	//For the compatibility,these funcs don't be supported on vista.
-	Mflib = LoadLibrary(L"Mf.dll");
-	Mfplatlib = LoadLibrary(L"Mfplat.dll");
-	Mfreadwritelib = LoadLibrary(L"Mfreadwrite.dll");
-	if (!Mflib || !Mfplatlib || !Mfreadwritelib)
-		return false;
+bool RegisterCMPTMFApis() {
+	// We dynamically load these, as they are not always available (de-bloated Windows, Windows Vista, etc).
 
-	EnumDeviceSources = (MFEnumDeviceSourcesFunc)GetProcAddress(Mflib, "MFEnumDeviceSources");
-	GetStrideForBitmapInfoHeader = (MFGetStrideForBitmapInfoHeaderFunc)GetProcAddress(Mfplatlib, "MFGetStrideForBitmapInfoHeader");
-	MFAPI::CopyImage = (MFCopyImageFunc)GetProcAddress(Mfplatlib, "MFCopyImage");
-	CreateSourceReaderFromMediaSource = (MFCreateSourceReaderFromMediaSourceFunc)GetProcAddress(Mfreadwritelib, "MFCreateSourceReaderFromMediaSource");
-	if (!EnumDeviceSources || !GetStrideForBitmapInfoHeader || !CreateSourceReaderFromMediaSource || !MFAPI::CopyImage)
+	MFAPI::Mflib = LoadLibrary(L"Mf.dll");
+	if (!MFAPI::Mflib) {
+		ERROR_LOG(Log::System, "Failed to load Mflib.");
 		return false;
+	}
+	MFAPI::Mfplatlib = LoadLibrary(L"Mfplat.dll");
+	if (!MFAPI::Mfplatlib) {
+		ERROR_LOG(Log::System, "Failed to load Mfplat.");
+		return false;
+	}
+	MFAPI::Mfreadwritelib = LoadLibrary(L"Mfreadwrite.dll");
+	if (!MFAPI::Mfreadwritelib) {
+		ERROR_LOG(Log::System, "Failed to load Mfreadwrite.");
+		return false;
+	}
+
+	MFAPI::EnumDeviceSources = (MFAPI::MFEnumDeviceSourcesFunc)GetProcAddress(MFAPI::Mflib, "MFEnumDeviceSources");
+	MFAPI::Startup = (MFAPI::MFStartupFunc)GetProcAddress(MFAPI::Mfplatlib, "MFStartup");
+	MFAPI::ShutdownFn = (MFAPI::MFShutdownFunc)GetProcAddress(MFAPI::Mfplatlib, "MFShutdown");
+	MFAPI::CreateAttributes = (MFAPI::MFCreateAttributesFunc)GetProcAddress(MFAPI::Mfplatlib, "MFCreateAttributes");
+	MFAPI::GetStrideForBitmapInfoHeader = (MFAPI::MFGetStrideForBitmapInfoHeaderFunc)GetProcAddress(MFAPI::Mfplatlib, "MFGetStrideForBitmapInfoHeader");
+	MFAPI::CopyImage = (MFAPI::MFCopyImageFunc)GetProcAddress(MFAPI::Mfplatlib, "MFCopyImage");
+	MFAPI::CreateSourceReaderFromMediaSource = (MFAPI::MFCreateSourceReaderFromMediaSourceFunc)GetProcAddress(MFAPI::Mfreadwritelib, "MFCreateSourceReaderFromMediaSource");
+	if (!MFAPI::EnumDeviceSources || !MFAPI::Startup || !MFAPI::ShutdownFn || !MFAPI::CreateAttributes || !MFAPI::GetStrideForBitmapInfoHeader || !MFAPI::CreateSourceReaderFromMediaSource || !MFAPI::CopyImage) {
+		return false;
+	}
 
 	return true;
 }
 
-bool unRegisterCMPTMFApis() {
-	if (Mflib) {
-		FreeLibrary(Mflib);
-		Mflib = nullptr;
+bool UnRegisterCMPTMFApis() {
+	if (MFAPI::Mflib) {
+		FreeLibrary(MFAPI::Mflib);
+		MFAPI::Mflib = nullptr;
 	}
 
-	if (Mfplatlib) {
-		FreeLibrary(Mfplatlib);
-		Mfplatlib = nullptr;
+	if (MFAPI::Mfplatlib) {
+		FreeLibrary(MFAPI::Mfplatlib);
+		MFAPI::Mfplatlib = nullptr;
 	}
 
-	if (Mfreadwritelib) {
-		FreeLibrary(Mfreadwritelib);
-		Mfreadwritelib = nullptr;
+	if (MFAPI::Mfreadwritelib) {
+		FreeLibrary(MFAPI::Mfreadwritelib);
+		MFAPI::Mfreadwritelib = nullptr;
 	}
 
-	EnumDeviceSources = nullptr;
-	GetStrideForBitmapInfoHeader = nullptr;
-	CreateSourceReaderFromMediaSource = nullptr;
+	MFAPI::EnumDeviceSources = nullptr;
+	MFAPI::Startup = nullptr;
+	MFAPI::ShutdownFn = nullptr;
+	MFAPI::CreateAttributes = nullptr;
+	MFAPI::GetStrideForBitmapInfoHeader = nullptr;
+	MFAPI::CreateSourceReaderFromMediaSource = nullptr;
 	MFAPI::CopyImage = nullptr;
-
 	return true;
 }
 
 WindowsCaptureDevice *winCamera;
-WindowsCaptureDevice *winMic;
-
 // TODO: Add more formats, but need some tests.
 VideoFormatTransform g_VideoFormats[] =
 {
@@ -96,30 +124,20 @@ VideoFormatTransform g_VideoFormats[] =
 	{ MFVideoFormat_NV12,  AV_PIX_FMT_NV12    }
 };
 
-AudioFormatTransform g_AudioFormats[] = {
-	{ MFAudioFormat_PCM,    8, AV_SAMPLE_FMT_U8 },
-	{ MFAudioFormat_PCM,   16, AV_SAMPLE_FMT_S16 },
-	{ MFAudioFormat_PCM,   32, AV_SAMPLE_FMT_S32 },
-	{ MFAudioFormat_Float, 32, AV_SAMPLE_FMT_FLT }
-};
-
 const int g_cVideoFormats = ARRAYSIZE(g_VideoFormats);
-const int g_cAudioFormats = ARRAYSIZE(g_AudioFormats);
 
 MediaParam defaultVideoParam = { { 640, 480,  0, MFVideoFormat_RGB24 } };
-MediaParam defaultAudioParam = { { 44100, 2, 16, MFAudioFormat_PCM } };
 
 HRESULT GetDefaultStride(IMFMediaType *pType, LONG *plStride);
 
 ReaderCallback::ReaderCallback(WindowsCaptureDevice *_device) : device(_device) {}
 
 ReaderCallback::~ReaderCallback() {
+#ifdef USE_FFMPEG
 	if (img_convert_ctx) {
 		sws_freeContext(img_convert_ctx);
 	}
-	if (resample_ctx) {
-		swr_free(&resample_ctx);
-	}
+#endif
 }
 
 HRESULT ReaderCallback::QueryInterface(REFIID riid, void** ppv)
@@ -139,7 +157,7 @@ HRESULT ReaderCallback::OnReadSample(
 		LONGLONG llTimestamp,
 		IMFSample *pSample) {
 	HRESULT hr = S_OK;
-	IMFMediaBuffer *pBuffer = nullptr;
+	ComPtr<IMFMediaBuffer> pBuffer;
 	std::lock_guard<std::mutex> lock(device->sdMutex);
 	if (device->isShutDown())
 		return hr;
@@ -154,7 +172,7 @@ HRESULT ReaderCallback::OnReadSample(
 	}
 	if (SUCCEEDED(hr)) {
 		switch (device->type) {
-		case CAPTUREDEVIDE_TYPE::VIDEO: {
+		case CAPTUREDEVICE_TYPE::VIDEO: {
 			BYTE *pbScanline0 = nullptr;
 			VideoBufferLock *videoBuffer = nullptr;
 			int imgJpegSize = device->imgJpegSize;
@@ -170,7 +188,7 @@ HRESULT ReaderCallback::OnReadSample(
 
 			// pSample can be null, in this case ReadSample still should be called to request next frame.
 			if (pSample) {
-				videoBuffer = new VideoBufferLock(pBuffer);
+				videoBuffer = new VideoBufferLock(pBuffer.Get());
 				hr = videoBuffer->LockBuffer(device->deviceParam.default_stride, device->deviceParam.height, &pbScanline0, &lStride);
 
 				if (lStride > 0)
@@ -178,6 +196,7 @@ HRESULT ReaderCallback::OnReadSample(
 				else
 					srcPadding = device->deviceParam.default_stride - lStride;
 
+#ifdef USE_FFMPEG
 				if (SUCCEEDED(hr)) {
 					// Convert image to RGB24
 					if (lStride > 0) {
@@ -196,14 +215,39 @@ HRESULT ReaderCallback::OnReadSample(
 						av_free(invertedSrcImg);
 					}
 
-					// Compress image to jpeg from RGB24.
-					jpge::compress_image_to_jpeg_file_in_memory(
-						device->imageJpeg, imgJpegSize,
-						dstW,
-						dstH,
-						3,
-						device->imageRGB);
+					// Mirror the image in-place if needed.
+					if (g_Config.bCameraMirrorHorizontal) {
+						for (int y = 0; y < (int)dstH; y++) {
+							uint8_t *line = device->imageRGB + y * device->imgRGBLineSizes[0];
+							for (int x = 0; x < (int)dstW / 2; x++) {
+								const int invX = dstW - 1 - x;
+								const uint8_t r = line[x * 3 + 0];
+								const uint8_t g = line[x * 3 + 1];
+								const uint8_t b = line[x * 3 + 2];
+								line[x * 3 + 0] = line[invX * 3 + 0];
+								line[x * 3 + 1] = line[invX * 3 + 1];
+								line[x * 3 + 2] = line[invX * 3 + 2];
+								line[invX * 3 + 0] = r;
+								line[invX * 3 + 1] = g;
+								line[invX * 3 + 2] = b;
+							}
+						}
+					}
+
+					// Compress image to jpeg from RGB24. Like the PSP camera, fit the size the game asked for:
+					// Go!Edit stores frames in fixed 15KB slots.
+					imgJpegSize = Camera::encodeToFit(Camera::getMaxFrameSize(), [&](int quality) {
+						jpge::params params;
+						params.m_quality = quality;
+						int size = device->imgJpegSize;
+						return jpge::compress_image_to_jpeg_file_in_memory(
+							device->imageJpeg, size, dstW, dstH, 3, device->imageRGB, params) ? size : -1;
+					});
+					if (imgJpegSize < 0) {
+						imgJpegSize = 0;
+					}
 				}
+#endif
 				Camera::pushCameraImage(imgJpegSize, device->imageJpeg);
 			}
 			// Request the next frame.
@@ -220,41 +264,9 @@ HRESULT ReaderCallback::OnReadSample(
 			delete videoBuffer;
 			break;
 		}
-		case CAPTUREDEVIDE_TYPE::AUDIO: {
-			BYTE *sampleBuf = nullptr;
-			DWORD length = 0;
-			u32 sizeAfterResample = 0;
-			// pSample can be null, in this case ReadSample still should be called to request next frame.
-			if (pSample) {
-				pBuffer->Lock(&sampleBuf, nullptr, &length);
-				if (device->needResample()) {
-					sizeAfterResample = doResample(
-						&device->resampleBuf, device->targetMediaParam.sampleRate, device->targetMediaParam.channels, &device->resampleBufSize,
-						sampleBuf, device->deviceParam.sampleRate, device->deviceParam.channels, device->deviceParam.audioFormat, length, device->deviceParam.bitsPerSample);
-					if (device->resampleBuf)
-						Microphone::addAudioData(device->resampleBuf, sizeAfterResample);	
-				} else {
-					Microphone::addAudioData(sampleBuf, length);
-				}
-				pBuffer->Unlock();
-			}
-			// Request the next frame.
-			if (SUCCEEDED(hr)) {
-				hr = device->m_pReader->ReadSample(
-					(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-					0,
-					nullptr,
-					nullptr,
-					nullptr,
-					nullptr
-				);
-			}
-			break;
-		}
 		}
 	}
 
-	SafeRelease(&pBuffer);
 	return hr;
 }
 
@@ -266,23 +278,17 @@ AVPixelFormat ReaderCallback::getAVVideoFormatbyMFVideoFormat(const GUID &MFVide
 	return AV_PIX_FMT_RGB24;
 }
 
-AVSampleFormat ReaderCallback::getAVAudioFormatbyMFAudioFormat(const GUID &MFAudioFormat, const u32 &bitsPerSample) {
-	for (int i = 0; i < g_cAudioFormats; i++) {
-		if (MFAudioFormat == g_AudioFormats[i].MFAudioFormat && bitsPerSample == g_AudioFormats[i].bitsPerSample)
-			return g_AudioFormats[i].AVAudioFormat;
-	}
-	return AV_SAMPLE_FMT_S16;
-}
-
 void ReaderCallback::imgConvert(
 	unsigned char *dst, unsigned int &dstW, unsigned int &dstH, int dstLineSizes[4],
 	unsigned char *src, const unsigned int &srcW, const unsigned int &srcH, const GUID &srcFormat, 
 	const int &srcPadding) {
+#ifdef USE_FFMPEG
 	int srcLineSizes[4] = { 0, 0, 0, 0 };
 	unsigned char *pSrc[4];
 	unsigned char *pDst[4];
 
 	AVPixelFormat srcAVFormat = getAVVideoFormatbyMFVideoFormat(srcFormat);
+
 
 	av_image_fill_linesizes(srcLineSizes, srcAVFormat, srcW);
 
@@ -322,9 +328,11 @@ void ReaderCallback::imgConvert(
 			dstLineSizes
 		);
 	}
+#endif
 }
 
 void ReaderCallback::imgInvert(unsigned char *dst, unsigned char *src, const int &srcW, const int &srcH, const GUID &srcFormat, const int &srcStride) {
+#ifdef USE_FFMPEG
 	AVPixelFormat srcAvFormat = getAVVideoFormatbyMFVideoFormat(srcFormat);
 	int dstLineSizes[4] = { 0, 0, 0, 0 };
 
@@ -338,6 +346,7 @@ void ReaderCallback::imgInvert(unsigned char *dst, unsigned char *src, const int
 		imgInvertYUY2(dst, dstLineSizes[0], src, srcStride, srcH);
 	else if (srcFormat == MFVideoFormat_NV12)
 		imgInvertNV12(dst, dstLineSizes[0], src, srcStride, srcH);;
+#endif
 }
 
 void ReaderCallback::imgInvertRGBA(unsigned char *dst, int &dstStride, unsigned char *src, const int &srcStride, const int &h) {
@@ -391,114 +400,48 @@ void ReaderCallback::imgInvertNV12(unsigned char *dst, int &dstStride, unsigned 
 	}
 }
 
-u32 ReaderCallback::doResample(u8 **dst, u32 &dstSampleRate, u32 &dstChannels, u32 *dstSize, u8 *src, const u32 &srcSampleRate, const u32 &srcChannels, const GUID &srcFormat, const u32& srcSize, const u32& srcBitsPerSample) {
-	AVSampleFormat srcAVFormat = getAVAudioFormatbyMFAudioFormat(srcFormat, srcBitsPerSample);
-	int outSamplesCount = 0;
-	if (resample_ctx == nullptr) {
-		resample_ctx = swr_alloc_set_opts(nullptr,
-			av_get_default_channel_layout(dstChannels),
-			AV_SAMPLE_FMT_S16,
-			dstSampleRate,
-			av_get_default_channel_layout(srcChannels),
-			srcAVFormat,
-			srcSampleRate,
-			0,
-			nullptr);
-		if (resample_ctx == nullptr || swr_init(resample_ctx) < 0) {
-			swr_free(&resample_ctx);
-			return 0;
-		}
-	}
-	int srcSamplesCount = srcSize / srcChannels / av_get_bytes_per_sample(srcAVFormat); // per channel.
-	int outCount = srcSamplesCount * dstSampleRate / srcSampleRate + 256;
-	unsigned int outSize = av_samples_get_buffer_size(nullptr, dstChannels, outCount, AV_SAMPLE_FMT_S16, 0);
-	
-	if (!*dst) {
-		*dst = (u8 *)av_malloc(outSize);
-		*dstSize = outSize;
-	}
-	if (!*dst)
-		return 0;
-
-	if(*dstSize < outSize)
-		av_fast_malloc(dst, dstSize, outSize);
-
-	outSamplesCount = swr_convert(resample_ctx, dst, outCount, (const uint8_t **)&src, srcSamplesCount);
-	if (outSamplesCount < 0)
-		return 0;
-	return av_samples_get_buffer_size(nullptr, dstChannels, outSamplesCount, AV_SAMPLE_FMT_S16, 0);
-}
-
-WindowsCaptureDevice::WindowsCaptureDevice(CAPTUREDEVIDE_TYPE _type) :
+WindowsCaptureDevice::WindowsCaptureDevice(CAPTUREDEVICE_TYPE _type) :
 	type(_type),
 	error(CAPTUREDEVIDE_ERROR_NO_ERROR),
-	state(CAPTUREDEVIDE_STATE::UNINITIALIZED) {
+	state(CAPTUREDEVICE_STATE::UNINITIALIZED) {
 	param = { 0 };
 	deviceParam = { { 0 } };
 
 	switch (type) {
-	case CAPTUREDEVIDE_TYPE::VIDEO:
+	case CAPTUREDEVICE_TYPE::VIDEO:
 		targetMediaParam = defaultVideoParam;
-		break;
-	case CAPTUREDEVIDE_TYPE::AUDIO:
-		targetMediaParam = defaultAudioParam;
 		break;
 	}
 
-	std::thread t(&WindowsCaptureDevice::messageHandler, this);
-	t.detach();
+	thread_ = std::thread(&WindowsCaptureDevice::messageHandler, this);
 }
 
 WindowsCaptureDevice::~WindowsCaptureDevice() {
+#ifdef USE_FFMPEG
 	switch (type) {
-	case CAPTUREDEVIDE_TYPE::VIDEO:
+	case CAPTUREDEVICE_TYPE::VIDEO:
 		av_freep(&imageRGB);
 		av_freep(&imageJpeg);
 		break;
-	case CAPTUREDEVIDE_TYPE::AUDIO:
-		av_freep(&resampleBuf);
-		break;
 	}
+#endif
 }
 
 void WindowsCaptureDevice::CheckDevices() {
 	isDeviceChanged = true;
 }
 
-bool WindowsCaptureDevice::init() {
-	HRESULT hr = S_OK;
-
-	if (!RegisterCMPTMFApis()) {
-		setError(CAPTUREDEVIDE_ERROR_INIT_FAILED, "Cannot register devices");
-		return false;
-	}
-	std::unique_lock<std::mutex> lock(paramMutex);
-	hr = enumDevices();
-	lock.unlock();
-
-	if (FAILED(hr)) {
-		setError(CAPTUREDEVIDE_ERROR_INIT_FAILED, "Cannot enumerate devices");
-		return false;
-	}
-
-	updateState(CAPTUREDEVIDE_STATE::STOPPED);
-	return true;
-}
-
 bool WindowsCaptureDevice::start(void *startParam) {
 	HRESULT hr = S_OK;
-	IMFAttributes *pAttributes = nullptr;
-	IMFMediaType *pType = nullptr;
+	ComPtr<IMFAttributes> pAttributes;
+	ComPtr<IMFMediaType> pType;
 	UINT32 selection = 0;
 	UINT32 count = 0;
 
 	// Release old sources first(if any).
-	SafeRelease(&m_pSource);
-	SafeRelease(&m_pReader);
-	if (m_pCallback) {
-		delete m_pCallback;
-		m_pCallback = nullptr;
-	}
+	m_pSource = nullptr;
+	m_pReader = nullptr;
+	m_pCallback = nullptr;
 	// Need to re-enumerate the list,because old sources were released.
 	std::vector<std::string> deviceList = getDeviceList(true);
 
@@ -509,10 +452,10 @@ bool WindowsCaptureDevice::start(void *startParam) {
 
 	m_pCallback = new ReaderCallback(this);
 
-	std::string selectedDeviceName = type == CAPTUREDEVIDE_TYPE::VIDEO ? g_Config.sCameraDevice : g_Config.sMicDevice;
+	std::string selectedDeviceName = g_Config.sCameraDevice;
 
 	switch (state) {
-	case CAPTUREDEVIDE_STATE::STOPPED:
+	case CAPTUREDEVICE_STATE::STOPPED:
 		for (auto &name : deviceList) {
 			if (name == selectedDeviceName) {
 				selection = count;
@@ -520,25 +463,24 @@ bool WindowsCaptureDevice::start(void *startParam) {
 			}
 			++count;
 		}
-		setSelction(selection);
+		setSelection(selection);
 		hr = param.ppDevices[param.selection]->ActivateObject(
-			__uuidof(IMFMediaSource),
-			(void**)&m_pSource);
+			IID_PPV_ARGS(&m_pSource));
 
 		if (SUCCEEDED(hr))
-			hr = MFCreateAttributes(&pAttributes, 2);
+			hr = MFAPI::CreateAttributes(&pAttributes, 2);
 
 		// Use async mode
 		if (SUCCEEDED(hr))
-			hr = pAttributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, m_pCallback);
+			hr = pAttributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, m_pCallback.Get());
 
 		if (SUCCEEDED(hr))
 			hr = pAttributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, TRUE);
 
 		if (SUCCEEDED(hr)) {
-			hr = CreateSourceReaderFromMediaSource(
-					m_pSource,
-					pAttributes,
+			hr = MFAPI::CreateSourceReaderFromMediaSource(
+					m_pSource.Get(),
+					pAttributes.Get(),
 					&m_pReader
 				);
 		}
@@ -548,13 +490,14 @@ bool WindowsCaptureDevice::start(void *startParam) {
 
 		if (SUCCEEDED(hr)) {
 			switch (type) {
-			case CAPTUREDEVIDE_TYPE::VIDEO: {
+			case CAPTUREDEVICE_TYPE::VIDEO: {
 				if (startParam) {
 					std::vector<int> *resolution = static_cast<std::vector<int>*>(startParam);
 					targetMediaParam.width = resolution->at(0);
 					targetMediaParam.height = resolution->at(1);
 					delete resolution;
 				}
+#ifdef USE_FFMPEG
 
 				av_freep(&imageRGB);
 				av_freep(&imageJpeg);
@@ -562,6 +505,7 @@ bool WindowsCaptureDevice::start(void *startParam) {
 				imgJpegSize = av_image_get_buffer_size(AV_PIX_FMT_YUVJ411P, targetMediaParam.width, targetMediaParam.height, 1);
 				imageJpeg = (unsigned char*)av_malloc(imgJpegSize);
 				av_image_fill_linesizes(imgRGBLineSizes, AV_PIX_FMT_RGB24, targetMediaParam.width);
+#endif
 
 				for (DWORD i = 0; ; i++) {
 					hr = m_pReader->GetNativeMediaType(
@@ -572,7 +516,7 @@ bool WindowsCaptureDevice::start(void *startParam) {
 
 					if (FAILED(hr)) { break; }
 
-					hr = setDeviceParam(pType);
+					hr = setDeviceParam(pType.Get());
 
 					if (SUCCEEDED(hr))
 						break;
@@ -600,41 +544,6 @@ bool WindowsCaptureDevice::start(void *startParam) {
 				break;
 			}
 
-			case CAPTUREDEVIDE_TYPE::AUDIO: {
-				if (startParam) {
-					std::vector<u32> *micParam = static_cast<std::vector<u32>*>(startParam);
-					targetMediaParam.sampleRate = micParam->at(0);
-					targetMediaParam.channels = micParam->at(1);
-					delete micParam;
-				}
-
-				for (DWORD i = 0; ; i++) {
-					hr = m_pReader->GetNativeMediaType(
-						(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-						i,
-						&pType
-					);
-
-					if (FAILED(hr)) { break; }
-
-					hr = setDeviceParam(pType);
-
-					if (SUCCEEDED(hr))
-						break;
-				}
-
-				if (SUCCEEDED(hr)) {
-					hr = m_pReader->ReadSample(
-						(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-						0,
-						nullptr,
-						nullptr,
-						nullptr,
-						nullptr
-					);
-				}
-				break;
-			}
 			}
 		}
 
@@ -642,24 +551,20 @@ bool WindowsCaptureDevice::start(void *startParam) {
 			setError(CAPTUREDEVIDE_ERROR_START_FAILED, "Cannot start");
 			if(m_pSource)
 				m_pSource->Shutdown();
-			SafeRelease(&m_pSource);
-			SafeRelease(&pAttributes);
-			SafeRelease(&pType);
-			SafeRelease(&m_pReader);
+			m_pSource = nullptr;
+			m_pReader = nullptr;
 			return false;
 		}
 
-		SafeRelease(&pAttributes);
-		SafeRelease(&pType);
-		updateState(CAPTUREDEVIDE_STATE::STARTED);
+		updateState(CAPTUREDEVICE_STATE::STARTED);
 		break;
-	case CAPTUREDEVIDE_STATE::LOST:
+	case CAPTUREDEVICE_STATE::LOST:
 		setError(CAPTUREDEVIDE_ERROR_START_FAILED, "Device has lost");
 		return false;
-	case CAPTUREDEVIDE_STATE::STARTED:
+	case CAPTUREDEVICE_STATE::STARTED:
 		setError(CAPTUREDEVIDE_ERROR_START_FAILED, "Device has started");
 		return false;
-	case CAPTUREDEVIDE_STATE::UNINITIALIZED:
+	case CAPTUREDEVICE_STATE::UNINITIALIZED:
 		setError(CAPTUREDEVIDE_ERROR_START_FAILED, "Device doesn't initialize");
 		return false;
 	default:
@@ -669,12 +574,12 @@ bool WindowsCaptureDevice::start(void *startParam) {
 }
 
 bool WindowsCaptureDevice::stop() {
-	if (state == CAPTUREDEVIDE_STATE::STOPPED)
+	if (state == CAPTUREDEVICE_STATE::STOPPED)
 		return true;
 	if (m_pSource)
 		m_pSource->Stop();
 
-	updateState(CAPTUREDEVIDE_STATE::STOPPED);
+	updateState(CAPTUREDEVICE_STATE::STOPPED);
 
 	return true;
 };
@@ -714,13 +619,13 @@ std::vector<std::string> WindowsCaptureDevice::getDeviceList(bool forceEnum, int
 
 		if (SUCCEEDED(hr)) {
 			// Get the size needed first
-			dwMinSize = WideCharToMultiByte(CP_UTF8, NULL, pwstrName, -1, nullptr, 0, nullptr, FALSE);
+			dwMinSize = WideCharToMultiByte(CP_UTF8, 0, pwstrName, -1, nullptr, 0, nullptr, FALSE);
 			if (dwMinSize == 0)
-				hr = -1;
+				hr = E_FAIL;
 		}
 		if (SUCCEEDED(hr)) {
 			cstrName = new char[dwMinSize];
-			WideCharToMultiByte(CP_UTF8, NULL, pwstrName, -1, cstrName, dwMinSize, NULL, FALSE);
+			WideCharToMultiByte(CP_UTF8, 0, pwstrName, -1, cstrName, dwMinSize, NULL, FALSE);
 			strName = cstrName;
 			delete[] cstrName;
 
@@ -747,7 +652,7 @@ HRESULT WindowsCaptureDevice::setDeviceParam(IMFMediaType *pType) {
 	bool getFormat = false;
 
 	switch (type) {
-	case CAPTUREDEVIDE_TYPE::VIDEO:
+	case CAPTUREDEVICE_TYPE::VIDEO:
 		hr = pType->GetGUID(MF_MT_SUBTYPE, &subtype);
 		if (FAILED(hr))
 			break;
@@ -786,64 +691,22 @@ HRESULT WindowsCaptureDevice::setDeviceParam(IMFMediaType *pType) {
 			hr = GetDefaultStride(pType, &deviceParam.default_stride);
 
 		break;
-	case CAPTUREDEVIDE_TYPE::AUDIO:
-		hr = pType->GetGUID(MF_MT_SUBTYPE, &subtype);
-		if (FAILED(hr))
-			break;
-
-		for (int i = 0; i < g_cVideoFormats; i++) {
-			if (subtype == g_AudioFormats[i].MFAudioFormat) {
-				deviceParam.audioFormat = subtype;
-				getFormat = true;
-				break;
-			}
-		}
-
-		if (!getFormat) {
-			for (int i = 0; i < g_cAudioFormats; i++) {
-				hr = pType->SetGUID(MF_MT_SUBTYPE, g_AudioFormats[i].MFAudioFormat);
-				if (FAILED(hr))
-					continue;
-
-				hr = m_pReader->SetCurrentMediaType(
-					(DWORD)MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-					NULL,
-					pType
-				);
-
-				if (SUCCEEDED(hr)) {
-					deviceParam.audioFormat = g_AudioFormats[i].MFAudioFormat;
-					getFormat = true;
-					break;
-				}
-			}
-		}
-		if (SUCCEEDED(hr))
-			hr = pType->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &deviceParam.sampleRate);
-
-		if (SUCCEEDED(hr))
-			hr = pType->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &deviceParam.channels);
-
-		if (SUCCEEDED(hr))
-			hr = pType->GetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, (UINT32 *)&deviceParam.bitsPerSample);
-
-		break;
 	}
 
 	return hr;
 }
 
-void WindowsCaptureDevice::sendMessage(CAPTUREDEVIDE_MESSAGE message) {
+void WindowsCaptureDevice::sendMessage(CAPTUREDEVICE_MESSAGE message) {
 	// Must be unique lock
 	std::unique_lock<std::mutex> lock(mutex);
 	messageQueue.push(message);
 	cond.notify_one();
 }
 
-CAPTUREDEVIDE_MESSAGE WindowsCaptureDevice::getMessage() {
+CAPTUREDEVICE_MESSAGE WindowsCaptureDevice::getMessage() {
 	// Must be unique lock
 	std::unique_lock<std::mutex> lock(mutex);
-	CAPTUREDEVIDE_MESSAGE message;
+	CAPTUREDEVICE_MESSAGE message;
 	cond.wait(lock, [this]() { return !messageQueue.empty(); });
 	message = messageQueue.front();
 	messageQueue.pop();
@@ -851,7 +714,7 @@ CAPTUREDEVIDE_MESSAGE WindowsCaptureDevice::getMessage() {
 	return message;
 }
 
-void WindowsCaptureDevice::updateState(const CAPTUREDEVIDE_STATE &newState) {
+void WindowsCaptureDevice::updateState(const CAPTUREDEVICE_STATE &newState) {
 	state = newState;
 	if (isShutDown()) {
 		std::unique_lock<std::mutex> guard(stateMutex_);
@@ -860,50 +723,61 @@ void WindowsCaptureDevice::updateState(const CAPTUREDEVIDE_STATE &newState) {
 }
 
 void WindowsCaptureDevice::waitShutDown() {
-	sendMessage({ CAPTUREDEVIDE_COMMAND::SHUTDOWN, nullptr });
-
-	std::unique_lock<std::mutex> guard(stateMutex_);
-	while (!isShutDown()) {
-		stateCond_.wait(guard);
+	_dbg_assert_(thread_.joinable());
+	if (!thread_.joinable()) {
+		ERROR_LOG(Log::System, "Tried to wait for capture device thread, but not joinable.");
+		return;
 	}
+
+	sendMessage({ CAPTUREDEVICE_COMMAND::SHUTDOWN, nullptr });
+	thread_.join();
 }
 
+// This is the main thread for the capture device.
 void WindowsCaptureDevice::messageHandler() {
-	CoInitializeEx(NULL, COINIT_MULTITHREADED);
-	MFStartup(MF_VERSION);
-	CAPTUREDEVIDE_MESSAGE message;
+	SetCurrentThreadName("Camera");
 
-	if (type == CAPTUREDEVIDE_TYPE::VIDEO) {
-		setCurrentThreadName("Camera");
-	} else if (type == CAPTUREDEVIDE_TYPE::AUDIO) {
-		setCurrentThreadName("Microphone");
+	if (!MFAPI::Startup) {
+		setError(CAPTUREDEVIDE_ERROR_INIT_FAILED, "Cannot register devices");
+		return;
 	}
 
-	while ((message = getMessage()).command != CAPTUREDEVIDE_COMMAND::SHUTDOWN) {
+	HRESULT hr = ERROR_SUCCESS;
+	{
+		std::lock_guard<std::mutex> lock(paramMutex);
+		hr = enumDevices();
+	}
+	if (FAILED(hr)) {
+		setError(CAPTUREDEVIDE_ERROR_INIT_FAILED, "Cannot enumerate devices");
+		return;
+	}
+
+	updateState(CAPTUREDEVICE_STATE::STOPPED);
+	CAPTUREDEVICE_MESSAGE message;
+
+	while ((message = getMessage()).command != CAPTUREDEVICE_COMMAND::SHUTDOWN) {
 		switch (message.command) {
-		case CAPTUREDEVIDE_COMMAND::INITIALIZE:
-			init();
-			break;
-		case CAPTUREDEVIDE_COMMAND::START:
+		case CAPTUREDEVICE_COMMAND::START:
 			start(message.opacity);
 			break;
-		case CAPTUREDEVIDE_COMMAND::STOP:
+		case CAPTUREDEVICE_COMMAND::STOP:
 			stop();
 			break;
-		case CAPTUREDEVIDE_COMMAND::UPDATE_STATE:
-			updateState((*(CAPTUREDEVIDE_STATE *)message.opacity));
+		case CAPTUREDEVICE_COMMAND::UPDATE_STATE:
+			updateState((*(CAPTUREDEVICE_STATE *)message.opacity));
+			break;
+		case CAPTUREDEVICE_COMMAND::SHUTDOWN:
 			break;
 		}
 	}
 
-	if (state != CAPTUREDEVIDE_STATE::STOPPED)
+	if (state != CAPTUREDEVICE_STATE::STOPPED)
 		stop();
 
 	std::lock_guard<std::mutex> lock(sdMutex);
-	SafeRelease(&m_pSource);
-	SafeRelease(&m_pReader);
-	delete m_pCallback;
-	unRegisterCMPTMFApis();
+	m_pSource = nullptr;
+	m_pReader = nullptr;
+	m_pCallback = nullptr;
 
 	std::unique_lock<std::mutex> lock2(paramMutex);
 	for (DWORD i = 0; i < param.count; i++) {
@@ -912,30 +786,20 @@ void WindowsCaptureDevice::messageHandler() {
 	CoTaskMemFree(param.ppDevices); // Null pointer is okay.
 	lock2.unlock();
 
-	MFShutdown();
-	CoUninitialize();
-
-	updateState(CAPTUREDEVIDE_STATE::SHUTDOWN);
+	updateState(CAPTUREDEVICE_STATE::SHUTDOWN);
 }
 
 HRESULT WindowsCaptureDevice::enumDevices() {
 	HRESULT hr = S_OK;
-	IMFAttributes *pAttributes = nullptr;
+	ComPtr<IMFAttributes> pAttributes;
 
-	hr = MFCreateAttributes(&pAttributes, 1);
+	hr = MFAPI::CreateAttributes(&pAttributes, 1);
 	if (SUCCEEDED(hr)) {
 		switch (type) {
-		case CAPTUREDEVIDE_TYPE::VIDEO:
+		case CAPTUREDEVICE_TYPE::VIDEO:
 			hr = pAttributes->SetGUID(
 				MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
 				MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
-			);
-
-			break;
-		case CAPTUREDEVIDE_TYPE::AUDIO:
-			hr = pAttributes->SetGUID(
-				MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-				MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID
 			);
 
 			break;
@@ -945,18 +809,10 @@ HRESULT WindowsCaptureDevice::enumDevices() {
 		}
 	}
 	if (SUCCEEDED(hr)) {
-		hr = EnumDeviceSources(pAttributes, &param.ppDevices, &param.count);
+		hr = MFAPI::EnumDeviceSources(pAttributes.Get(), &param.ppDevices, &param.count);
 	}
 
-	SafeRelease(&pAttributes);
 	return hr;
-}
-
-bool WindowsCaptureDevice::needResample() {
-	return deviceParam.sampleRate    != targetMediaParam.sampleRate     || 
-		   deviceParam.channels      != targetMediaParam.channels       || 
-		   deviceParam.audioFormat   != targetMediaParam.audioFormat    ||
-		   deviceParam.bitsPerSample != targetMediaParam.bitsPerSample;
 }
 
 //-----------------------------------------------------------------------------
@@ -988,7 +844,7 @@ HRESULT GetDefaultStride(IMFMediaType *pType, LONG *plStride)
 		}
 		if (SUCCEEDED(hr))
 		{
-			hr = GetStrideForBitmapInfoHeader(subtype.Data1, width, &lStride);
+			hr = MFAPI::GetStrideForBitmapInfoHeader(subtype.Data1, width, &lStride);
 		}
 
 		// Set the attribute for later reference.

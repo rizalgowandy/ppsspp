@@ -25,14 +25,14 @@
 #include <vector>
 #include <queue>
 #include <thread>
+#include <wrl/client.h>
 
-#include "Core/HLE/sceUsbMic.h"
+#include "Common/CommonTypes.h"
 
 #ifdef __cplusplus
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libswscale/swscale.h"
-#include "libswresample/swresample.h"
 #include "libavutil/imgutils.h"
 }
 #endif // __cplusplus
@@ -42,18 +42,11 @@ struct VideoFormatTransform {
 	AVPixelFormat AVVideoFormat;
 };
 
-struct AudioFormatTransform {
-	GUID MFAudioFormat;
-	u32 bitsPerSample;
-	AVSampleFormat AVAudioFormat;
-};
-
-enum class CAPTUREDEVIDE_TYPE {
+enum class CAPTUREDEVICE_TYPE {
 	VIDEO,
-	AUDIO
 };
 
-enum class CAPTUREDEVIDE_STATE {
+enum class CAPTUREDEVICE_STATE {
 	UNINITIALIZED,
 	LOST,
 	STOPPED,
@@ -61,15 +54,14 @@ enum class CAPTUREDEVIDE_STATE {
 	SHUTDOWN
 };
 
-enum class CAPTUREDEVIDE_COMMAND {
-	INITIALIZE,
+enum class CAPTUREDEVICE_COMMAND {
 	START,
 	STOP,
 	SHUTDOWN,
 	UPDATE_STATE
 };
 
-enum CAPTUREDEVIDE_ERROR {
+enum CAPTUREDEVICE_ERROR {
 	CAPTUREDEVIDE_ERROR_NO_ERROR,
 	CAPTUREDEVIDE_ERROR_UNKNOWN_TYPE = 0x80000001,
 	CAPTUREDEVIDE_ERROR_INIT_FAILED,
@@ -78,8 +70,8 @@ enum CAPTUREDEVIDE_ERROR {
 	CAPTUREDEVIDE_ERROR_GETNAMES_FAILED
 };
 
-struct CAPTUREDEVIDE_MESSAGE{
-	CAPTUREDEVIDE_COMMAND command;
+struct CAPTUREDEVICE_MESSAGE {
+	CAPTUREDEVICE_COMMAND command;
 	void *opacity;
 };
 
@@ -96,12 +88,6 @@ union MediaParam {
 		LONG   default_stride;
 		GUID   videoFormat;
 	};
-	struct  {
-		UINT32 sampleRate;
-		UINT32 channels;
-		LONG bitsPerSample;
-		GUID   audioFormat;
-	};
 };
 
 template <class T> void SafeRelease(T **ppT) {
@@ -116,12 +102,12 @@ class WindowsCaptureDevice;
 class ReaderCallback final : public IMFSourceReaderCallback {
 public:
 	ReaderCallback(WindowsCaptureDevice *device);
-	~ReaderCallback();
+	virtual ~ReaderCallback();
 
 	// IUnknown methods.
-	STDMETHODIMP QueryInterface(REFIID iid, void** ppv);
-	STDMETHODIMP_(ULONG) AddRef() { return 0; }  // Unused, just define.
-	STDMETHODIMP_(ULONG) Release() { return 0; } // Unused, just define.
+	STDMETHODIMP QueryInterface(REFIID iid, void** ppv) override;
+	STDMETHODIMP_(ULONG) AddRef() override { return 0; }  // Unused, just define.
+	STDMETHODIMP_(ULONG) Release() override { return 0; } // Unused, just define.
 
 	// IMFSourceReaderCallback methods.
 	STDMETHODIMP OnReadSample(
@@ -130,13 +116,12 @@ public:
 		DWORD dwStreamFlags,
 		LONGLONG llTimestamp,
 		IMFSample *pSample   // Can be null,even if hrStatus is success.
-	);
+	) override;
 
-	STDMETHODIMP OnEvent(DWORD, IMFMediaEvent *) { return S_OK; }
-	STDMETHODIMP OnFlush(DWORD) { return S_OK; }
+	STDMETHODIMP OnEvent(DWORD, IMFMediaEvent *) override { return S_OK; }
+	STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
 
 	AVPixelFormat getAVVideoFormatbyMFVideoFormat(const GUID &MFVideoFormat);
-	AVSampleFormat getAVAudioFormatbyMFAudioFormat(const GUID &MFAudioFormat, const u32 &bitsPerSample);
 
 	/*
 	 * Always convert the image to RGB24
@@ -159,100 +144,85 @@ public:
 	void imgInvertYUY2(unsigned char *dst, int &dstStride, unsigned char *src, const int &srcStride, const int &h);
 	void imgInvertNV12(unsigned char *dst, int &dstStride, unsigned char *src, const int &srcStride, const int &h);
 
-	/*
-	 * Always resample to uncompressed signed 16bits
-	 * @param dst pointer to pointer of dst buffer could be a nullptr, would be overwritten by a new pointer if space too small or a nullptr, should be freed by av_free/av_freep by caller
-	 * @param dstSize pointer to size of the dst buffer, could be modified after this func
-	 * @param srcFormat MF_MT_SUBTYPE attribute of the source audio data
-	 * @param srcSize size of valid data in the source buffer, in bytes
-	 * @return size of output in bytes 
-	 */
-	u32 doResample(u8 **dst, u32 &dstSampleRate, u32 &dstChannels, u32 *dstSize, u8 *src, const u32 &srcSampleRate, const u32 &srcChannels, const GUID &srcFormat, const u32 &srcSize, const u32& srcBitsPerSamples);
-
 protected:
 	WindowsCaptureDevice *device;
 	SwsContext *img_convert_ctx = nullptr;
-	SwrContext *resample_ctx = nullptr;
 };
 
 class WindowsCaptureDevice {
 public:
-	WindowsCaptureDevice(CAPTUREDEVIDE_TYPE type);
+	WindowsCaptureDevice(CAPTUREDEVICE_TYPE type);
 	~WindowsCaptureDevice();
 
 	void CheckDevices();
 
-	bool init();
 	bool start(void *startParam);
 	bool stop();
 
-	CAPTUREDEVIDE_ERROR getError() const { return error; }
+	CAPTUREDEVICE_ERROR getError() const { return error; }
 	std::string getErrorMessage() const { return errorMessage; }
 	int getDeviceCounts() const { return param.count; }
 	// Get a list contained friendly device name.
 	std::vector<std::string> getDeviceList(bool forceEnum = false, int *pActuallCount = nullptr);
 
-	void setError(const CAPTUREDEVIDE_ERROR &newError, const std::string &newErrorMessage) { error = newError; errorMessage = newErrorMessage; }
-	void setSelction(const UINT32 &selection) { param.selection = selection; }
+	void setError(const CAPTUREDEVICE_ERROR &newError, const std::string &newErrorMessage) { error = newError; errorMessage = newErrorMessage; }
+	void setSelection(const UINT32 &selection) { param.selection = selection; }
 	HRESULT setDeviceParam(IMFMediaType *pType);
 
-	bool isShutDown() const { return state == CAPTUREDEVIDE_STATE::SHUTDOWN; }
-	bool isStarted() const { return state == CAPTUREDEVIDE_STATE::STARTED; }
+	bool isShutDown() const { return state == CAPTUREDEVICE_STATE::SHUTDOWN; }
+	bool isStarted() const { return state == CAPTUREDEVICE_STATE::STARTED; }
 	void waitShutDown();
 
-	void sendMessage(CAPTUREDEVIDE_MESSAGE message);
-	CAPTUREDEVIDE_MESSAGE getMessage();
+	void sendMessage(CAPTUREDEVICE_MESSAGE message);
+	CAPTUREDEVICE_MESSAGE getMessage();
 
 	HRESULT enumDevices();
-
-	bool needResample();
 
 	friend class ReaderCallback;
 
 protected:
-	void updateState(const CAPTUREDEVIDE_STATE &newState);
+	void updateState(const CAPTUREDEVICE_STATE &newState);
 	// Handle message here.
 	void messageHandler();
 
-	CAPTUREDEVIDE_TYPE type;
+	CAPTUREDEVICE_TYPE type;
 	MediaParam deviceParam;
 	MediaParam targetMediaParam;
-	CAPTUREDEVIDE_STATE state;
+	CAPTUREDEVICE_STATE state;
 	ChooseDeviceParam param;
 
-	CAPTUREDEVIDE_ERROR error;
+	CAPTUREDEVICE_ERROR error;
 	std::string errorMessage;
 
 	bool isDeviceChanged = false;
 
-// MF interface.
-	ReaderCallback *m_pCallback = nullptr;
-	IMFSourceReader *m_pReader = nullptr;
-	IMFMediaSource *m_pSource = nullptr;
+	// MF interface.
+	Microsoft::WRL::ComPtr<ReaderCallback> m_pCallback;
+	Microsoft::WRL::ComPtr<IMFSourceReader> m_pReader;
+	Microsoft::WRL::ComPtr<IMFMediaSource> m_pSource;
 
-// Message loop.
+	// Message loop.
 	std::mutex mutex;
 	std::condition_variable cond;
-	std::queue<CAPTUREDEVIDE_MESSAGE> messageQueue;
+	std::queue<CAPTUREDEVICE_MESSAGE> messageQueue;
 
-// For the shutdown event safety.
+	// For the shutdown event safety.
 	std::mutex sdMutex;
 
-// Param updating synchronously.
+	// Param updating synchronously.
 	std::mutex paramMutex;
 	std::mutex stateMutex_;
 	std::condition_variable stateCond_;
 
-// Camera only
 	unsigned char *imageRGB = nullptr;
 	int imgRGBLineSizes[4]{};
 	unsigned char *imageJpeg = nullptr;
 	int imgJpegSize = 0;
 
-//Microphone only
-	u8 *resampleBuf = nullptr;
-	u32 resampleBufSize = 0;
+	std::thread thread_;
 };
 
 extern WindowsCaptureDevice *winCamera;
-extern WindowsCaptureDevice *winMic;
+
+bool RegisterCMPTMFApis();
+bool UnRegisterCMPTMFApis();

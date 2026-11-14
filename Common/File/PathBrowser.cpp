@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <cstring>
 #include <set>
 
@@ -8,20 +7,28 @@
 #include "Common/Net/URL.h"
 
 #include "Common/File/PathBrowser.h"
+#include "Common/File/FileUtil.h"
+#include "Common/File/DirListing.h"
 #include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
 #include "Common/Log.h"
 #include "Common/Thread/ThreadUtil.h"
 
-#include "Core/System.h"
+#if PPSSPP_PLATFORM(ANDROID)
+#include "android/jni/app-android.h"
+#endif
 
-bool LoadRemoteFileList(const std::string &url, bool *cancel, std::vector<FileInfo> &files) {
-	http::Client http;
+static bool LoadRemoteFileList(const Path &url, std::string_view userAgent, bool *cancel, std::vector<File::FileInfo> &files) {
+	_dbg_assert_(url.Type() == PathType::HTTP);
+
+	http::Client http(nullptr);
 	Buffer result;
 	int code = 500;
 	std::vector<std::string> responseHeaders;
 
-	Url baseURL(url);
+	http.SetUserAgent(userAgent);
+
+	Url baseURL(url.ToString());
 	if (!baseURL.Valid()) {
 		return false;
 	}
@@ -29,7 +36,9 @@ bool LoadRemoteFileList(const std::string &url, bool *cancel, std::vector<FileIn
 	// Start by requesting the list of files from the server.
 	if (http.Resolve(baseURL.Host().c_str(), baseURL.Port())) {
 		if (http.Connect(2, 20.0, cancel)) {
-			code = http.GET(baseURL.Resource().c_str(), &result, responseHeaders);
+			http::RequestParams req(baseURL.Resource(), "text/plain, text/html; q=0.9, */*; q=0.8");
+			net::RequestProgress progress(cancel);
+			code = http.GET(req, &result, responseHeaders, &progress);
 			http.Disconnect();
 		}
 	}
@@ -42,10 +51,11 @@ bool LoadRemoteFileList(const std::string &url, bool *cancel, std::vector<FileIn
 	std::vector<std::string> items;
 	result.TakeAll(&listing);
 
+	constexpr std::string_view ContentTypeHeader = "Content-Type:";
 	std::string contentType;
 	for (const std::string &header : responseHeaders) {
-		if (startsWithNoCase(header, "Content-Type:")) {
-			contentType = header.substr(strlen("Content-Type:"));
+		if (startsWithNoCase(header, ContentTypeHeader)) {
+			contentType = header.substr(ContentTypeHeader.size());
 			// Strip any whitespace (TODO: maybe move this to stringutil?)
 			contentType.erase(0, contentType.find_first_not_of(" \t\r\n"));
 			contentType.erase(contentType.find_last_not_of(" \t\r\n") + 1);
@@ -64,102 +74,82 @@ bool LoadRemoteFileList(const std::string &url, bool *cancel, std::vector<FileIn
 		// Try to extract from an automatic webserver directory listing...
 		GetQuotedStrings(listing, items);
 	} else {
-		ERROR_LOG(IO, "Unsupported Content-Type: %s", contentType.c_str());
+		ERROR_LOG(Log::IO, "Unsupported Content-Type: %s", contentType.c_str());
 		return false;
 	}
-
-	for (std::string item : items) {
+	Path basePath(baseURL.ToString());
+	for (auto &item : items) {
 		// Apply some workarounds.
 		if (item.empty())
 			continue;
-		if (item.back() == '\r')
+		if (item.back() == '\r') {
 			item.pop_back();
+			if (item.empty())
+				continue;
+		}
 		if (item == baseURL.Resource())
 			continue;
 
-		FileInfo info;
+		File::FileInfo info;
+		if (item.back() == '/') {
+			item.pop_back();
+			if (item.empty())
+				continue;
+			info.isDirectory = true;
+		} else {
+			info.isDirectory = false;
+		}
 		info.name = item;
-		info.fullName = baseURL.Relative(item).ToString();
-		info.isDirectory = endsWith(item, "/");
+		info.fullName = basePath / item;
 		info.exists = true;
 		info.size = 0;
 		info.isWritable = false;
-
 		files.push_back(info);
 	}
 
 	return !files.empty();
 }
 
-std::vector<FileInfo> ApplyFilter(std::vector<FileInfo> files, const char *filter) {
-	std::set<std::string> filters;
-	if (filter) {
-		std::string tmp;
-		while (*filter) {
-			if (*filter == ':') {
-				filters.insert(std::move(tmp));
-			} else {
-				tmp.push_back(*filter);
-			}
-			filter++;
-		}
-		if (!tmp.empty())
-			filters.insert(std::move(tmp));
-	}
-
-	auto pred = [&](const FileInfo &info) {
-		if (info.isDirectory || !filter)
-			return false;
-		std::string ext = getFileExtension(info.fullName);
-		return filters.find(ext) == filters.end();
-	};
-	files.erase(std::remove_if(files.begin(), files.end(), pred), files.end());
-	return files;
-}
-
 PathBrowser::~PathBrowser() {
-	std::unique_lock<std::mutex> guard(pendingLock_);
-	pendingCancel_ = true;
-	pendingStop_ = true;
-	pendingCond_.notify_all();
-	guard.unlock();
-
+	{
+		std::unique_lock<std::mutex> guard(pendingLock_);
+		pendingCancel_ = true;
+		pendingStop_ = true;
+		listingAbort_ = true;
+		pendingCond_.notify_all();
+	}
 	if (pendingThread_.joinable()) {
 		pendingThread_.join();
 	}
 }
 
-// Normalize slashes.
-void PathBrowser::SetPath(const std::string &path) {
-	if (path[0] == '!') {
-		path_ = path;
-		HandlePath();
-		return;
-	}
+void PathBrowser::SetPath(const Path &path) {
+	std::lock_guard<std::mutex> guard(pendingLock_);
 	path_ = path;
-	for (size_t i = 0; i < path_.size(); i++) {
-		if (path_[i] == '\\') path_[i] = '/';
-	}
-	if (!path_.size() || (path_[path_.size() - 1] != '/'))
-		path_ += "/";
+	ApplyRestriction();
 	HandlePath();
 }
 
+void PathBrowser::RestrictToRoot(const Path &root) {
+	VERBOSE_LOG(Log::IO, "Restricting to root: %s", root.c_str());
+	std::lock_guard<std::mutex> guard(pendingLock_);
+	restrictedRoot_ = root;
+}
+
 void PathBrowser::HandlePath() {
-	if (!path_.empty() && path_[0] == '!') {
-		if (pendingActive_)
-			ResetPending();
-		ready_ = true;
-		return;
+	// Asking for the path that's being listed again shouldn't restart it.
+	if (path_ != pendingPath_) {
+		listingAbort_ = true;
 	}
-	if (!startsWith(path_, "http://") && !startsWith(path_, "https://")) {
-		if (pendingActive_)
-			ResetPending();
+	if (!path_.empty() && path_.ToString()[0] == '!') {
+		if (pendingActive_) {
+			pendingCancel_ = true;
+			pendingPath_.clear();
+		}
 		ready_ = true;
 		return;
 	}
 
-	std::lock_guard<std::mutex> guard(pendingLock_);
 	ready_ = false;
 	pendingActive_ = true;
 	pendingCancel_ = false;
@@ -170,27 +160,51 @@ void PathBrowser::HandlePath() {
 	if (pendingThread_.joinable())
 		return;
 
-	pendingThread_ = std::thread([&] {
-		setCurrentThreadName("PathBrowser");
+	pendingThread_ = std::thread([this] {
+		SetCurrentThreadName("PathBrowser");
+
+		AndroidJNIThreadContext jniContext;  // destructor detaches
 
 		std::unique_lock<std::mutex> guard(pendingLock_);
-		std::vector<FileInfo> results;
-		std::string lastPath;
+		std::vector<File::FileInfo> results;
+		Path lastPath("NONSENSE THAT WONT EQUAL A PATH");
 		while (!pendingStop_) {
 			while (lastPath == pendingPath_ && !pendingCancel_) {
 				pendingCond_.wait(guard);
 			}
+			if (pendingStop_) {
+				break;
+			}
 			lastPath = pendingPath_;
-			bool success = false;
-			if (!lastPath.empty()) {
+			listingAbort_ = false;
+			if (lastPath.Type() == PathType::HTTP) {
+				std::string userAgentCopy = userAgent_;
 				guard.unlock();
 				results.clear();
-				success = LoadRemoteFileList(lastPath, &pendingCancel_, results);
+				bool tempSuccess = LoadRemoteFileList(lastPath, userAgentCopy, &pendingCancel_, results);
 				guard.lock();
+				success_ = tempSuccess;
+			} else if (lastPath.empty()) {
+				results.clear();
+				success_ = true;
+			} else {
+				guard.unlock();
+				results.clear();
+				bool tempSuccess = File::GetFilesInDir(lastPath, &results, nullptr, 0, std::string_view(), &listingAbort_);
+				guard.lock();
+				if (listingAbort_) {
+					// We navigated away, maybe and back again, in which case this lists it again.
+					lastPath.clear();
+					continue;
+				}
+				success_ = tempSuccess;
+				if (!success_) {
+					WARN_LOG(Log::IO, "PathBrowser: Failed to list directory: %s", lastPath.c_str());
+				}
 			}
 
 			if (pendingPath_ == lastPath) {
-				if (success && !pendingCancel_) {
+				if (success_ && !pendingCancel_) {
 					pendingFiles_ = results;
 				}
 				pendingPath_.clear();
@@ -201,121 +215,56 @@ void PathBrowser::HandlePath() {
 	});
 }
 
-void PathBrowser::ResetPending() {
-	std::lock_guard<std::mutex> guard(pendingLock_);
-	pendingCancel_ = true;
-	pendingPath_.clear();
-}
-
-bool PathBrowser::IsListingReady() {
-	return ready_;
-}
-
-std::string PathBrowser::GetFriendlyPath() const {
-	std::string str = GetPath();
-	// Show relative to memstick root if there.
-	std::string root = GetSysDirectory(DIRECTORY_MEMSTICK_ROOT);
-	for (size_t i = 0; i < root.size(); i++) {
-		if (root[i] == '\\')
-			root[i] = '/';
-	}
-
-	if (startsWith(str, root)) {
-		return std::string("ms:/") + str.substr(root.size());
-	}
-
-#if PPSSPP_PLATFORM(LINUX) || PPSSPP_PLATFORM(MAC)
-	char *home = getenv("HOME");
-	if (home != nullptr && !strncmp(str.c_str(), home, strlen(home))) {
-		str = std::string("~") + str.substr(strlen(home));
-	}
-#endif
-	return str;
-}
-
-bool PathBrowser::GetListing(std::vector<FileInfo> &fileInfo, const char *filter, bool *cancel) {
+bool PathBrowser::GetListing(std::vector<File::FileInfo> &fileInfo, const char *extensionFilter, bool *cancel) {
 	std::unique_lock<std::mutex> guard(pendingLock_);
-	while (!IsListingReady() && (!cancel || !*cancel)) {
-		// In case cancel changes, just sleep.
+	while (!ready_ && (!cancel || !*cancel)) {
+		// In case cancel changes, just sleep. TODO: Replace with condition variable.
 		guard.unlock();
-		sleep_ms(100);
+		sleep_ms(50, "pathbrowser-poll");
 		guard.lock();
 	}
 
-#ifdef _WIN32
-	if (path_ == "/") {
-		// Special path that means root of file system.
-		std::vector<std::string> drives = getWindowsDrives();
-		for (auto drive = drives.begin(); drive != drives.end(); ++drive) {
-			if (*drive == "A:/" || *drive == "B:/")
-				continue;
-			FileInfo fake;
-			fake.fullName = *drive;
-			fake.name = *drive;
-			fake.isDirectory = true;
-			fake.exists = true;
-			fake.size = 0;
-			fake.isWritable = false;
-			fileInfo.push_back(fake);
-		}
-	}
-#endif
-
-	if (startsWith(path_, "http://") || startsWith(path_, "https://")) {
-		fileInfo = ApplyFilter(pendingFiles_, filter);
-		return true;
-	} else {
-		getFilesInDir(path_.c_str(), &fileInfo, filter);
-		return true;
-	}
-}
-
-bool PathBrowser::CanNavigateUp() {
-/* Leaving this commented out, not sure if there's a use in UWP for navigating up from the user data folder.
-#if PPSSPP_PLATFORM(UWP)
-	// Can't navigate up from memstick folder :(
-	if (path_ == GetSysDirectory(DIRECTORY_MEMSTICK_ROOT)) {
-		return false;
-	}
-#endif
-*/
-	if (path_ == "/" || path_ == "") {
-		return false;
-	}
+	fileInfo = ApplyFilter(pendingFiles_, extensionFilter, "");
 	return true;
 }
 
-void PathBrowser::NavigateUp() {
-	// Upwards.
-	// Check for windows drives.
-	if (path_.size() == 3 && path_[1] == ':') {
-		path_ = "/";
-	} else if (startsWith(path_, "http://") || startsWith(path_, "https://")) {
-		// You can actually pin "remote disc streaming" (which I didn't even realize until recently).
-		// This prevents you from getting the path browser into very weird states:
-		path_ = "/";
-		// It's ok to just go directly to root without more checking since remote disc streaming
-		// does not yet support folders.
-	} else {
-		size_t slash = path_.rfind('/', path_.size() - 2);
-		if (slash != std::string::npos)
-			path_ = path_.substr(0, slash + 1);
+void PathBrowser::ApplyRestriction() {
+	if (!path_.StartsWith(restrictedRoot_) && !startsWith(path_.ToString(), "!")) {
+		WARN_LOG(Log::IO, "Applying path restriction: %s (%s didn't match)", restrictedRoot_.c_str(), path_.c_str());
+		path_ = restrictedRoot_;
 	}
 }
 
-// TODO: Support paths like "../../hello"
-void PathBrowser::Navigate(const std::string &path) {
-	if (path == ".")
-		return;
-	if (path == "..") {
-		NavigateUp();
-	} else {
-		if (path.size() > 2 && path[1] == ':' && path_ == "/")
-			path_ = path;
-		else
-			path_ = path_ + path;
-		if (path_[path_.size() - 1] != '/')
-			path_ += "/";
+bool PathBrowser::CanNavigateUp() const {
+	std::unique_lock<std::mutex> guard(pendingLock_);
+	if (path_ == restrictedRoot_) {
+		return false;
 	}
+	return path_.CanNavigateUp();
+}
+
+void PathBrowser::NavigateUp() {
+	_dbg_assert_(CanNavigateUp());
+
+	std::unique_lock<std::mutex> guard(pendingLock_);
+	path_ = path_.NavigateUp();
+	ApplyRestriction();
+}
+
+// TODO: Support paths like "../../hello"
+void PathBrowser::Navigate(std::string_view path) {
+	std::unique_lock<std::mutex> guard(pendingLock_);
+	if (path == ".") {
+		// Same directory, nothing to do.
+		return;
+	}
+	if (path == "..") {
+		path_ = path_.NavigateUp();
+	} else if (path.size() >= 2 && path[1] == ':' && path_.IsRoot()) {
+		path_ = Path(path);
+	} else {
+		path_ = path_ / path;
+	}
+	ApplyRestriction();
 	HandlePath();
 }

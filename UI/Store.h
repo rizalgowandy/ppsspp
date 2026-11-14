@@ -23,7 +23,8 @@
 #include "Common/UI/ViewGroup.h"
 #include "Common/Net/HTTPClient.h"
 
-#include "UI/MiscScreens.h"
+#include "UI/BaseScreens.h"
+#include "UI/SimpleDialogScreen.h"
 
 // Game screen: Allows you to start a game, delete saves, delete the game,
 // set game specific settings, etc.
@@ -50,42 +51,40 @@ struct StoreEntry {
 	std::string description;
 	std::string author;
 	std::string iconURL;
-	std::string file;  // This is the folder name of the installed one too, and hence a "unique-ish" identifier.
+	std::string file;  // This is the folder name of the installed one too, and hence a "unique-ish" identifier. Also used as a-link on the license website, if !license.empty().
 	std::string category;
 	std::string downloadURL;  // Only set for games that are not hosted on store.ppsspp.org
+	std::string websiteURL;
+	std::string license;
 	bool hidden;
+	int contentRating;  // 100 means to hide it on iOS. No other values defined yet.
 	u64 size;
 };
 
-struct StoreFilter {
-	std::string categoryId;
-};
-
-class StoreScreen : public UIDialogScreenWithBackground {
+class StoreScreen : public UISimpleBaseDialogScreen {
 public:
 	StoreScreen();
 	~StoreScreen();
 
 	void update() override;
-	std::string tag() const override { return "store"; }
+	const char *tag() const override { return "Store"; }
 
 protected:
-	void CreateViews() override;
-	UI::EventReturn OnGameSelected(UI::EventParams &e);
-	UI::EventReturn OnRetry(UI::EventParams &e);
-	UI::EventReturn OnGameLaunch(UI::EventParams &e);
+	void CreateDialogViews(UI::ViewGroup *parent) override;
+	void OnGameSelected(UI::EventParams &e);
+	void OnRetry(UI::EventParams &e);
+	void OnGameLaunch(UI::EventParams &e);
 
+	std::string_view GetTitle() const override;
 private:
-	void SetFilter(const StoreFilter &filter);
-	void ParseListing(std::string json);
+	void StartListingDownload();
+	void ParseListing(const std::string &json);
 	ProductItemView *GetSelectedItem();
-	std::vector<StoreEntry> FilterEntries();
 
-	std::string GetStoreJsonURL(std::string storePath) const;
-	std::string GetTranslatedString(const json::JsonGet json, std::string key, const char *fallback = nullptr) const;
+	std::string GetTranslatedString(const json::JsonGet json, const std::string &key, const char *fallback = nullptr) const;
 
-	std::shared_ptr<http::Download> listing_;
-	std::shared_ptr<http::Download> image_;
+	std::shared_ptr<http::Request> listing_;
+	std::shared_ptr<http::Request> image_;
 
 	// TODO: Replace with a PathBrowser or similar. Though that one only supports
 	// local filesystems at the moment.
@@ -93,6 +92,7 @@ private:
 
 	bool loading_ = true;
 	bool connectionError_ = false;
+	int resultCode_ = 0;
 
 	std::map<std::string, StoreCategory> categories_;
 
@@ -100,12 +100,10 @@ private:
 	// for now. entries_ contains all the products in the store.
 	std::vector<StoreEntry> entries_;
 
-	StoreFilter filter_;
 	std::string lang_;
 	std::string lastSelectedName_;
 
-	UI::ViewGroup *scrollItemView_;
-	UI::ViewGroup *productPanel_;
-	UI::TextView *titleText_;
+	UI::ViewGroup *scrollItemView_ = nullptr;
+	UI::ViewGroup *productPanel_ = nullptr;
 };
 

@@ -21,19 +21,17 @@
 #include "Core/MemMap.h"
 #include "Core/Reporting.h"
 
-
-static u32 sceP3daBridgeInit(u32 channelsNum, u32 samplesNum)
-{
-	ERROR_LOG_REPORT(SCEAUDIO, "UNIMPL sceP3daBridgeInit(%08x, %08x)", channelsNum, samplesNum);
-	return 0;
+static u32 sceP3daBridgeInit(u32 channelsNum, u32 samplesNum) {
+	WARN_LOG(Log::sceAudio, "UNIMPL sceP3daBridgeInit(%08x, %08x)", channelsNum, samplesNum);
+	return hleNoLog(0);
 }
 
-static u32 sceP3daBridgeExit()
-{
-	ERROR_LOG_REPORT(SCEAUDIO, "UNIMPL sceP3daBridgeExit()");
-	return 0;
+static u32 sceP3daBridgeExit() {
+	WARN_LOG(Log::sceAudio, "UNIMPL sceP3daBridgeExit()");
+	return hleNoLog(0);
 }
 
+// Isn't this just a log2?
 static inline int getScaleValue(u32 channelsNum) {
 	int val = 0;
 	while (channelsNum > 1) {
@@ -43,16 +41,17 @@ static inline int getScaleValue(u32 channelsNum) {
 	return val;
 }
 
-static u32 sceP3daBridgeCore(u32 p3daCoreAddr, u32 channelsNum, u32 samplesNum, u32 inputAddr, u32 outputAddr)
-{
-	DEBUG_LOG(SCEAUDIO, "sceP3daBridgeCore(%08x, %08x, %08x, %08x, %08x)", p3daCoreAddr, channelsNum, samplesNum, inputAddr, outputAddr);
-	if (Memory::IsValidAddress(inputAddr) && Memory::IsValidAddress(outputAddr)) {
+// What is this??
+static u32 sceP3daBridgeCore(u32 p3daCoreAddr, u32 channelsNum, u32 samplesNum, u32 inputAddr, u32 outputAddr) {
+	// The sizes could wrap in 32 bits.
+	if ((u64)channelsNum * 4 <= 0xFFFFFFFF && (u64)samplesNum * sizeof(s16) * 2 <= 0xFFFFFFFF &&
+		Memory::IsValidRange(inputAddr, channelsNum * 4) && Memory::IsValidRange(outputAddr, samplesNum * sizeof(s16) * 2)) {
 		int scaleval = getScaleValue(channelsNum);
-		s16_le *outbuf = (s16_le *)Memory::GetPointer(outputAddr);
+		s16_le *outbuf = (s16_le *)Memory::GetPointerWriteUnchecked(outputAddr);
 		memset(outbuf, 0, samplesNum * sizeof(s16) * 2);
 		for (u32 k = 0; k < channelsNum; k++) {
-			u32 inaddr = Memory::Read_U32(inputAddr + k * 4);
-			const s16 *inbuf = (const s16 *)Memory::GetPointer(inaddr);
+			u32 inaddr = Memory::ReadUnchecked_U32(inputAddr + k * 4);
+			const s16 *inbuf = (const s16 *)Memory::GetPointerUnchecked(inaddr);
 			if (!inbuf)
 				continue;
 			for (u32 i = 0; i < samplesNum; i++) {
@@ -63,17 +62,15 @@ static u32 sceP3daBridgeCore(u32 p3daCoreAddr, u32 channelsNum, u32 samplesNum, 
 		}
 	}
 	// same as sas core
-	return hleDelayResult(0, "p3da core", 240);
+	return hleDelayResult(hleLogDebug(Log::sceAudio, 0), "p3da core", 240);
 }
 
-const HLEFunction sceP3da[] =
-{
+const HLEFunction sceP3da[] = {
 	{0X374500A5, &WrapU_UU<sceP3daBridgeInit>,       "sceP3daBridgeInit", 'x', "xx"   },
 	{0X43F756A2, &WrapU_V<sceP3daBridgeExit>,        "sceP3daBridgeExit", 'x', ""     },
 	{0X013016F3, &WrapU_UUUUU<sceP3daBridgeCore>,    "sceP3daBridgeCore", 'x', "xxxxx"},
 };
 
-void Register_sceP3da()
-{
-	RegisterModule("sceP3da", ARRAY_SIZE(sceP3da), sceP3da);
+void Register_sceP3da() {
+	RegisterHLEModule("sceP3da", ARRAY_SIZE(sceP3da), sceP3da);
 }

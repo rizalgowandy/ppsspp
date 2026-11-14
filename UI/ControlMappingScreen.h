@@ -19,122 +19,175 @@
 
 #include <functional>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <vector>
+#include <string>
 
 #include "Common/UI/View.h"
 #include "Common/UI/UIScreen.h"
-
+#include "Common/UI/PopupScreens.h"
 #include "Common/Data/Text/I18n.h"
-#include "UI/MiscScreens.h"
 
-class ControlMapper;
+#include "Core/ControlMapper.h"
 
-class ControlMappingScreen : public UIDialogScreenWithBackground {
+#include "UI/BaseScreens.h"
+#include "UI/TabbedDialogScreen.h"
+#include "UI/SimpleDialogScreen.h"
+
+class SingleControlMapper;
+
+class ControlMappingScreen : public UITwoPaneBaseDialogScreen {
 public:
-	ControlMappingScreen() {}
-	void KeyMapped(int pspkey);  // Notification to let us refocus the same one after recreating views.
-	std::string tag() const override { return "control mapping"; }
-
-protected:
-	virtual void CreateViews() override;
-private:
-	UI::EventReturn OnDefaultMapping(UI::EventParams &params);
-	UI::EventReturn OnClearMapping(UI::EventParams &params);
-	UI::EventReturn OnAutoConfigure(UI::EventParams &params);
-	UI::EventReturn OnTestAnalogs(UI::EventParams &params);
-
-	virtual void dialogFinished(const Screen *dialog, DialogResult result) override;
-
-	UI::ScrollView *rightScroll_;
-	std::vector<ControlMapper *> mappers_;
-};
-
-class KeyMappingNewKeyDialog : public PopupScreen {
-public:
-	explicit KeyMappingNewKeyDialog(int btn, bool replace, std::function<void(KeyDef)> callback, std::shared_ptr<I18NCategory> i18n)
-		: PopupScreen(i18n->T("Map Key"), "Cancel", ""), callback_(callback), mapped_(false) {
-		pspBtn_ = btn;
+	ControlMappingScreen(const Path &gamePath) : UITwoPaneBaseDialogScreen(gamePath, TwoPaneFlags::SettingsInContextMenu | TwoPaneFlags::ContentsCanScroll | TwoPaneFlags::NoTopbarInLandscape) {
+		categoryToggles_[0] = true;
+		categoryToggles_[1] = true;
+		categoryToggles_[2] = true;
+		categoryToggles_[3] = false;
 	}
-
-	virtual bool key(const KeyInput &key) override;
-	virtual bool axis(const AxisInput &axis) override;
+	const char *tag() const override { return "ControlMapping"; }
 
 protected:
-	void CreatePopupContents(UI::ViewGroup *parent) override;
+	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateContentViews(UI::ViewGroup *parent) override;
+	void update() override;
 
-	virtual bool FillVertical() const override { return false; }
-	virtual bool ShowButtons() const override { return true; }
-	virtual void OnCompleted(DialogResult result) override {}
+	std::string_view GetTitle() const override;
 
 private:
-	int pspBtn_;
-	std::function<void(KeyDef)> callback_;
-	bool mapped_;  // Prevent double registrations
+	void OnAutoConfigure(UI::EventParams &params);
+
+	std::vector<SingleControlMapper *> mappers_;
+	int keyMapGeneration_ = -1;
+
+	bool categoryToggles_[10]{};
 };
 
-class KeyMappingNewMouseKeyDialog : public PopupScreen {
+class KeyMappingNewKeyDialog : public UI::PopupScreen {
 public:
-	explicit KeyMappingNewMouseKeyDialog(int btn, bool replace, std::function<void(KeyDef)> callback, std::shared_ptr<I18NCategory> i18n)
-		: PopupScreen(i18n->T("Map Mouse"), "", ""), callback_(callback), mapped_(false) {
-		pspBtn_ = btn;
+	explicit KeyMappingNewKeyDialog(int btn, bool replace, std::function<void(KeyMap::MultiInputMapping)> callback, I18NCat i18n)
+		: PopupScreen(T(i18n, "Map Key"), T(I18NCat::DIALOG, "Cancel")), pspBtn_(btn), callback_(callback) {}
+
+	const char *tag() const override { return "KeyMappingNewKey"; }
+
+	InputMode PassInputToMapper() const override {
+		return PopupScreen::PassInputToMapper() | InputMode::AllKeys;
 	}
-
-	virtual bool key(const KeyInput &key) override;
-	virtual bool axis(const AxisInput &axis) override;
-
-protected:
-	void CreatePopupContents(UI::ViewGroup *parent) override;
-
-	virtual bool FillVertical() const override { return false; }
-	virtual bool ShowButtons() const override { return true; }
-	virtual void OnCompleted(DialogResult result) override {}
-
-private:
-	int pspBtn_;
-	std::function<void(KeyDef)> callback_;
-	bool mapped_;  // Prevent double registrations
-};
-
-class AnalogTestScreen : public UIDialogScreenWithBackground {
-public:
-	AnalogTestScreen() {}
 
 	bool key(const KeyInput &key) override;
-	bool axis(const AxisInput &axis) override;
+	void axis(const AxisInput &axis) override;
+
+	void SetDelay(float t);
 
 protected:
-	virtual void CreateViews() override;
+	void CreatePopupContents(UI::ViewGroup *parent) override;
 
-	UI::TextView *lastKeyEvent_ = nullptr;
-	UI::TextView *lastLastKeyEvent_ = nullptr;
+	bool FillVertical() const override { return false; }
+	bool ShowButtons() const override { return true; }
+	void OnCompleted(DialogResult result) override {}
+
+private:
+	int pspBtn_;
+	std::function<void(KeyMap::MultiInputMapping)> callback_;
+
+	KeyMap::MultiInputMapping mapping_;
+
+	UI::View *comboMappingsNotEnabled_ = nullptr;
+
+	// We need to do our own detection for axis "keyup" here.
+	std::set<InputMapping> triggeredAxes_;
+
+	double delayUntil_ = 0.0f;
 };
 
-class TouchTestScreen : public UIDialogScreenWithBackground {
+class KeyMappingNewMouseKeyDialog : public UI::PopupScreen {
 public:
-	TouchTestScreen() {
-		for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-			touches_[i].id = -1;
-		}
+	KeyMappingNewMouseKeyDialog(int btn, bool replace, std::function<void(KeyMap::MultiInputMapping)> callback, I18NCat i18n)
+		: PopupScreen(T(i18n, "Map Mouse"), "", ""), callback_(callback) {}
+	~KeyMappingNewMouseKeyDialog() {
+		g_IsMappingMouseInput = false;
 	}
 
-	bool touch(const TouchInput &touch) override;
-	void render() override;
+	const char *tag() const override { return "KeyMappingNewMouseKey"; }
+
+	bool key(const KeyInput &key) override;
+	void axis(const AxisInput &axis) override;
 
 protected:
-	struct TrackedTouch {
-		int id;
-		float x;
-		float y;
-	};
-	enum {
-		MAX_TOUCH_POINTS = 10,
-	};
-	TrackedTouch touches_[MAX_TOUCH_POINTS]{};
+	void CreatePopupContents(UI::ViewGroup *parent) override;
 
+	bool FillVertical() const override { return false; }
+	bool ShowButtons() const override { return true; }
+	void OnCompleted(DialogResult result) override {}
+
+private:
+	std::function<void(KeyMap::MultiInputMapping)> callback_;
+	bool mapped_ = false;  // Prevent double registrations
+};
+
+class JoystickHistoryView;
+
+class AnalogCalibrationScreen : public UITwoPaneBaseDialogScreen, protected ControlListener {
+public:
+	AnalogCalibrationScreen(const Path &gamePath);
+	~AnalogCalibrationScreen();
+
+	void axis(const AxisInput &axis) override;
+
+	void update() override;
+
+	InputMode PassInputToMapper() const override {
+		return InputMode::Other | InputMode::Keyboard | InputMode::Mouse;
+	}
+
+	const char *tag() const override { return "AnalogSetup"; }
+
+protected:
+	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateContentViews(UI::ViewGroup *parent) override;
+
+	void SetPSPAnalog(int rotation, int stick, float x, float y) override;
+	void SetRawAnalog(int stick, float x, float y) override;
+
+	std::string_view GetTitle() const override;
+private:
+	void OnResetToDefaults(UI::EventParams &e);
+
+	float analogX_[2]{};
+	float analogY_[2]{};
+	float rawX_[2]{};
+	float rawY_[2]{};
+
+	JoystickHistoryView *stickView_[2]{};
+};
+
+class MockPSP;
+
+class VisualMappingScreen : public UIBaseDialogScreen {
+public:
+	// Places the controller picture from the screen bounds.
+	bool LimitContentArea() const override { return false; }
+	VisualMappingScreen(const Path &gamePath) : UIBaseDialogScreen(gamePath) {}
+
+	const char *tag() const override { return "VisualMapping"; }
+
+	bool key(const KeyInput &key) override;
+	void axis(const AxisInput &axis) override;
+
+protected:
 	void CreateViews() override;
 
-	UI::EventReturn OnImmersiveModeChange(UI::EventParams &e);
-	UI::EventReturn OnRenderingBackend(UI::EventParams &e);
-	UI::EventReturn OnRecreateActivity(UI::EventParams &e);
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+	void resized() override;
+
+private:
+	void OnMapButton(UI::EventParams &e);
+	void OnBindAll(UI::EventParams &e);
+	void HandleKeyMapping(const KeyMap::MultiInputMapping &key);
+	void MapNext(bool successive);
+
+	MockPSP *psp_ = nullptr;
+	int nextKey_ = 0;
+	int bindAll_ = -1;
+	bool replace_ = false;
 };

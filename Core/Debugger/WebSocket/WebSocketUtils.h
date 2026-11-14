@@ -33,8 +33,48 @@
 
 using namespace json;
 
+struct WebSocketClientInfo {
+	WebSocketClientInfo() = default;
+
+	std::string name;
+	std::string version;
+	std::map<std::string, bool> disallowed;
+	// Whether to send a "deferred" event for requests that only finish later. Off by default,
+	// and it has to stay that way: an extra message would break a client that correlates purely
+	// by ticket, or one that waits for the bare event name a resume or a button press answers
+	// with. See client.config.set.
+	bool acknowledgeDeferred = false;
+};
+
+// Sent, if the client asked for it, when a handler accepted a request but arranged to finish it
+// later - a resume, a step, a button held for some frames. Deliberately not named after the
+// request: the event that reports the actual outcome uses that name, and for input.buttons.press
+// it carries the same ticket too, so anything less distinct would be impossible to tell apart.
+struct DebuggerDeferredEvent {
+	DebuggerDeferredEvent(const char *n, const JsonGet data) : name(n) {
+		const JsonNode *value = data ? data.get("ticket") : nullptr;
+		if (value)
+			ticketRaw = json_stringify(value);
+	}
+
+	const char *name;
+	std::string ticketRaw;
+
+	operator std::string() const {
+		JsonWriter j;
+		j.begin();
+		j.writeString("event", "deferred");
+		j.writeString("for", name);
+		if (!ticketRaw.empty()) {
+			j.writeRaw("ticket", ticketRaw);
+		}
+		j.end();
+		return j.str();
+	}
+};
+
 struct DebuggerErrorEvent {
-	DebuggerErrorEvent(const std::string m, LogTypes::LOG_LEVELS l, const JsonGet data = JsonValue(JSON_NULL))
+	DebuggerErrorEvent(const std::string m, LogLevel l, const JsonGet data = JsonValue(JSON_NULL))
 		: message(m), level(l) {
 		// Need to format right away, before it's out of scope.
 		if (data) {
@@ -45,7 +85,7 @@ struct DebuggerErrorEvent {
 	}
 
 	std::string message;
-	LogTypes::LOG_LEVELS level;
+	LogLevel level;
 	std::string ticketRaw;
 
 	operator std::string() const {
@@ -53,7 +93,7 @@ struct DebuggerErrorEvent {
 		j.begin();
 		j.writeString("event", "error");
 		j.writeString("message", message);
-		j.writeInt("level", level);
+		j.writeInt("level", (int)level);
 		if (!ticketRaw.empty()) {
 			j.writeRaw("ticket", ticketRaw);
 		}
@@ -70,21 +110,25 @@ enum class DebuggerParamType {
 };
 
 struct DebuggerRequest {
-	DebuggerRequest(const char *n, net::WebSocketServer *w, const JsonGet &d)
-		: name(n), ws(w), data(d) {
+	DebuggerRequest(const char *n, net::WebSocketServer *w, const JsonGet &d, WebSocketClientInfo *client_info)
+		: name(n), ws(w), data(d), client(client_info) {
 	}
 
 	const char *name;
 	net::WebSocketServer *ws;
 	const JsonGet data;
+	WebSocketClientInfo *client;
 
 	void Fail(const std::string &message) {
-		ws->Send(DebuggerErrorEvent(message, LogTypes::LERROR, data));
+		ws->Send(DebuggerErrorEvent(message, LogLevel::LERROR, data));
 		responseSent_ = true;
 	}
 
 	bool HasParam(const char *name, bool ignoreNull = false);
 	bool ParamU32(const char *name, uint32_t *out, bool allowFloatBits = false, DebuggerParamType type = DebuggerParamType::REQUIRED);
+	// For quantities that don't fit in 32 bits, like emulated microseconds - JSON numbers are
+	// doubles anyway, which is exact well past any plausible session length.
+	bool ParamF64(const char *name, double *out, DebuggerParamType type = DebuggerParamType::REQUIRED);
 	bool ParamBool(const char *name, bool *out, DebuggerParamType type = DebuggerParamType::REQUIRED);
 	bool ParamString(const char *name, std::string *out, DebuggerParamType type = DebuggerParamType::REQUIRED);
 
@@ -108,6 +152,6 @@ public:
 };
 
 typedef std::function<void(DebuggerRequest &req)> DebuggerEventHandler;
-typedef std::unordered_map<std::string, DebuggerEventHandler> DebuggerEventHandlerMap;
+typedef std::unordered_map<std::string_view, DebuggerEventHandler> DebuggerEventHandlerMap;
 
 uint32_t RoundMemAddressUp(uint32_t addr);

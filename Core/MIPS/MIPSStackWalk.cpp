@@ -15,6 +15,7 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "Common/Log.h"
 #include "Core/MemMap.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
@@ -67,7 +68,7 @@ namespace MIPSStackWalk {
 		// It ought to be pretty close.
 		u32 stop = pc - 32 * 4;
 		for (; Memory::IsValidAddress(pc) && pc >= stop; pc -= 4) {
-			MIPSOpcode op = Memory::Read_Instruction(pc, true);
+			MIPSOpcode op = Memory::Read_Instruction(pc);
 
 			// We're looking for a "mov fp, sp" close by a "addiu sp, sp, -N".
 			if (IsMovRegsInstr(op) && _RD == MIPS_REG_FP && (_RS == MIPS_REG_SP || _RT == MIPS_REG_SP)) {
@@ -78,12 +79,21 @@ namespace MIPSStackWalk {
 	}
 
 	bool ScanForEntry(StackFrame &frame, u32 entry, u32 &ra) {
-		// Let's hope there are no > 1MB functions on the PSP, for the sake of humanity...
-		const u32 LONGEST_FUNCTION = 1024 * 1024;
+		// Let's hope there are no > 0.5MB functions on the PSP, for the sake of humanity...
+		const u32 LONGEST_FUNCTION = 1024 * 512;
 		// TODO: Check if found entry is in the same symbol?  Might be wrong sometimes...
 
+		if (entry != INVALIDTARGET && frame.pc == entry) {
+			// This happens when we're at the start of a function.  Our ra is already correct.
+			frame.entry = entry;
+			// This function may consume stack, but the frame hasn't used it yet.
+			frame.stackSize = 0;
+			return true;
+		}
+
 		int ra_offset = -1;
-		const u32 start = frame.pc;
+		// Start one instruction before the current frame pc, as that hasn't run yet.
+		const u32 start = frame.pc - 4;
 		u32 stop = entry;
 		if (entry == INVALIDTARGET) {
 			if (start >= PSP_GetUserMemoryBase()) {
@@ -94,11 +104,36 @@ namespace MIPSStackWalk {
 				stop = PSP_GetScratchpadMemoryBase();
 			}
 		}
+
+		if (!Memory::IsValidAddress(start)) {
+			return false;
+		}
+
 		if (stop < start - LONGEST_FUNCTION) {
 			stop = start - LONGEST_FUNCTION;
 		}
 		for (u32 pc = start; Memory::IsValidAddress(pc) && pc >= stop; pc -= 4) {
-			MIPSOpcode op = Memory::Read_Instruction(pc, true);
+			_dbg_assert_(Memory::IsValidAddress(pc));
+			MIPSOpcode op = Memory::Read_Instruction(pc);
+
+			// Without a symbol, a jr ra above any prologue is most likely the end of the function before
+			// this one, so this is a leaf that starts after its delay slot. Scanning on would pick up
+			// that function's prologue, and read a bogus ra from the stack. Only the innermost frame
+			// has ra in the register to fall back on.
+			// (Right above pc, it's this function's own return, with pc in its delay slot.)
+			if (entry == INVALIDTARGET && pc != start && op.encoding == MIPS_MAKE_JR_RA()) {
+				if (ra == INVALIDTARGET) {
+					return false;
+				}
+				// An ra between here and pc is a stale return from a call this function made, so this
+				// is an early return in the same function, and its prologue is further up.
+				if (ra > pc && ra <= frame.pc) {
+					continue;
+				}
+				frame.entry = pc + 8;
+				frame.stackSize = 0;
+				return true;
+			}
 
 			// Here's where they store the ra address.
 			if (IsSWInstr(op) && _RT == MIPS_REG_RA && _RS == MIPS_REG_SP) {
@@ -115,10 +150,13 @@ namespace MIPSStackWalk {
 					continue;
 				}
 
-				frame.entry = pc;
+				// The prologue often isn't the first instruction (a lui or move can come first), so
+				// the function's symbol, if it has one, gives the real entry.
+				const u32 symbolEntry = GuessEntry(pc);
+				frame.entry = symbolEntry != INVALIDTARGET ? symbolEntry : pc;
 				frame.stackSize = -_IMM16;
-				if (ra_offset != -1 && Memory::IsValidAddress(frame.sp + ra_offset)) {
-					ra = Memory::Read_U32(frame.sp + ra_offset);
+				if (ra_offset != -1 && Memory::IsValid4AlignedAddress(frame.sp + ra_offset)) {
+					ra = Memory::ReadUnchecked_U32(frame.sp + ra_offset);
 				}
 				return true;
 			}
@@ -147,8 +185,13 @@ namespace MIPSStackWalk {
 		}
 	}
 
-	std::vector<StackFrame> Walk(u32 pc, u32 ra, u32 sp, u32 threadEntry, u32 threadStackTop) {
+	std::vector<StackFrame> Walk(const u32 pc, u32 ra, u32 sp, const u32 threadEntry, u32 threadStackTop) {
 		std::vector<StackFrame> frames;
+
+		if (!Memory::IsValidAddress(pc) || !Memory::IsValidAddress(sp) || !Memory::IsValidAddress(ra)) {
+			return frames;
+		}
+
 		StackFrame current;
 		current.pc = pc;
 		current.sp = sp;
@@ -156,7 +199,11 @@ namespace MIPSStackWalk {
 		current.stackSize = -1;
 
 		u32 prevEntry = INVALIDTARGET;
-		while (pc != threadEntry) {
+		while (current.pc != threadEntry) {
+			if (!Memory::IsValidAddress(current.pc)) {
+				break;
+			}
+
 			u32 possibleEntry = GuessEntry(current.pc);
 			if (DetermineFrameInfo(current, possibleEntry, threadEntry, ra)) {
 				frames.push_back(current);

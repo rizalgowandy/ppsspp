@@ -1,5 +1,3 @@
-// NOTE: Apologies for the quality of this code, this is really from pre-opensource Dolphin - that is, 2003.
-
 #include "Windows/stdafx.h"
 #include <windowsx.h>
 #include <commctrl.h>
@@ -8,14 +6,16 @@
 #include "Common/Data/Encoding/Utf8.h"
 #include "Common/System/Display.h"
 
+#include "Core/Core.h"
 #include "Core/Debugger/MemBlockInfo.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/MIPS/MIPSDebugInterface.h"
+#include "Core/System.h"
 
 #include "Debugger_MemoryDlg.h"
 #include "CtrlMemView.h"
 #include "DebuggerShared.h"
-#include "LogManager.h"
+#include "Common/Log.h"
 #include "winnt.h"
 #include <WindowsX.h>
 #include <algorithm>
@@ -56,11 +56,11 @@ LRESULT CALLBACK AddressEditProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM 
 }
 
 
-CMemoryDlg::CMemoryDlg(HINSTANCE _hInstance, HWND _hParent, DebugInterface *_cpu) : Dialog((LPCSTR)IDD_MEMORY, _hInstance,_hParent)
+CMemoryDlg::CMemoryDlg(HINSTANCE _hInstance, HWND _hParent, MIPSDebugInterface *_cpu) : Dialog((LPCSTR)IDD_MEMORY, _hInstance,_hParent)
 {
 	cpu = _cpu;
 	wchar_t temp[256];
-	wsprintf(temp,L"Memory Viewer - %S",cpu->GetName());
+	wsprintf(temp,L"Memory Viewer - R4");
 	SetWindowText(m_hDlg,temp);
 
 	ShowWindow(m_hDlg,SW_HIDE);
@@ -117,11 +117,12 @@ void CMemoryDlg::Update(void)
 	}	
 }
 
-void CMemoryDlg::searchBoxRedraw(std::vector<u32> results) {
+void CMemoryDlg::searchBoxRedraw(const std::vector<u32> &results) {
 	wchar_t temp[256]{};
 	SendMessage(srcListHdl, WM_SETREDRAW, FALSE, 0);
 	ListBox_ResetContent(srcListHdl);
-	for (int i = 0; i < results.size(); i++) {
+	SendMessage(srcListHdl, LB_INITSTORAGE, (WPARAM)results.size(), (LPARAM)results.size() * 22);
+	for (size_t i = 0; i < results.size(); i++) {
 		wsprintf(temp, L"0x%08X", results[i]);
 		int index = (int)ListBox_AddString(srcListHdl, temp);
 		ListBox_SetItemData(srcListHdl, index, results[i]);
@@ -132,9 +133,19 @@ void CMemoryDlg::searchBoxRedraw(std::vector<u32> results) {
 
 
 void CMemoryDlg::NotifyMapLoaded() {
-	if (m_hDlg && g_symbolMap)
-		g_symbolMap->FillSymbolListBox(symListHdl, ST_DATA);
-	Update(); 
+	if (m_hDlg && g_symbolMap) {
+		// Reading the live symbol map here on the GUI thread would otherwise race with the CPU
+		// thread - hold g_frameMutex for the duration of the read, which NativeFrame() also holds
+		// while it's actually touching that state. See g_frameMutex in Core.h.
+		std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+		// Not while the loader thread is still adding symbols. BOOT_DONE sends another of these.
+		if (!PSP_IsBooting()) {
+			g_symbolMap->FillSymbolListBox(symListHdl, ST_DATA);
+		}
+	} else {
+		mapLoadPending_ = true;
+	}
+	Update();
 }
 
 BOOL CMemoryDlg::DlgProc(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -192,7 +203,7 @@ BOOL CMemoryDlg::DlgProc(UINT message, WPARAM wParam, LPARAM lParam) {
 			switch (HIWORD(wParam)) {
 			case BN_CLICKED:
 				GetWindowText(searchBoxHdl, temp, 255);
-				std::vector<u32> results = memView->searchString(ConvertWStringToUTF8(temp).c_str());
+				std::vector<u32> results = memView->searchString(ConvertWStringToUTF8(temp));
 				if (results.size() > 0){
 					searchBoxRedraw(results);
 				}
@@ -219,6 +230,13 @@ BOOL CMemoryDlg::DlgProc(UINT message, WPARAM wParam, LPARAM lParam) {
 	}
 
 	case WM_DEB_UPDATE:
+		if (mapLoadPending_ && m_hDlg && g_symbolMap) {
+			std::lock_guard<std::mutex> frameGuard(g_frameMutex);
+			if (!PSP_IsBooting()) {
+				g_symbolMap->FillSymbolListBox(symListHdl, ST_DATA);
+				mapLoadPending_ = false;
+			}
+		}
 		Update();
 		return TRUE;
 
@@ -250,7 +268,7 @@ void CMemoryDlg::Goto(u32 addr)
 
 void CMemoryDlg::Size()
 {
-	const float fontScale = 1.0f / g_dpi_scale_real_y;
+	const float fontScale = 1.0f / g_display.dpi_scale_real_y;
 
 	GetClientRect(m_hDlg,&winRect);
 	int dlg_w = winRect.right - winRect.left;

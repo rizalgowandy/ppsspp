@@ -23,52 +23,31 @@
 
 #include "ppsspp_config.h"
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <random>
 #include <signal.h>
 
-#if defined(HAVE_LIBNX) || PPSSPP_PLATFORM(SWITCH)
-#include <netdb.h>
-#include <switch.h>
-// Missing include, *shrugs*
-extern "C" struct hostent *gethostbyname(const char *name);
-#endif // defined(HAVE_LIBNX) || PPSSPP_PLATFORM(SWITCH)
-
-#if !defined(__APPLE__)
-#include <stdlib.h>
-#endif
-
 #include <sys/types.h>
-// Net stuff
-#if defined(_WIN32)
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#endif
-
-#include <fcntl.h>
-#include <errno.h>
-//#include <sqlite3.h>
-
-#ifndef MSG_NOSIGNAL
-// Default value to 0x00 (do nothing) in systems where it's not supported.
-#define MSG_NOSIGNAL 0x00
-#endif
-
+#include "Common/Net/SocketCompat.h"
 #include "Common/Data/Text/I18n.h"
 #include "Common/Thread/ThreadUtil.h"
+#include "Common/System/OSD.h"
 
 #include "Common/File/FileUtil.h"
 #include "Common/TimeUtil.h"
+#include "Common/Net/Resolve.h"
 #include "Core/Util/PortManager.h"
 #include "Core/Instance.h"
 #include "Core/Core.h"
-#include "Core/Host.h"
+#include "Core/Config.h"
 #include "Core/HLE/proAdhocServer.h"
+
+#ifdef _WIN32
+#undef errno
+#define errno WSAGetLastError()
+#endif
 
 // User Count
 uint32_t _db_user_count = 0;
@@ -80,8 +59,7 @@ SceNetAdhocctlUserNode * _db_user = NULL;
 SceNetAdhocctlGameNode * _db_game = NULL;
 
 // Server Status
-//int _status = 0;
-bool adhocServerRunning = false;
+std::atomic<bool> adhocServerRunning(false);
 std::thread adhocServerThread;
 
 // Crosslink database for cross region Adhoc play
@@ -369,6 +347,8 @@ static const db_productid default_productids[] = {
 	{ "ULES01432", "Full Metal Alchemist - Brotherhood" },
 	{ "ULUS10490", "GTA Chinatown Wars" },
 	{ "ULUS10160", "GTA Vice City Stories" },
+	{ "ULUS10041", "GTA Liberty City Stories" },
+	{ "ULES00151", "GTA Liberty City Stories" },
 	{ "ULUS10210", "Ghost Rider" },
 	{ "ULJS00237", "God Eater" },
 	{ "NPJH50832", "God Eater 2" },
@@ -487,6 +467,7 @@ static const db_productid default_productids[] = {
 	{ "ULJM05151", "Yu-Gi-Oh! GX Tag Force" },
 	{ "ULJM05373", "Yu-Gi-Oh! GX Tag Force 3" },
 	{ "NPUG80086", "flOw" },
+	// TODO? GTA 10160,beta,10041,00151
 };
 
 // Function Prototypes
@@ -518,16 +499,21 @@ void login_user_stream(int fd, uint32_t ip)
 	if(_db_user_count < SERVER_USER_MAXIMUM)
 	{
 		// Check IP Duplication
-		SceNetAdhocctlUserNode * u = _db_user;
-		while(u != NULL && u->resolver.ip != ip) u = u->next;
-
-		if (u != NULL) { // IP Already existed
-			WARN_LOG(SCENET, "AdhocServer: Already Existing IP: %s\n", ip2str(*(in_addr*)&u->resolver.ip).c_str());
+		int sameIP = 0;
+		for (SceNetAdhocctlUserNode *u = _db_user; u != NULL; u = u->next) {
+			if (u->resolver.ip == ip) {
+				sameIP++;
+			}
 		}
 
-		// Unique IP Address
-		else //if(u == NULL)
-		{
+		// Players sharing an IP (behind one NAT, or instances on one machine) are told apart by MAC
+		// through the relay. In P2P mode, only one of them can play.
+		if (sameIP > 0) {
+			INFO_LOG(Log::sceNet, "AdhocServer: Another user from IP %s", ip2str(*(in_addr*)&ip).c_str());
+		}
+
+		// Capped, so one host can't take every slot.
+		if (sameIP < SERVER_USER_MAXIMUM_PER_IP) {
 			// Allocate User Node Memory
 			SceNetAdhocctlUserNode * user = (SceNetAdhocctlUserNode *)malloc(sizeof(SceNetAdhocctlUserNode));
 
@@ -550,9 +536,10 @@ void login_user_stream(int fd, uint32_t ip)
 
 				// Initialize Death Clock
 				user->last_recv = time(NULL);
+				user->connected_at = user->last_recv;
 
 				// Notify User
-				INFO_LOG(SCENET, "AdhocServer: New Connection from %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
+				INFO_LOG(Log::sceNet, "AdhocServer: New Connection from %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
 
 				// Fix User Counter
 				_db_user_count++;
@@ -577,6 +564,9 @@ void login_user_stream(int fd, uint32_t ip)
  */
 void login_user_data(SceNetAdhocctlUserNode * user, SceNetAdhocctlLoginPacketC2S * data)
 {
+	// The client's nickname needn't be terminated, and it's printed with %s.
+	data->name.data[ADHOCCTL_NICKNAME_LEN - 1] = 0;
+
 	// Product Code Check
 	int valid_product_code = 1;
 
@@ -595,7 +585,7 @@ void login_user_data(SceNetAdhocctlUserNode * user, SceNetAdhocctlLoginPacketC2S
 		while (u != NULL && !IsMatch(u->resolver.mac, data->mac)) u = u->next;
 
 		if (u != NULL) { // MAC Already existed
-			WARN_LOG(SCENET, "AdhocServer: Already Existing MAC: %s [%s]\n", mac2str(&data->mac).c_str(), ip2str(*(in_addr*)&u->resolver.ip).c_str());
+			WARN_LOG(Log::sceNet, "AdhocServer: Already Existing MAC: %s [%s]\n", mac2str(&data->mac).c_str(), ip2str(*(in_addr*)&u->resolver.ip).c_str());
 		}
 
 		// Game Product Override
@@ -646,7 +636,7 @@ void login_user_data(SceNetAdhocctlUserNode * user, SceNetAdhocctlLoginPacketC2S
 			char safegamestr[10];
 			memset(safegamestr, 0, sizeof(safegamestr));
 			strncpy(safegamestr, game->game.data, PRODUCT_CODE_LENGTH);
-			INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) started playing %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
+			INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) started playing %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
 
 			// Update Status Log
 			update_status();
@@ -660,7 +650,7 @@ void login_user_data(SceNetAdhocctlUserNode * user, SceNetAdhocctlLoginPacketC2S
 	else
 	{
 		// Notify User
-		WARN_LOG(SCENET, "AdhocServer: Invalid Login Packet Contents from %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
+		WARN_LOG(Log::sceNet, "AdhocServer: Invalid Login Packet Contents from %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
 	}
 
 	// Logout User - Out of Memory or Invalid Arguments
@@ -695,7 +685,7 @@ void logout_user(SceNetAdhocctlUserNode * user)
 		char safegamestr[10];
 		memset(safegamestr, 0, sizeof(safegamestr));
 		strncpy(safegamestr, user->game->game.data, PRODUCT_CODE_LENGTH);
-		INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) stopped playing %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
+		INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) stopped playing %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
 
 		// Fix Game Player Count
 		user->game->playercount--;
@@ -721,7 +711,7 @@ void logout_user(SceNetAdhocctlUserNode * user)
 	else
 	{
 		// Notify User
-		WARN_LOG(SCENET, "AdhocServer: Dropped Connection to %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
+		WARN_LOG(Log::sceNet, "AdhocServer: Dropped Connection to %s", ip2str(*(in_addr*)&user->resolver.ip).c_str());
 	}
 
 	// Free Memory
@@ -833,6 +823,15 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 					// Copy Group Name
 					g->group = *group;
 
+					// A PSP group's BSSID is a locally administered address of its own, not a member's MAC. It
+					// stays when the creator leaves, and a group created again gets a new one (pspautotests
+					// net/adhoc/pair/lifecycle).
+					static std::mt19937 bssidRng(std::random_device{}());
+					for (int i = 0; i < ETHER_ADDR_LEN; i++) {
+						g->bssid.data[i] = (uint8_t)bssidRng();
+					}
+					g->bssid.data[0] = (g->bssid.data[0] & 0xFC) | 0x02;
+
 					// Increase Group Counter for Game
 					g->game->groupcount++;
 				}
@@ -864,8 +863,8 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 					packet.ip = user->resolver.ip;
 
 					// Send Data
-					int iResult = send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-					if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: connect_user[send peer] (Socket error %d)", errno);
+					int iResult = (int)send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+					if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: connect_user[send peer] (Socket error %d)", socket_errno);
 
 					// Set Player Name
 					packet.name = peer->resolver.name;
@@ -877,15 +876,14 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 					packet.ip = peer->resolver.ip;
 
 					// Send Data
-					iResult = send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-					if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: connect_user[send user] (Socket error %d)", errno);
-
-					// Set BSSID
-					if(peer->group_next == NULL) bssid.mac = peer->resolver.mac;
+					iResult = (int)send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+					if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: connect_user[send user] (Socket error %d)", socket_errno);
 
 					// Move Pointer
 					peer = peer->group_next;
 				}
+
+				bssid.mac = g->bssid;
 
 				// Link User to Group
 				user->group_next = g->player;
@@ -899,8 +897,8 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 				g->playercount++;
 
 				// Send Network BSSID to User
-				int iResult = send(user->stream, (const char*)&bssid, sizeof(bssid), MSG_NOSIGNAL);
-				if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: connect_user[send user bssid] (Socket error %d)", errno);
+				int iResult = (int)send(user->stream, (const char*)&bssid, sizeof(bssid), MSG_NOSIGNAL);
+				if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: connect_user[send user bssid] (Socket error %d)", socket_errno);
 
 				// Notify User
 				char safegamestr[10];
@@ -909,7 +907,7 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 				char safegroupstr[9];
 				memset(safegroupstr, 0, sizeof(safegroupstr));
 				strncpy(safegroupstr, (char *)user->group->group.data, ADHOCCTL_GROUPNAME_LEN);
-				INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) joined %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
+				INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) joined %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
 
 				// Update Status Log
 				update_status();
@@ -932,7 +930,7 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 			char safegroupstr2[9];
 			memset(safegroupstr2, 0, sizeof(safegroupstr2));
 			strncpy(safegroupstr2, (char *)user->group->group.data, ADHOCCTL_GROUPNAME_LEN);
-			WARN_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) attempted to join %s group %s without disconnecting from %s first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr, safegroupstr2);
+			WARN_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) attempted to join %s group %s without disconnecting from %s first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr, safegroupstr2);
 		}
 	}
 
@@ -946,7 +944,7 @@ void connect_user(SceNetAdhocctlUserNode * user, SceNetAdhocctlGroupName * group
 		char safegroupstr[9];
 		memset(safegroupstr, 0, sizeof(safegroupstr));
 		strncpy(safegroupstr, (char *)group->data, ADHOCCTL_GROUPNAME_LEN);
-		WARN_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) attempted to join invalid %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
+		WARN_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) attempted to join invalid %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
 	}
 
 	// Invalid State, Out of Memory or Invalid Group Name
@@ -991,8 +989,8 @@ void disconnect_user(SceNetAdhocctlUserNode * user)
 			packet.ip = user->resolver.ip;
 
 			// Send Data
-			int iResult = send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-			if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: disconnect_user[send peer] (Socket error %d)", errno);
+			int iResult = (int)send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+			if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: disconnect_user[send peer] (Socket error %d)", socket_errno);
 
 			// Move Pointer
 			peer = peer->group_next;
@@ -1005,7 +1003,7 @@ void disconnect_user(SceNetAdhocctlUserNode * user)
 		char safegroupstr[9];
 		memset(safegroupstr, 0, sizeof(safegroupstr));
 		strncpy(safegroupstr, (char *)user->group->group.data, ADHOCCTL_GROUPNAME_LEN);
-		INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) left %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
+		INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) left %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
 
 		// Empty Group
 		if(user->group->playercount == 0)
@@ -1045,7 +1043,7 @@ void disconnect_user(SceNetAdhocctlUserNode * user)
 		char safegamestr[10];
 		memset(safegamestr, 0, sizeof(safegamestr));
 		strncpy(safegamestr, user->game->game.data, PRODUCT_CODE_LENGTH);
-		WARN_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) attempted to leave %s group without joining one first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
+		WARN_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) attempted to leave %s group without joining one first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
 	}
 
 	// Delete User
@@ -1077,33 +1075,23 @@ void send_scan_results(SceNetAdhocctlUserNode * user)
 			// Set Group Name
 			packet.group = group->group;
 
-			// Iterate Players in Network Group
-			SceNetAdhocctlUserNode * peer = group->player;
-			for(; peer != NULL; peer = peer->group_next)
-			{
-				// Found Network Founder
-				if(peer->group_next == NULL)
-				{
-					// Set Group Host MAC
-					packet.mac = peer->resolver.mac;
-				}
-			}
+			packet.mac = group->bssid;
 
 			// Send Group Packet
-			int iResult = send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-			if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: send_scan_result[send user] (Socket error %d)", errno);
+			int iResult = (int)send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+			if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: send_scan_result[send user] (Socket error %d)", socket_errno);
 		}
 
 		// Notify Player of End of Scan
 		uint8_t opcode = OPCODE_SCAN_COMPLETE;
-		int iResult = send(user->stream, (const char*)&opcode, 1, MSG_NOSIGNAL);
-		if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: send_scan_result[send peer complete] (Socket error %d)", errno);
+		int iResult = (int)send(user->stream, (const char*)&opcode, 1, MSG_NOSIGNAL);
+		if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: send_scan_result[send peer complete] (Socket error %d)", socket_errno);
 
 		// Notify User
 		char safegamestr[10];
 		memset(safegamestr, 0, sizeof(safegamestr));
 		strncpy(safegamestr, user->game->game.data, PRODUCT_CODE_LENGTH);
-		INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) requested information on %d %s groups", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), user->game->groupcount, safegamestr);
+		INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) requested information on %d %s groups", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), user->game->groupcount, safegamestr);
 
 		// Exit Function
 		return;
@@ -1119,7 +1107,7 @@ void send_scan_results(SceNetAdhocctlUserNode * user)
 		char safegroupstr[9];
 		memset(safegroupstr, 0, sizeof(safegroupstr));
 		strncpy(safegroupstr, (char *)user->group->group.data, ADHOCCTL_GROUPNAME_LEN);
-		WARN_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) attempted to scan for %s groups without disconnecting from %s first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
+		WARN_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) attempted to scan for %s groups without disconnecting from %s first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr, safegroupstr);
 	}
 
 	// Delete User
@@ -1155,8 +1143,8 @@ void spread_message(SceNetAdhocctlUserNode *user, const char *message)
 				strcpy(packet.base.message, message);
 
 				// Send Data
-				int iResult = send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-				if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: spread_message[send user chat] (Socket error %d)", errno);
+				int iResult = (int)send(user->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+				if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: spread_message[send user chat] (Socket error %d)", socket_errno);
 			}
 		}
 
@@ -1185,7 +1173,7 @@ void spread_message(SceNetAdhocctlUserNode *user, const char *message)
 			}
 
 			// Chat Packet
-			SceNetAdhocctlChatPacketS2C packet;
+			SceNetAdhocctlChatPacketS2C packet{};
 
 			// Set Chat Opcode
 			packet.base.base.opcode = OPCODE_CHAT;
@@ -1197,8 +1185,8 @@ void spread_message(SceNetAdhocctlUserNode *user, const char *message)
 			packet.name = user->resolver.name;
 
 			// Send Data
-			int iResult = send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
-			if (iResult < 0) ERROR_LOG(SCENET, "AdhocServer: spread_message[send peer chat] (Socket error %d)", errno);
+			int iResult = (int)send(peer->stream, (const char*)&packet, sizeof(packet), MSG_NOSIGNAL);
+			if (iResult < 0) ERROR_LOG(Log::sceNet, "AdhocServer: spread_message[send peer chat] (Socket error %d)", socket_errno);
 
 			// Move Pointer
 			peer = peer->group_next;
@@ -1217,7 +1205,7 @@ void spread_message(SceNetAdhocctlUserNode *user, const char *message)
 			char safegroupstr[9];
 			memset(safegroupstr, 0, sizeof(safegroupstr));
 			strncpy(safegroupstr, (char *)user->group->group.data, ADHOCCTL_GROUPNAME_LEN);
-			INFO_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) sent \"%s\" to %d players in %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), message, counter, safegamestr, safegroupstr);
+			INFO_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) sent \"%s\" to %d players in %s group %s", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), message, counter, safegamestr, safegroupstr);
 		}
 
 		// Exit Function
@@ -1231,7 +1219,7 @@ void spread_message(SceNetAdhocctlUserNode *user, const char *message)
 		char safegamestr[10];
 		memset(safegamestr, 0, sizeof(safegamestr));
 		strncpy(safegamestr, user->game->game.data, PRODUCT_CODE_LENGTH);
-		WARN_LOG(SCENET, "AdhocServer: %s (MAC: %s - IP: %s) attempted to send a text message without joining a %s group first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
+		WARN_LOG(Log::sceNet, "AdhocServer: %s (MAC: %s - IP: %s) attempted to send a text message without joining a %s group first", (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str(), safegamestr);
 	}
 
 	// Delete User
@@ -1248,7 +1236,10 @@ int get_user_state(SceNetAdhocctlUserNode * user)
 	if((time(NULL) - user->last_recv) >= SERVER_USER_TIMEOUT) return USER_STATE_TIMED_OUT;
 
 	// Waiting Status
-	if(user->game == NULL) return USER_STATE_WAITING;
+	if (user->game == NULL) {
+		if ((time(NULL) - user->connected_at) >= SERVER_LOGIN_TIMEOUT) return USER_STATE_TIMED_OUT;
+		return USER_STATE_WAITING;
+	}
 
 	// Logged-In Status
 	return USER_STATE_LOGGED_IN;
@@ -1332,7 +1323,7 @@ void game_product_override(SceNetAdhocctlProductCode * product)
 					strncpy(product->data, crosslink, PRODUCT_CODE_LENGTH);
 
 					// Log Crosslink
-					INFO_LOG(SCENET, "Crosslinked %s to %s", productid, crosslink);
+					INFO_LOG(Log::sceNet, "Crosslinked %s to %s", productid, crosslink);
 
 					// Set Crosslinked Flag
 					crosslinked = 1;
@@ -1342,18 +1333,18 @@ void game_product_override(SceNetAdhocctlProductCode * product)
 			// Destroy Prepared SQL Statement
 			sqlite3_finalize(statement);
 		}*/
-		for (std::vector<db_crosslink>::iterator it = crosslinks.begin(); it != crosslinks.end(); it++) {
-			if (IsMatch(it->id_from, productid)) {
+		for (const auto &link : crosslinks) {
+			if (IsMatch(link.id_from, productid)) {
 				// Grab Crosslink ID
 				char crosslink[PRODUCT_CODE_LENGTH + 1];
-				strncpy(crosslink, it->id_to, PRODUCT_CODE_LENGTH);
+				strncpy(crosslink, link.id_to, PRODUCT_CODE_LENGTH);
 				crosslink[PRODUCT_CODE_LENGTH] = 0; // null terminated
 
 				// Crosslink Product Code
-				strncpy(product->data, it->id_to, PRODUCT_CODE_LENGTH);
+				strncpy(product->data, link.id_to, PRODUCT_CODE_LENGTH);
 
 				// Log Crosslink
-				INFO_LOG(SCENET, "AdhocServer: Crosslinked %s to %s", productid, crosslink);
+				INFO_LOG(Log::sceNet, "AdhocServer: Crosslinked %s to %s", productid, crosslink);
 
 				// Set Crosslinked Flag
 				crosslinked = 1;
@@ -1381,8 +1372,8 @@ void game_product_override(SceNetAdhocctlProductCode * product)
 				// Destroy Prepare SQL Statement
 				sqlite3_finalize(statement);
 			}*/
-			for (std::vector<db_productid>::iterator it = productids.begin(); it != productids.end(); it++) {
-				if (IsMatch(it->id, productid)) {
+			for (const auto &product : productids) {
+				if (IsMatch(product.id, productid)) {
 					// Set Exists Flag
 					exists = 1;
 					break;
@@ -1402,19 +1393,16 @@ void game_product_override(SceNetAdhocctlProductCode * product)
 						if(sqlite3_step(statement) == SQLITE_DONE)
 						{
 							// Log Addition
-							INFO_LOG(SCENET, "Added Unknown Product ID %s to Database", productid);
+							INFO_LOG(Log::sceNet, "Added Unknown Product ID %s to Database", productid);
 						}
 					}
 
 					// Destroy Prepare SQL Statement
 					sqlite3_finalize(statement);
 				}*/
-				db_productid unkproduct;
-				strncpy(unkproduct.id, productid, sizeof(unkproduct.id));
-				strncpy(unkproduct.name, productid, sizeof(productid));
-				productids.push_back(unkproduct); //productids[productids.size()] = unkproduct;
-				// Log Addition
-				INFO_LOG(SCENET, "AdhocServer: Added Unknown Product ID %s to Database", productid);
+				// Not added to productids: any client can send any code, so that would grow forever.
+				// update_status() shows the code itself as the name of an unknown game.
+				INFO_LOG(Log::sceNet, "AdhocServer: Unknown Product ID %s", productid);
 			}
 		}
 
@@ -1429,7 +1417,7 @@ void game_product_override(SceNetAdhocctlProductCode * product)
 void update_status()
 {
 	// Open Logfile
-	FILE * log = File::OpenCFile(SERVER_STATUS_XMLOUT, "w");
+	FILE * log = File::OpenCFile(Path(SERVER_STATUS_XMLOUT), "w");
 
 	// Opened Logfile
 	if(log != NULL)
@@ -1496,10 +1484,10 @@ void update_status()
 				}*/
 				//db_productid *foundid = NULL;
 				bool found = false;
-				for (std::vector<db_productid>::iterator it = productids.begin(); it != productids.end(); it++) {
-					if (IsMatch(it->id, productid)) {
+				for (const auto &product : productids) {
+					if (IsMatch(product.id, productid)) {
 						// Copy Game Name
-						strcpyxml(displayname, it->name, sizeof(displayname));
+						strcpyxml(displayname, product.name, sizeof(displayname));
 						found = true;
 						break;
 					}
@@ -1681,11 +1669,17 @@ const char * strcpyxml(char * out, const char * in, uint32_t size)
  */
 int proAdhocServerThread(int port) // (int argc, char * argv[])
 {
-	setCurrentThreadName("AdhocServer");
+	SetCurrentThreadName("AdhocServer");
 	// Result
 	int result = 0;
 
-	INFO_LOG(SCENET, "AdhocServer: Begin of AdhocServer Thread");
+	if (net::HostPortExists(g_Config.sProAdhocServer, SERVER_PORT, 200)) {
+		INFO_LOG(Log::sceNet, "AdhocServer: Skipped starting because the server is already available");
+		return 0;
+	}
+	else {
+		INFO_LOG(Log::sceNet, "AdhocServer: Begin of AdhocServer Thread");
+	}
 
 	// Create Signal Receiver for CTRL + C
 	//signal(SIGINT, interrupt);
@@ -1700,7 +1694,7 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 	if(server != SOCKET_ERROR)
 	{
 		// Notify User
-		INFO_LOG(SCENET, "AdhocServer: Listening for Connections on TCP Port %u", port); //SERVER_PORT
+		INFO_LOG(Log::sceNet, "AdhocServer: Listening for Connections on TCP Port %u", port); //SERVER_PORT
 
 		// Port forward
 		UPnP_Add(IP_PROTOCOL_TCP, port); // g_PortManager.Add(IP_PROTOCOL_TCP, port);
@@ -1712,13 +1706,13 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 		UPnP_Remove(IP_PROTOCOL_TCP, port); // g_PortManager.Remove(IP_PROTOCOL_TCP, port);
 
 		// Notify User
-		INFO_LOG(SCENET, "AdhocServer: Shutdown complete");
+		INFO_LOG(Log::sceNet, "AdhocServer: Shutdown complete");
 	}
 
 	//_status = 0;
 	adhocServerRunning = false;
 
-	INFO_LOG(SCENET, "AdhocServer: End of AdhocServer Thread");
+	INFO_LOG(Log::sceNet, "AdhocServer: End of AdhocServer Thread");
 
 	// Return Result
 	return result;
@@ -1731,7 +1725,7 @@ int proAdhocServerThread(int port) // (int argc, char * argv[])
 void interrupt(int sig)
 {
 	// Notify User
-	INFO_LOG(SCENET, "AdhocServer: Shutting down... please wait");
+	INFO_LOG(Log::sceNet, "AdhocServer: Shutting down... please wait");
 
 	// Trigger Shutdown
 	//_status = 0;
@@ -1841,11 +1835,6 @@ int create_listen_socket(uint16_t port)
 		local.sin_addr.s_addr = INADDR_ANY;
 		local.sin_port = htons(port);
 
-		// Should only bind to specific IP for the 2nd or more instance of PPSSPP to prevent communication interference issue when sharing the same port. (ie. Capcom Classics Collection Remixed)
-		if (PPSSPP_ID > 1) {
-			local.sin_addr = g_localhostIP.in.sin_addr;
-		}
-
 		// Bind Local Address to Socket
 		int bindresult = bind(fd, (struct sockaddr *)&local, sizeof(local));
 
@@ -1861,17 +1850,17 @@ int create_listen_socket(uint16_t port)
 
 		// Notify User
 		else {
-			ERROR_LOG(SCENET, "AdhocServer: Bind returned %i (Socket error %d)", bindresult, errno);
-			auto n = GetI18NCategory("Networking");
-			host->NotifyUserMessage(std::string(n->T("AdhocServer Failed to Bind Port")) + " " + std::to_string(port), 3.0, 0x0000ff);
+			ERROR_LOG(Log::sceNet, "AdhocServer: Bind returned %i (Socket error %d)", bindresult, socket_errno);
+			auto n = GetI18NCategory(I18NCat::NETWORKING);
+			g_OSD.Show(OSDType::MESSAGE_ERROR, std::string(n->T("AdhocServer Failed to Bind Port")) + " " + std::to_string(port), "portbindfail");
 		}
 
 		// Close Socket
 		closesocket(fd);
+	} else {
+		// Notify User
+		ERROR_LOG(Log::sceNet, "AdhocServer: Socket returned %i (Socket error %d)", fd, socket_errno);
 	}
-
-	// Notify User
-	else ERROR_LOG(SCENET, "AdhocServer: Socket returned %i (Socket error %d)", fd, errno);
 
 	// Return Error
 	return -1;
@@ -1884,9 +1873,7 @@ int create_listen_socket(uint16_t port)
  */
 int server_loop(int server)
 {
-	// Set Running Status
-	//_status = 1;
-	adhocServerRunning = true;
+	// adhocServerRunning was set by whoever started the thread, and is cleared to stop it.
 
 	// Create Empty Status Logfile
 	update_status();
@@ -1928,7 +1915,7 @@ int server_loop(int server)
 						u8 *pip = (u8*)&sip;
 						if (gethostbyname(str)->h_addrtype == AF_INET && gethostbyname(str)->h_addr_list[0] != NULL) pip = (u8*)gethostbyname(str)->h_addr_list[0];
 						sip = *(u32_le*)pip;
-						WARN_LOG(SCENET, "AdhocServer: Replacing IP %s with %s", inet_ntoa(addr.sin_addr), inet_ntoa(*(in_addr*)&pip));
+						WARN_LOG(Log::sceNet, "AdhocServer: Replacing IP %s with %s", inet_ntoa(addr.sin_addr), inet_ntoa(*(in_addr*)&pip));
 					}
 					*/
 					login_user_stream(loginresult, sip);
@@ -1944,10 +1931,10 @@ int server_loop(int server)
 			SceNetAdhocctlUserNode * next = user->next;
 
 			// Receive Data from User
-			int recvresult = recv(user->stream, (char*)user->rx + user->rxpos, sizeof(user->rx) - user->rxpos, MSG_NOSIGNAL);
+			int recvresult = (int)recv(user->stream, (char*)user->rx + user->rxpos, sizeof(user->rx) - user->rxpos, MSG_NOSIGNAL);
 
 			// Connection Closed or Timed Out
-			if(recvresult == 0 || (recvresult == -1 && errno != EAGAIN && errno != EWOULDBLOCK) || get_user_state(user) == USER_STATE_TIMED_OUT)
+			if(recvresult == 0 || (recvresult == -1 && socket_errno != EAGAIN && socket_errno != EWOULDBLOCK) || get_user_state(user) == USER_STATE_TIMED_OUT)
 			{
 				// Logout User
 				logout_user(user);
@@ -1990,7 +1977,7 @@ int server_loop(int server)
 					else
 					{
 						// Notify User
-						WARN_LOG(SCENET, "AdhocServer: Invalid Opcode 0x%02X in Waiting State from %s", user->rx[0], ip2str(*(in_addr*)&user->resolver.ip).c_str());
+						WARN_LOG(Log::sceNet, "AdhocServer: Invalid Opcode 0x%02X in Waiting State from %s", user->rx[0], ip2str(*(in_addr*)&user->resolver.ip).c_str());
 
 						// Logout User
 						logout_user(user);
@@ -2073,7 +2060,7 @@ int server_loop(int server)
 					else
 					{
 						// Notify User
-						WARN_LOG(SCENET, "AdhocServer: Invalid Opcode 0x%02X in Logged-In State from %s (MAC: %s - IP: %s)", user->rx[0], (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str());
+						WARN_LOG(Log::sceNet, "AdhocServer: Invalid Opcode 0x%02X in Logged-In State from %s (MAC: %s - IP: %s)", user->rx[0], (char *)user->resolver.name.data, mac2str(&user->resolver.mac).c_str(), ip2str(*(in_addr*)&user->resolver.ip).c_str());
 
 						// Logout User
 						logout_user(user);
@@ -2085,11 +2072,26 @@ int server_loop(int server)
 			user = next;
 		}
 
-		// Prevent needless CPU Overload (1ms Sleep)
-		sleep_ms(10);
-
-		// Don't do anything if it's paused, otherwise the log will be flooded
-		while (adhocServerRunning && Core_IsStepping() && coreState != CORE_POWERDOWN) sleep_ms(10);
+		// Wait until a login or a message comes in, rather than polling: with nothing to do the server
+		// sleeps, and a message is handled as soon as it arrives. Woken at least every 50 ms anyway, to
+		// notice adhocServerRunning going false.
+		fd_set readfds;
+		FD_ZERO(&readfds);
+		int maxfd = server;
+		FD_SET(server, &readfds);
+		for (SceNetAdhocctlUserNode *u = _db_user; u != NULL; u = u->next) {
+#if !defined(_WIN32)
+			if (u->stream >= FD_SETSIZE) {
+				continue;
+			}
+#endif
+			FD_SET(u->stream, &readfds);
+			maxfd = std::max(maxfd, u->stream);
+		}
+		timeval tv;
+		tv.tv_sec = 0;
+		tv.tv_usec = 50000;
+		select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
 	}
 
 	// Free User Database Memory

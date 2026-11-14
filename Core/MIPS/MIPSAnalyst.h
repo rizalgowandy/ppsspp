@@ -18,15 +18,15 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Common/File/Path.h"
+#include "Core/Debugger/DebugInterface.h"
 #include "Core/MIPS/MIPS.h"
 
-class DebugInterface;
-
-namespace MIPSAnalyst
-{
+namespace MIPSAnalyst {
 	const int MIPS_NUM_GPRS = 32;
 
 	struct RegisterAnalysisResults {
@@ -83,22 +83,21 @@ namespace MIPSAnalyst
 	bool IsRegisterClobbered(MIPSGPReg reg, u32 addr, int instrs);
 
 	struct AnalyzedFunction {
-		u32 start;
-		u32 end;
-		u64 hash;
-		u32 size;
-		bool isStraightLeaf;
-		bool hasHash;
-		bool usesVFPU;
-		bool foundInSymbolMap;
-		char name[64];
+		u32 start = 0;
+		u32 end = 0;
+		u64 hash = 0;
+		u32 size = 0;
+		bool isStraightLeaf = false;
+		bool hasHash = false;
+		bool usesVFPU = false;
+		bool foundInSymbolMap = false;
+		char name[64] = {};
 	};
 
 	struct ReplacementTableEntry;
 
 	void Reset();
 
-	bool IsRegisterUsed(u32 reg, u32 addr);
 	// This will not only create a database of "AnalyzedFunction" structs, it also
 	// will insert all the functions it finds into the symbol map, if insertSymbols is true.
 
@@ -107,17 +106,31 @@ namespace MIPSAnalyst
 	void RegisterFunction(u32 startAddr, u32 size, const char *name);
 	// Returns new insertSymbols value for FinalizeScan().
 	bool ScanForFunctions(u32 startAddr, u32 endAddr, bool insertSymbols);
-	void FinalizeScan(bool insertSymbols);
+	// After scanning start to end (inclusive): hashes the functions found there, names them from the
+	// hash map and installs replacements.
+	void FinalizeScan(bool insertSymbols, u32 start, u32 end);
 	void ForgetFunctions(u32 startAddr, u32 endAddr);
-	void PrecompileFunctions();
-	void PrecompileFunction(u32 startAddr, u32 length);
 
-	void SetHashMapFilename(const std::string& filename = "");
+	// Debugger helpers. The range is widened to whole instructions. Callers should clear
+	// g_disassemblyManager afterwards.
+	void ScanFunctionsInRange(u32 addr, u32 size);
+	// Removes the function symbols starting in (or containing the start of) the range, forgets
+	// them, and reapplies replacements. Returns the number removed.
+	u32 RemoveFunctionsInRange(u32 addr, u32 size);
+
+	bool GetAnalyzedFunctionAt(u32 addr, AnalyzedFunction *out);
+	// endAddr is exclusive.
+	bool HasFunctionsInRange(u32 startAddr, u32 endAddr);
+
 	void LoadBuiltinHashMap();
-	void LoadHashMap(const std::string& filename);
-	void StoreHashMap(std::string filename = "");
+	void LoadHashMap(const Path &filename);
+	void StoreHashMap(Path filename = Path());
 
 	const char *LookupHash(u64 hash, u32 funcSize);
+	// Hashes the known functions again, from what memory holds now (after a savestate load.)
+	// Functions that already have a hash and lie entirely in one of the (address, size) ranges in
+	// unchanged keep it: their code is what it was hashed from.
+	void RehashFunctions(const std::vector<std::pair<u32, u32>> &unchanged = {});
 	void ReplaceFunctions();
 
 	void UpdateHashMap();
@@ -133,13 +146,13 @@ namespace MIPSAnalyst
 	bool IsDelaySlotNiceFPU(MIPSOpcode branchOp, MIPSOpcode op);
 	bool IsSyscall(MIPSOpcode op);
 
-	bool OpWouldChangeMemory(u32 pc, u32 addr, u32 size);
+	bool OpWouldChangeMemory(MIPSState *mips, u32 pc, u32 addr, u32 size);
 	int OpMemoryAccessSize(u32 pc);
 	bool IsOpMemoryWrite(u32 pc);
 	bool OpHasDelaySlot(u32 pc);
 
-	typedef struct {
-		DebugInterface* cpu;
+	struct MipsOpcodeInfo {
+		DebugInterface *cpu;
 		u32 opcodeAddress;
 		MIPSOpcode encodedOpcode;
 
@@ -162,7 +175,7 @@ namespace MIPSAnalyst
 
 		bool hasRelevantAddress;
 		u32 relevantAddress;
-	} MipsOpcodeInfo;
+	};
 
 	MipsOpcodeInfo GetOpcodeInfo(DebugInterface* cpu, u32 address);
 

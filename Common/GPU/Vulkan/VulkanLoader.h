@@ -17,7 +17,10 @@
 
 #pragma once
 
-#ifdef __ANDROID__
+#include "ppsspp_config.h"
+#include "Common/GPU/Vulkan/VulkanDriverVars.h"
+
+#if PPSSPP_PLATFORM(ANDROID)
 #define VK_USE_PLATFORM_ANDROID_KHR
 #elif defined(_WIN32)
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -29,19 +32,32 @@
 #define VK_USE_PLATFORM_METAL_EXT
 #endif
 
+// We load the functions at runtime into the pointers below. The iOS app has no MoltenVK (it uses
+// Metal), so there this finds no library.
 #define VK_NO_PROTOTYPES
+#define VK_ENABLE_BETA_EXTENSIONS				1		// VK_KHR_portability_subset
 
 #include "ext/vulkan/vulkan.h"
+#include <string>
 
+// Hacky X11 header workaround
+#ifdef Opposite
+#undef Opposite
+#endif
+
+namespace PPSSPP_VK {
+// Putting our own Vulkan function pointers in a namespace ensures that ppsspp_libretro.so doesn't collide with libvulkan.so.
 extern PFN_vkCreateInstance vkCreateInstance;
 extern PFN_vkDestroyInstance vkDestroyInstance;
 extern PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices;
+extern PFN_vkEnumerateInstanceVersion vkEnumerateInstanceVersion;
 extern PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
 extern PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 extern PFN_vkGetPhysicalDeviceImageFormatProperties vkGetPhysicalDeviceImageFormatProperties;
 extern PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties;
 extern PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties;
 extern PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
+extern PFN_vkGetPhysicalDeviceMemoryProperties2 vkGetPhysicalDeviceMemoryProperties2;
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 extern PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 extern PFN_vkCreateDevice vkCreateDevice;
@@ -62,11 +78,15 @@ extern PFN_vkFlushMappedMemoryRanges vkFlushMappedMemoryRanges;
 extern PFN_vkInvalidateMappedMemoryRanges vkInvalidateMappedMemoryRanges;
 extern PFN_vkGetDeviceMemoryCommitment vkGetDeviceMemoryCommitment;
 extern PFN_vkBindBufferMemory vkBindBufferMemory;
+extern PFN_vkBindBufferMemory2 vkBindBufferMemory2;
 extern PFN_vkBindImageMemory vkBindImageMemory;
+extern PFN_vkBindImageMemory2 vkBindImageMemory2;
 extern PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements;
+extern PFN_vkGetBufferMemoryRequirements2 vkGetBufferMemoryRequirements2;
+extern PFN_vkGetDeviceBufferMemoryRequirements vkGetDeviceBufferMemoryRequirements;
 extern PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements;
-extern PFN_vkGetImageSparseMemoryRequirements vkGetImageSparseMemoryRequirements;
-extern PFN_vkGetPhysicalDeviceSparseImageFormatProperties vkGetPhysicalDeviceSparseImageFormatProperties;
+extern PFN_vkGetImageMemoryRequirements2 vkGetImageMemoryRequirements2;
+extern PFN_vkGetDeviceImageMemoryRequirements vkGetDeviceImageMemoryRequirements;
 extern PFN_vkQueueBindSparse vkQueueBindSparse;
 extern PFN_vkCreateFence vkCreateFence;
 extern PFN_vkDestroyFence vkDestroyFence;
@@ -184,6 +204,14 @@ extern PFN_vkCreateXlibSurfaceKHR vkCreateXlibSurfaceKHR;
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
 extern PFN_vkCreateWaylandSurfaceKHR vkCreateWaylandSurfaceKHR;
 #endif
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+extern PFN_vkCreateDisplayPlaneSurfaceKHR vkCreateDisplayPlaneSurfaceKHR;
+extern PFN_vkGetPhysicalDeviceDisplayPropertiesKHR vkGetPhysicalDeviceDisplayPropertiesKHR;
+extern PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR vkGetPhysicalDeviceDisplayPlanePropertiesKHR;
+extern PFN_vkGetDisplayModePropertiesKHR vkGetDisplayModePropertiesKHR;
+extern PFN_vkGetDisplayPlaneSupportedDisplaysKHR vkGetDisplayPlaneSupportedDisplaysKHR;
+extern PFN_vkGetDisplayPlaneCapabilitiesKHR vkGetDisplayPlaneCapabilitiesKHR;
+#endif
 
 extern PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR;
 
@@ -208,34 +236,67 @@ extern PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
 extern PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT;
 
 // Assorted other extensions.
-extern PFN_vkGetBufferMemoryRequirements2KHR vkGetBufferMemoryRequirements2KHR;
-extern PFN_vkGetImageMemoryRequirements2KHR vkGetImageMemoryRequirements2KHR;
+extern PFN_vkGetBufferMemoryRequirements2 vkGetBufferMemoryRequirements2;
+extern PFN_vkGetImageMemoryRequirements2 vkGetImageMemoryRequirements2;
+extern PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
+extern PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
+extern PFN_vkCreateRenderPass2 vkCreateRenderPass2;
+
 extern PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT;
-extern PFN_vkGetPhysicalDeviceProperties2KHR vkGetPhysicalDeviceProperties2KHR;
-extern PFN_vkGetPhysicalDeviceFeatures2KHR vkGetPhysicalDeviceFeatures2KHR;
+extern PFN_vkWaitForPresentKHR vkWaitForPresentKHR;
+extern PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE;
+extern PFN_vkGetRefreshCycleDurationGOOGLE vkGetRefreshCycleDurationGOOGLE;
+} // namespace PPSSPP_VK
 
 // For fast extension-enabled checks.
 struct VulkanExtensions {
+	// Instance extensions
+	bool KHR_get_surface_capabilities2;
 	bool EXT_debug_utils;
+
+	// Device extensions
 	bool KHR_maintenance1; // required for KHR_create_renderpass2
 	bool KHR_maintenance2;
 	bool KHR_maintenance3;
+	bool KHR_maintenance4;
 	bool KHR_multiview;  // required for KHR_create_renderpass2
 	bool KHR_get_memory_requirements2;
 	bool KHR_dedicated_allocation;
 	bool KHR_create_renderpass2;
-	bool EXT_external_memory_host;
 	bool KHR_get_physical_device_properties2;
 	bool KHR_depth_stencil_resolve;
 	bool EXT_shader_stencil_export;
+	bool EXT_swapchain_colorspace;
+	bool ARM_rasterization_order_attachment_access;
+	bool EXT_fragment_shader_interlock;
+	bool KHR_present_id;  // Should probably check the feature flags instead.
+	bool KHR_present_wait;  // Same
+	bool GOOGLE_display_timing;
+	bool EXT_provoking_vertex;
+	bool KHR_portability_subset;
+	bool KHR_present_mode_fifo_latest_ready;
+	bool EXT_scalar_block_layout;
+	bool EXT_full_screen_exclusive;
 	// bool EXT_depth_range_unrestricted;  // Allows depth outside [0.0, 1.0] in 32-bit float depth buffers.
 };
 
+void VulkanApplyCustomDriverEnvVars(AdrenoEnvVar envVars);
+
 // Way to do a quick check before even attempting to load.
+void VulkanSetNativeLibDir(std::string_view nativeLibDir);
 bool VulkanMayBeAvailable();
 void VulkanSetAvailable(bool available);
 
-bool VulkanLoad();
-void VulkanLoadInstanceFunctions(VkInstance instance, const VulkanExtensions &enabledExtensions);
-void VulkanLoadDeviceFunctions(VkDevice device, const VulkanExtensions &enabledExtensions);
+bool VulkanLoad(std::string *errorStr);
+// Alternative to VulkanLoad() for adopting a Vulkan loader that a host application (e.g. a libretro
+// frontend) already resolved for us, instead of dlopen/dlsym-ing the Vulkan loader library ourselves.
+// instance must already be a valid, live VkInstance - vkGetDeviceProcAddr can only be resolved through
+// vkGetInstanceProcAddr with a real instance, not NULL (see the Vulkan spec's vkGetInstanceProcAddr
+// "encodes the info from" table - only a handful of global commands are NULL-instance queryable, and
+// vkGetDeviceProcAddr isn't one of them).
+bool VulkanLoadFromGetInstanceProcAddr(VkInstance instance, PFN_vkGetInstanceProcAddr getInstanceProcAddr);
+void VulkanLoadInstanceFunctions(VkInstance instance, const VulkanExtensions &enabledExtensions, uint32_t vulkanApiVersion);
+void VulkanLoadDeviceFunctions(VkDevice device, const VulkanExtensions &enabledExtensions, uint32_t vulkanApiVersion);
 void VulkanFree();
+
+const char *VulkanResultToString(VkResult res);

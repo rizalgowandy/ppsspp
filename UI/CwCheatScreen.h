@@ -15,47 +15,75 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#pragma once
+
 #include <cstdint>
 #include <functional>
 
 #include "Common/UI/View.h"
 #include "Common/UI/UIScreen.h"
 #include "Common/UI/Context.h"
-#include "UI/MiscScreens.h"
+#include "UI/BaseScreens.h"
+#include "UI/SimpleDialogScreen.h"
+#include "UI/MiscViews.h"
+#include "Common/Net/HTTPClient.h"
 
 struct CheatFileInfo;
 class CWCheatEngine;
+class NoticeView;
 
-class CwCheatScreen : public UIDialogScreenWithBackground {
+class CwCheatScreen : public UITwoPaneBaseDialogScreen {
 public:
-	CwCheatScreen(const std::string &gamePath);
+	CwCheatScreen(const Path &gamePath);
 	~CwCheatScreen();
 
-	void LoadCheatInfo();
+	bool TryLoadCheatInfo();
 
-	UI::EventReturn OnAddCheat(UI::EventParams &params);
-	UI::EventReturn OnImportCheat(UI::EventParams &params);
-	UI::EventReturn OnEditCheatFile(UI::EventParams &params);
-	UI::EventReturn OnEnableAll(UI::EventParams &params);
+	void OnAddCheat(UI::EventParams &params);
+	void OnImportCheat(UI::EventParams &params);
+	void OnImportBrowse(UI::EventParams &params);
+	void OnEditCheatFile(UI::EventParams &params);
+	void OnDisableAll(UI::EventParams &params);
 
 	void update() override;
+	bool key(const KeyInput &input) override;
 	void onFinish(DialogResult result) override;
 
+	const char *tag() const override { return "CwCheat"; }
+
+	bool WantsTextInput() const override;
+
 protected:
-	void CreateViews() override;
+	void BeforeCreateViews() override;
+	void CreateSettingsViews(UI::ViewGroup *) override;
+	void CreateContentViews(UI::ViewGroup *) override;
+	std::string_view GetTitle() const override;
+
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
 
 private:
-	UI::EventReturn OnCheckBox(int index);
+	void OnCheckBox(int index);
+	bool ImportCheats(const Path &cheatFile, int *cheatsFound);
+
+	void ImportAndReport(const Path &cheatFile);
 
 	enum { INDEX_ALL = -1 };
+	bool HasCheatWithName(const std::string &name);
 	bool RebuildCheatFile(int index);
 
-	UI::ScrollView *rightScroll_ = nullptr;
 	CWCheatEngine *engine_ = nullptr;
 	std::vector<CheatFileInfo> fileInfo_;
-	std::string gamePath_;
+	std::vector<std::string> parseErrors_;
 	std::string gameID_;
 	int fileCheckCounter_ = 0;
-	uint64_t fileCheckHash_;
-	bool enableAllFlag_ = false;
+	uint64_t fileCheckHash_ = 0;
+
+	std::string errorMessage_;
+	NoticeLevel errorLevel_ = NoticeLevel::ERROR;
+	std::string errorDetails_;
+
+	UI::ViewGroup *cheatList_ = nullptr;
+	ViewSearch search_;
+
+	std::shared_ptr<http::Request> downloadRequest_;
 };

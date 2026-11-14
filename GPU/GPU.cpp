@@ -18,108 +18,96 @@
 #include "ppsspp_config.h"
 
 #include "Common/TimeUtil.h"
-#include "Common/GraphicsContext.h"
+#include "Common/GPU/GraphicsContext.h"
 #include "Core/Core.h"
+#include "Core/System.h"
 
 #include "GPU/GPU.h"
-#include "GPU/GPUInterface.h"
+#include "GPU/GPUCommon.h"
+#include "GPU/Debugger/Stepping.h"
 
 #if PPSSPP_API(ANY_GL)
 #include "GPU/GLES/GPU_GLES.h"
 #endif
 #include "GPU/Vulkan/GPU_Vulkan.h"
 #include "GPU/Software/SoftGpu.h"
-
-#if PPSSPP_API(D3D9)
-#include "GPU/Directx9/GPU_DX9.h"
-#endif
+#include "GPU/Null/GPU_Null.h"
 
 #if PPSSPP_API(D3D11)
 #include "GPU/D3D11/GPU_D3D11.h"
 #endif
 
-GPUStatistics gpuStats;
-GPUInterface *gpu;
-GPUDebugInterface *gpuDebug;
+#if PPSSPP_API(METAL)
+#include "GPU/Metal/GPU_Metal.h"
+#endif
 
-template <typename T>
-static void SetGPU(T *obj) {
-	gpu = obj;
-	gpuDebug = obj;
-}
+GPUStatistics gpuStats;
+GPUCommon *gpu;
 
 #ifdef USE_CRT_DBG
 #undef new
 #endif
 
-bool GPU_IsReady() {
-	if (gpu)
-		return gpu->IsReady();
-	return false;
-}
-
-bool GPU_Init(GraphicsContext *ctx, Draw::DrawContext *draw) {
-	const auto &gpuCore = PSP_CoreParameter().gpuCore;
-	_assert_(draw || gpuCore == GPUCORE_SOFTWARE);
-#if PPSSPP_PLATFORM(UWP)
-	if (gpuCore == GPUCORE_SOFTWARE) {
-		SetGPU(new SoftGPU(ctx, draw));
-	} else {
-		SetGPU(new GPU_D3D11(ctx, draw));
-	}
-	return true;
-#else
+static GPUCommon *CreateGPUCore(GPUCore gpuCore, GraphicsContext *ctx, Draw::DrawContext *draw) {
 	switch (gpuCore) {
 	case GPUCORE_GLES:
 		// Disable GLES on ARM Windows (but leave it enabled on other ARM platforms).
 #if PPSSPP_API(ANY_GL)
-		SetGPU(new GPU_GLES(ctx, draw));
-		break;
+		return new GPU_GLES(ctx, draw);
 #else
-		return false;
+		return nullptr;
 #endif
 	case GPUCORE_SOFTWARE:
-		SetGPU(new SoftGPU(ctx, draw));
-		break;
-	case GPUCORE_DIRECTX9:
-#if PPSSPP_API(D3D9)
-		SetGPU(new DIRECTX9_GPU(ctx, draw));
-		break;
-#else
-		return false;
-#endif
+		return new SoftGPU(ctx, draw);
 	case GPUCORE_DIRECTX11:
 #if PPSSPP_API(D3D11)
-		SetGPU(new GPU_D3D11(ctx, draw));
-		break;
+		return new GPU_D3D11(ctx, draw);
 #else
-		return false;
+		return nullptr;
 #endif
+#if !PPSSPP_PLATFORM(SWITCH) && !PPSSPP_PLATFORM(UWP)
 	case GPUCORE_VULKAN:
 		if (!ctx) {
-			ERROR_LOG(G3D, "Unable to init Vulkan GPU backend, no context");
-			break;
+			// Can this happen?
+			ERROR_LOG(Log::G3D, "Unable to init Vulkan GPU backend, no context");
+			return nullptr;
 		}
-		SetGPU(new GPU_Vulkan(ctx, draw));
-		break;
-	}
-
-	return gpu != NULL;
+		return new GPU_Vulkan(ctx, draw);
 #endif
+	case GPUCORE_METAL:
+#if PPSSPP_API(METAL)
+		return new GPU_Metal(ctx, draw);
+#else
+		return nullptr;
+#endif
+	case GPUCORE_NULL:
+		return CreateNullGPU(ctx);
+	default:
+		return nullptr;
+	}
 }
+
+bool GPU_Init(GPUCore gpuCore, GraphicsContext *ctx, Draw::DrawContext *draw) {
+	_dbg_assert_(draw || gpuCore == GPUCORE_SOFTWARE || gpuCore == GPUCORE_NULL);
+	_dbg_assert_(!gpu);
+
+	GPUCommon *createdGPU = CreateGPUCore(gpuCore, ctx, draw);
+
+	gpu = createdGPU;
+
+	return gpu != nullptr;
+}
+
 #ifdef USE_CRT_DBG
 #define new DBG_NEW
 #endif
 
 void GPU_Shutdown() {
-	// Wait for IsReady, since it might be running on a thread.
-	if (gpu) {
-		gpu->CancelReady();
-		while (!gpu->IsReady()) {
-			sleep_ms(10);
-		}
-	}
+	GPUStepping::Reset();
 	delete gpu;
 	gpu = nullptr;
-	gpuDebug = nullptr;
+}
+
+const char *RasterChannelToString(RasterChannel channel) {
+	return channel == RASTER_COLOR ? "COLOR" : "DEPTH";
 }

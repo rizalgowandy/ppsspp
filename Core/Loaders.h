@@ -19,8 +19,11 @@
 
 #include <string>
 #include <memory>
+#include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Common/File/Path.h"
+#include "Common/File/VFS/ZipFileReader.h"
 
 enum class IdentifiedFileType {
 	ERROR_IDENTIFYING,
@@ -34,15 +37,21 @@ enum class IdentifiedFileType {
 
 	PSP_DISC_DIRECTORY,
 
-	UNKNOWN_BIN,
-	UNKNOWN_ELF,
-
 	// Try to reduce support emails...
 	ARCHIVE_RAR,
 	ARCHIVE_ZIP,
 	ARCHIVE_7Z,
+	// A .pkg game update - a container we install from rather than boot. See Core/Util/PkgUnpack.h.
+	PSP_PKG,
 	PSP_PS1_PBP,
-	ISO_MODE2,
+	PSX_ISO,
+	PS2_ISO,
+	PS3_ISO,
+	PSP_UMD_VIDEO_ISO,
+
+	UNKNOWN_BIN,
+	UNKNOWN_ELF,
+	UNKNOWN_ISO,
 
 	NORMAL_DIRECTORY,
 
@@ -54,7 +63,10 @@ enum class IdentifiedFileType {
 	UNKNOWN,
 };
 
+const char *IdentifiedFileTypeToString(IdentifiedFileType type);
+
 // NB: It is a REQUIREMENT that implementations of this class are entirely thread safe!
+// TODO: actually, is it really?
 class FileLoader {
 public:
 	enum class Flags {
@@ -68,21 +80,15 @@ public:
 	virtual bool IsRemote() {
 		return false;
 	}
-	virtual bool Exists() = 0;
+	virtual bool Exists() = 0;  // This is permitted to essentially be "IsReadable" and not actually report existence (let's say the permissions are wrong, for example...)
 	virtual bool ExistsFast() {
 		return Exists();
 	}
 	virtual bool IsDirectory() = 0;
 	virtual s64 FileSize() = 0;
-	virtual std::string Path() const = 0;
-	virtual std::string Extension() {
-		const std::string filename = Path();
-		size_t pos = filename.find_last_of('.');
-		if (pos == filename.npos) {
-			return "";
-		} else {
-			return filename.substr(pos);
-		}
+	virtual Path GetPath() const = 0;
+	virtual std::string GetFileExtension() const {
+		return GetPath().GetFileExtension();
 	}
 	virtual size_t ReadAt(s64 absolutePos, size_t bytes, size_t count, void *data, Flags flags = Flags::NONE) = 0;
 	virtual size_t ReadAt(s64 absolutePos, size_t bytes, void *data, Flags flags = Flags::NONE) {
@@ -90,8 +96,7 @@ public:
 	}
 
 	// Cancel any operations that might block, if possible.
-	virtual void Cancel() {
-	}
+	virtual void Cancel() {}
 
 	virtual std::string LatestError() const {
 		return "";
@@ -101,11 +106,10 @@ public:
 class ProxiedFileLoader : public FileLoader {
 public:
 	ProxiedFileLoader(FileLoader *backend) : backend_(backend) {}
-	~ProxiedFileLoader() override {
+	~ProxiedFileLoader() {
 		// Takes ownership.
 		delete backend_;
 	}
-
 	bool IsRemote() override {
 		return backend_->IsRemote();
 	}
@@ -121,8 +125,8 @@ public:
 	s64 FileSize() override {
 		return backend_->FileSize();
 	}
-	std::string Path() const override {
-		return backend_->Path();
+	Path GetPath() const override {
+		return backend_->GetPath();
 	}
 	void Cancel() override {
 		backend_->Cancel();
@@ -136,6 +140,11 @@ public:
 	size_t ReadAt(s64 absolutePos, size_t bytes, void *data, Flags flags = Flags::NONE) override {
 		return backend_->ReadAt(absolutePos, bytes, data, flags);
 	}
+	FileLoader *Steal() {
+		FileLoader *backend = backend_;
+		backend_ = nullptr;
+		return backend;
+	}
 
 protected:
 	FileLoader *backend_;
@@ -145,23 +154,74 @@ inline u32 operator & (const FileLoader::Flags &a, const FileLoader::Flags &b) {
 	return (u32)a & (u32)b;
 }
 
-FileLoader *ConstructFileLoader(const std::string &filename);
-// Resolve to the target binary, ISO, or other file (e.g. from a directory.)
-FileLoader *ResolveFileLoaderTarget(FileLoader *fileLoader);
+FileLoader *ConstructFileLoader(const Path &filename);
+// Identifies the file and resolves to the target binary, ISO, or other file (e.g. from a directory.)
+FileLoader *ResolveFileLoaderTarget(FileLoader *fileLoader, IdentifiedFileType *fileType, std::string *errorString);
 
-std::string ResolvePBPDirectory(const std::string &filename);
-std::string ResolvePBPFile(const std::string &filename);
+Path ResolvePBPDirectory(const Path &filename);
+Path ResolvePBPFile(const Path &filename);
 
-IdentifiedFileType Identify_File(FileLoader *fileLoader);
+IdentifiedFileType Identify_File(FileLoader *fileLoader, std::string *errorString);
 
-class FileLoaderFactory {
-public:
-	virtual ~FileLoaderFactory() {}
-	virtual FileLoader *ConstructFileLoader(const std::string &filename) = 0;
+bool UmdReplace(const Path &filepath, FileLoader **fileLoader, std::string &error);
+// Mounts a disc image at umd0:, umd1:, umd: and disc0:, whether or not one was there.
+bool UmdMount(const Path &filepath, FileLoader **fileLoader, std::string &error);
+
+class IFileSystem;
+// What a disc holds, as PSP_UMD_TYPE_* bits (game, video, audio), or 0 if it's none of those.
+// root is prepended to the disc's paths, so "disc0:" reads the mounted disc through pspFileSystem.
+u32 DetectUmdDiscType(IFileSystem *fs, std::string_view root);
+// The same for a disc image file. 0 if it can't be opened as one.
+u32 DetectUmdDiscType(FileLoader *fileLoader);
+// Whether the image's PSP_GAME has an actual executable. The EUR Video Demo Disc lists a game
+// (UMD_DATA.BIN says GVA) whose EBOOT.BIN and BOOT.BIN are all zeroes.
+bool UmdHasBootableGame(FileLoader *fileLoader);
+
+enum class ArchiveType {
+	ZIP,
+	SevenZ,
 };
-void RegisterFileLoaderFactory(std::string name, std::unique_ptr<FileLoaderFactory> factory);
 
-// Can modify the string filename, as it calls IdentifyFile above.
-bool LoadFile(FileLoader **fileLoaderPtr, std::string *error_string);
+enum class ZipFileContents {
+	NOT_A_ZIP_FILE = 0,
+	UNKNOWN,
+	PSP_GAME_DIR,
+	ISO_FILE,
+	TEXTURE_PACK,
+	SAVE_DATA,
+	FRAME_DUMP,
+	EXTRACTED_GAME,
+	SAVE_STATES,
+	PRX_PLUGIN,
+	// A PS1 disc image, which can be one file or several (a cue sheet and what it names).
+	PSX_DISC,
+};
 
-bool UmdReplace(std::string filepath, std::string &error);
+// TODO: Rename to ArchiveContentsInfo or something.
+struct ZipFileInfo {
+	ArchiveType archiveType;
+	ZipFileContents contents = ZipFileContents::NOT_A_ZIP_FILE;
+	int numFiles = 0;
+	int stripChars = 0;  // for PSP game - how much to strip from the path.
+	int isoFileIndex = -1;  // for ISO
+	int textureIniIndex = -1;  // for textures
+	bool ignoreMetaFiles = false;
+	bool saveDataInRoot = false;  // for SAVE_DATA - the files of a single save are in the root, extract into savedataDir.
+	std::string gameTitle;  // from PARAM.SFO if available
+	std::string savedataTitle;
+	std::string savedataDetails;
+	std::string savedataDir;
+	std::string mTime;
+	std::string iniContents;
+	std::string isoFilename; // Used by SevenZ only right now.
+	std::vector<std::string> discFiles;  // For PSX_DISC, the disc's files in the archive.
+	s64 totalFileSize = 0;
+
+	std::string contentName;
+};
+
+ZipContainer ZipOpenPath(const Path &fileName);
+void ZipClose(ZipContainer &z);
+
+void DetectZipFileContents(zip_t *z, ZipFileInfo *info);
+bool DetectArchiveContents(VFSInterface *vfs, ZipFileInfo *info);

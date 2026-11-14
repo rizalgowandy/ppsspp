@@ -1,0 +1,37 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="libchdr\src\libchdr_bitstream.c" />
+    <ClCompile Include="libchdr\src\libchdr_cdrom.c" />
+    <ClCompile Include="libchdr\src\libchdr_chd.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_avhuff.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_cdfl.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_cdlz.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_cdzl.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_cdzs.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_flac.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_huff.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_lzma.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_zlib.c" />
+    <ClCompile Include="libchdr\src\libchdr_codec_zstd.c" />
+    <ClCompile Include="libchdr\src\libchdr_flac.c" />
+    <ClCompile Include="libchdr\src\libchdr_huffman.c" />
+    <ClCompile Include="libchdr\deps\lzma-26.02\src\LzmaDec.c">
+      <Filter>LZMA</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="libchdr\include\dr_libs\dr_flac.h" />
+    <ClInclude Include="libchdr\include\libchdr\bitstream.h" />
+    <ClInclude Include="libchdr\include\libchdr\cdrom.h" />
+    <ClInclude Include="libchdr\include\libchdr\chd.h" />
+    <ClInclude Include="libchdr\include\libchdr\chdconfig.h" />
+    <ClInclude Include="libchdr\include\libchdr\flac.h" />
+    <ClInclude Include="libchdr\include\libchdr\huffman.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="LZMA">
+      <UniqueIdentifier>{ff31581b-3ff9-4e39-bb96-2f662896cf70}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

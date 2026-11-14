@@ -18,164 +18,126 @@
 #pragma once
 
 #include <functional>
+#include <string_view>
 
+#include "Common/File/Path.h"
 #include "Common/UI/UIScreen.h"
 #include "Common/UI/ViewGroup.h"
-#include "UI/MiscScreens.h"
+#include "Common/UI/TabHolder.h"
+#include "Common/UI/PopupScreens.h"
+#include "UI/BaseScreens.h"
+#include "UI/SimpleDialogScreen.h"
 #include "Common/File/PathBrowser.h"
 
-enum GameBrowserFlags {
-	FLAG_HOMEBREWSTOREBUTTON = 1
-};
-
-enum class BrowseFlags {
-	NONE = 0,
-	NAVIGATE = 1,
-	ARCHIVES = 2,
-	PIN = 4,
-	HOMEBREW_STORE = 8,
-	STANDARD = 1 | 2 | 4,
-};
-ENUM_CLASS_BITOPS(BrowseFlags);
-
-bool LaunchFile(ScreenManager *screenManager, std::string path);
-
-class GameBrowser : public UI::LinearLayout {
-public:
-	GameBrowser(std::string path, BrowseFlags browseFlags, bool *gridStyle, ScreenManager *screenManager, std::string lastText, std::string lastLink, UI::LayoutParams *layoutParams = nullptr);
-
-	UI::Event OnChoice;
-	UI::Event OnHoldChoice;
-	UI::Event OnHighlight;
-
-	void FocusGame(const std::string &gamePath);
-	void SetPath(const std::string &path);
-	void Draw(UIContext &dc) override;
-	void Update() override;
-
-protected:
-	virtual bool DisplayTopBar();
-	virtual bool HasSpecialFiles(std::vector<std::string> &filenames);
-
-	void Refresh();
-
-private:
-	bool IsCurrentPathPinned();
-	const std::vector<std::string> GetPinnedPaths();
-	const std::string GetBaseName(const std::string &path);
-
-	UI::EventReturn GameButtonClick(UI::EventParams &e);
-	UI::EventReturn GameButtonHoldClick(UI::EventParams &e);
-	UI::EventReturn GameButtonHighlight(UI::EventParams &e);
-	UI::EventReturn NavigateClick(UI::EventParams &e);
-	UI::EventReturn LayoutChange(UI::EventParams &e);
-	UI::EventReturn LastClick(UI::EventParams &e);
-	UI::EventReturn BrowseClick(UI::EventParams &e);
-	UI::EventReturn StorageClick(UI::EventParams &e);
-	UI::EventReturn HomeClick(UI::EventParams &e);
-	UI::EventReturn PinToggleClick(UI::EventParams &e);
-	UI::EventReturn GridSettingsClick(UI::EventParams &e);
-	UI::EventReturn OnRecentClear(UI::EventParams &e);
-	UI::EventReturn OnHomebrewStore(UI::EventParams &e);
-
-	UI::ViewGroup *gameList_ = nullptr;
-	PathBrowser path_;
-	bool *gridStyle_ = nullptr;
-	BrowseFlags browseFlags_;
-	std::string lastText_;
-	std::string lastLink_;
-	std::string focusGamePath_;
-	bool listingPending_ = false;
-	float lastScale_ = 1.0f;
-	bool lastLayoutWasGrid_ = true;
-	ScreenManager *screenManager_;
-};
+#include "UI/GameBrowser.h"
 
 class RemoteISOBrowseScreen;
 
-class MainScreen : public UIScreenWithBackground {
+struct HighlightedBackground {
+	Path gamePath;
+	double startTime;
+	double endTime;
+};
+
+class MainScreen : public UIBaseScreen {
 public:
 	MainScreen();
 	~MainScreen();
 
 	bool isTopLevel() const override { return true; }
 
+	const char *tag() const override { return "Main"; }
+
 	// Horrible hack to show the demos & homebrew tab after having installed a game from a zip file.
 	static bool showHomebrewTab;
 
+	bool key(const KeyInput &touch) override;
+
+	bool WantsTextInput() const override;
 protected:
+	ViewLayoutMode LayoutMode() const override { return ViewLayoutMode::IgnoreBottomInset; }
+
 	void CreateViews() override;
+	void CreateRecentTab();
+	GameBrowser *CreateBrowserTab(const Path &path, std::string_view title, std::string_view howToTitle, std::string_view howToUri, BrowseFlags browseFlags, int *viewMode, float *scrollPos);
+	void CreateMainButtons(UI::LinearLayout *parent, bool vertical);
+
 	void DrawBackground(UIContext &dc) override;
 	void update() override;
-	void sendMessage(const char *message, const char *value) override;
+	void sendMessage(UIMessage message, const char *value) override;
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
 
-	bool UseVerticalLayout() const;
-	bool DrawBackgroundFor(UIContext &dc, const std::string &gamePath, float progress);
+	void DrawBackgroundFor(UIContext &dc, const Path &gamePath, float alpha);
 
-	UI::EventReturn OnGameSelected(UI::EventParams &e);
-	UI::EventReturn OnGameSelectedInstant(UI::EventParams &e);
-	UI::EventReturn OnGameHighlight(UI::EventParams &e);
+	void OnGameSelected(UI::EventParams &e);
+	void OnGameSelectedInstant(UI::EventParams &e);
+	void OnGameHighlight(UI::EventParams &e);
 	// Event handlers
-	UI::EventReturn OnLoadFile(UI::EventParams &e);
-	UI::EventReturn OnGameSettings(UI::EventParams &e);
-	UI::EventReturn OnCredits(UI::EventParams &e);
-	UI::EventReturn OnSupport(UI::EventParams &e);
-	UI::EventReturn OnPPSSPPOrg(UI::EventParams &e);
-	UI::EventReturn OnForums(UI::EventParams &e);
-	UI::EventReturn OnExit(UI::EventParams &e);
-	UI::EventReturn OnDownloadUpgrade(UI::EventParams &e);
-	UI::EventReturn OnDismissUpgrade(UI::EventParams &e);
-	UI::EventReturn OnAllowStorage(UI::EventParams &e);
-	UI::EventReturn OnFullScreenToggle(UI::EventParams &e);
+	void OnLoadFile(UI::EventParams &e);
+	void OnGameSettings(UI::EventParams &e);
+	void OnCredits(UI::EventParams &e);
+	void OnPPSSPPOrg(UI::EventParams &e);
+	void OnForums(UI::EventParams &e);
+	void OnDownloadUpgrade(UI::EventParams &e);
+	void OnAllowStorage(UI::EventParams &e);
 
-	UI::LinearLayout *upgradeBar_ = nullptr;
 	UI::TabHolder *tabHolder_ = nullptr;
-	UI::Button *fullscreenButton_ = nullptr;
 
-	std::string restoreFocusGamePath_;
+	Path restoreFocusGamePath_;
 	std::vector<GameBrowser *> gameBrowsers_;
 
-	std::string highlightedGamePath_;
-	std::string prevHighlightedGamePath_;
-	float highlightProgress_ = 0.0f;
-	float prevHighlightProgress_ = 0.0f;
+	std::vector<HighlightedBackground> highlightedBackgrounds_;
+	Path highlightedGamePath_;
+
 	bool backFromStore_ = false;
 	bool lockBackgroundAudio_ = false;
-	bool lastVertical_;
+	int packGeneration_ = 0;  // GamePacker::Generation() the game lists were made at.
+	bool lastVertical_ = false;
 	bool confirmedTemporary_ = false;
-	UI::ScrollView *scrollAllGames_ = nullptr;
+	bool searchChanged_ = false;
+	bool recentTabShown_ = false;
+	bool createdMainTabs_ = false;
+	std::string searchFilter_;
 
 	friend class RemoteISOBrowseScreen;
+private:
+	void InstantHighlight(const Path &path);
 };
 
-class UmdReplaceScreen : public UIDialogScreenWithBackground {
+class UmdReplaceScreen : public UITwoPaneBaseDialogScreen {
 public:
-	UmdReplaceScreen() {}
+	// insert: put a disc into the empty drive (the VSH) rather than swap the one a game is running from.
+	explicit UmdReplaceScreen(bool insert = false)
+		: UITwoPaneBaseDialogScreen(Path(), TwoPaneFlags::SettingsToTheRight | TwoPaneFlags::NoTopbarInLandscape), insert_(insert) {}
+	const char *tag() const override { return "UmdReplace"; }
 
 protected:
-	void CreateViews() override;
+	std::string_view GetTitle() const override;
+	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateContentViews(UI::ViewGroup *parent) override;
 	void update() override;
-	//virtual void sendMessage(const char *message, const char *value);
 
 private:
-	UI::EventReturn OnGameSelected(UI::EventParams &e);
-	UI::EventReturn OnGameSelectedInstant(UI::EventParams &e);
+	void OnGameSelected(UI::EventParams &e);
+	void UseDisc(const Path &path);
 
-	UI::EventReturn OnCancel(UI::EventParams &e);
-	UI::EventReturn OnGameSettings(UI::EventParams &e);
+	bool insert_;
 };
 
-class GridSettingsScreen : public PopupScreen {
+class GridSettingsPopupScreen : public UI::PopupScreen {
 public:
-	GridSettingsScreen(std::string label) : PopupScreen(label) {}
+	// The icon size buttons change the size for viewMode.
+	GridSettingsPopupScreen(std::string_view label, GameBrowserViewMode viewMode) : PopupScreen(label), viewMode_(viewMode) {}
 	void CreatePopupContents(UI::ViewGroup *parent) override;
 	UI::Event OnRecentChanged;
 
+	const char *tag() const override { return "GridSettings"; }
+
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+
 private:
-	UI::EventReturn GridPlusClick(UI::EventParams &e);
-	UI::EventReturn GridMinusClick(UI::EventParams &e);
-	UI::EventReturn OnRecentClearClick(UI::EventParams &e);
-	const float MAX_GAME_GRID_SCALE = 3.0f;
-	const float MIN_GAME_GRID_SCALE = 0.8f;
+	GameBrowserViewMode viewMode_;
+	bool recentCleared_ = false;
 };
+
+void LaunchBuyGold(ScreenManager *screenManager);

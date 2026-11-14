@@ -1,6 +1,6 @@
-#include <atomic>
-#include <mutex>
+#include <algorithm>
 #include <deque>
+#include <mutex>
 
 #include "ppsspp_config.h"
 
@@ -12,162 +12,21 @@
 
 namespace UI {
 
-static std::mutex focusLock;
-static std::vector<int> focusMoves;
+// Guards focusMoves and heldKeys. NativeKey calls KeyEventToFocusMoves on the input thread,
+// while the UI thread processes them. Never held while dispatching to views.
+static std::mutex focusMovesLock;
+static std::vector<FocusMove> focusMoves;
 extern bool focusForced;
 
 static View *focusedView;
 static bool focusMovementEnabled;
 bool focusForced;
-static std::mutex eventMutex_;
+static bool scrollFocusedIntoView;
 
 static std::function<void(UISound)> soundCallback;
-static bool soundEnabled = true;
+static std::function<void(View *)> disabledActivationCallback;
 
-
-struct DispatchQueueItem {
-	Event *e;
-	EventParams params;
-};
-
-std::atomic<bool> hasDispatchQueue;
-std::deque<DispatchQueueItem> g_dispatchQueue;
-
-void EventTriggered(Event *e, EventParams params) {
-	DispatchQueueItem item;
-	item.e = e;
-	item.params = params;
-
-	std::unique_lock<std::mutex> guard(eventMutex_);
-	// Set before adding so we lock and check the added value.
-	hasDispatchQueue = true;
-	g_dispatchQueue.push_front(item);
-}
-
-void DispatchEvents() {
-	while (hasDispatchQueue) {
-		DispatchQueueItem item;
-		{
-			std::unique_lock<std::mutex> guard(eventMutex_);
-			if (g_dispatchQueue.empty())
-				break;
-			item = g_dispatchQueue.back();
-			g_dispatchQueue.pop_back();
-			hasDispatchQueue = !g_dispatchQueue.empty();
-		}
-		if (item.e) {
-			item.e->Dispatch(item.params);
-		}
-	}
-}
-
-void RemoveQueuedEventsByView(View *view) {
-	if (!hasDispatchQueue)
-		return;
-	std::unique_lock<std::mutex> guard(eventMutex_);
-	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
-		if (it->params.v == view) {
-			it = g_dispatchQueue.erase(it);
-		} else {
-			++it;
-		}
-	}
-}
-
-void RemoveQueuedEventsByEvent(Event *event) {
-	if (!hasDispatchQueue)
-		return;
-	std::unique_lock<std::mutex> guard(eventMutex_);
-	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
-		if (it->e == event) {
-			it = g_dispatchQueue.erase(it);
-		} else {
-			++it;
-		}
-	}
-}
-
-View *GetFocusedView() {
-	return focusedView;
-}
-
-void SetFocusedView(View *view, bool force) {
-	if (focusedView) {
-		focusedView->FocusChanged(FF_LOSTFOCUS);
-	}
-	focusedView = view;
-	if (focusedView) {
-		focusedView->FocusChanged(FF_GOTFOCUS);
-		if (force) {
-			focusForced = true;
-		}
-	}
-}
-
-void EnableFocusMovement(bool enable) {
-	focusMovementEnabled = enable;
-	if (!enable) {
-		if (focusedView) {
-			focusedView->FocusChanged(FF_LOSTFOCUS);
-		}
-		focusedView = 0;
-	}
-}
-
-bool IsFocusMovementEnabled() {
-	return focusMovementEnabled;
-}
-
-void LayoutViewHierarchy(const UIContext &dc, ViewGroup *root, bool ignoreInsets) {
-	if (!root) {
-		ERROR_LOG(SYSTEM, "Tried to layout a view hierarchy from a zero pointer root");
-		return;
-	}
-
-	Bounds rootBounds = ignoreInsets ? dc.GetBounds() : dc.GetLayoutBounds();
-
-	MeasureSpec horiz(EXACTLY, rootBounds.w);
-	MeasureSpec vert(EXACTLY, rootBounds.h);
-
-	// Two phases - measure contents, layout.
-	root->Measure(dc, horiz, vert);
-	// Root has a specified size. Set it, then let root layout all its children.
-	root->SetBounds(rootBounds);
-	root->Layout();
-}
-
-void MoveFocus(ViewGroup *root, FocusDirection direction) {
-	if (!GetFocusedView()) {
-		// Nothing was focused when we got in here. Focus the first non-group in the hierarchy.
-		root->SetFocus();
-		return;
-	}
-
-	NeighborResult neigh(0, 0);
-	neigh = root->FindNeighbor(GetFocusedView(), direction, neigh);
-
-	if (neigh.view) {
-		neigh.view->SetFocus();
-		root->SubviewFocused(neigh.view);
-
-		PlayUISound(UISound::SELECT);
-	}
-}
-
-void SetSoundEnabled(bool enabled) {
-	soundEnabled = enabled;
-}
-
-void SetSoundCallback(std::function<void(UISound)> func) {
-	soundCallback = func;
-}
-
-void PlayUISound(UISound sound) {
-	if (soundEnabled && soundCallback) {
-		soundCallback(sound);
-	}
-}
-
+// Repeat key handling below.
 // TODO: Figure out where this should really live.
 // Simple simulation of key repeat on platforms and for gamepads where we don't
 // automatically get it.
@@ -178,9 +37,12 @@ static int frameCount;
 // completely broken input where the original keypresses have deviceId = 10 and the repeats
 // have deviceId = 0.
 struct HeldKey {
-	int key;
-	int deviceId;
+	InputKeyCode key;
+	InputDeviceID deviceId;
 	double triggerTime;
+	// What the key meant when it went down. Kept here because a repeat has to move the same way
+	// the original press did, and modifiers (Shift+Tab) aren't part of the synthesized repeat.
+	FocusMove move;
 
 	// Ignores startTime
 	bool operator <(const HeldKey &other) const {
@@ -195,102 +57,304 @@ static std::set<HeldKey> heldKeys;
 const double repeatDelay = 15 * (1.0 / 60.0f);  // 15 frames like before.
 const double repeatInterval = 5 * (1.0 / 60.0f);  // 5 frames like before.
 
-bool KeyEvent(const KeyInput &key, ViewGroup *root) {
-	bool retval = false;
+struct DispatchQueueItem {
+	Event *e;
+	EventParams params;
+};
+
+std::deque<DispatchQueueItem> g_dispatchQueue;
+
+void EventTriggered(Event *e, EventParams params) {
+	DispatchQueueItem item{ e, params };
+	g_dispatchQueue.push_front(item);
+}
+
+DialogResult DispatchEvents() {
+	DialogResult result = DR_NONE;
+	while (!g_dispatchQueue.empty()) {
+		DispatchQueueItem item;
+		if (g_dispatchQueue.empty())
+			break;
+		item = g_dispatchQueue.back();
+		g_dispatchQueue.pop_back();
+		if (item.e) {
+			item.e->Dispatch(item.params);
+			if (item.params.bubbleResult != DR_NONE) {
+				result = item.params.bubbleResult;
+			}
+		}
+	}
+	return result;
+}
+
+void RemoveQueuedEventsByView(View *view) {
+	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
+		if (it->params.v == view) {
+			it = g_dispatchQueue.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+void RemoveQueuedEventsByEvent(Event *event) {
+	for (auto it = g_dispatchQueue.begin(); it != g_dispatchQueue.end(); ) {
+		if (it->e == event) {
+			it = g_dispatchQueue.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+View *GetFocusedView() {
+	return focusedView;
+}
+
+void ScrollFocusedViewIntoView() {
+	scrollFocusedIntoView = true;
+}
+
+void SetFocusedView(View *view, FocusFlags cause, bool force) {
+	if (focusedView) {
+		focusedView->FocusChanged(FocusFlags::LOST_FOCUS | cause);
+	}
+	focusedView = view;
+	if (focusedView) {
+		focusedView->FocusChanged(FocusFlags::GOT_FOCUS | cause);
+		if (force) {
+			focusForced = true;
+		}
+	}
+}
+
+void EnableFocusMovement(bool enable) {
+	// INFO_LOG(Log::UI, "EnableFocusMovement: %s", enable ? "true" : "false");
+	focusMovementEnabled = enable;
+	if (!enable) {
+		if (focusedView) {
+			focusedView->FocusChanged(FocusFlags::LOST_FOCUS | FocusFlags::CAUSE_KB_FOCUS_DISABLED);
+		}
+		{
+			std::lock_guard<std::mutex> guard(focusMovesLock);
+			focusMoves.clear();
+			heldKeys.clear();
+		}
+		focusedView = nullptr;
+	}
+}
+
+bool IsFocusMovementEnabled() {
+	return focusMovementEnabled;
+}
+
+void LayoutViewHierarchy(const UIContext &dc, const UI::Margins &rootMargins, ViewGroup *root, ViewLayoutMode layoutMode, bool immersiveMode) {
+	Bounds rootBounds = dc.GetLayoutBounds(layoutMode, immersiveMode);
+	rootBounds.x += rootMargins.left;
+	rootBounds.y += rootMargins.top;
+	rootBounds.w -= rootMargins.left + rootMargins.right;
+	rootBounds.h -= rootMargins.top + rootMargins.bottom;
+	LayoutViewHierarchy(dc, rootBounds, root);
+}
+
+void LayoutViewHierarchy(const UIContext &dc, const Bounds &rootBounds, ViewGroup *root) {
+	MeasureSpec horiz(EXACTLY, rootBounds.w);
+	MeasureSpec vert(EXACTLY, rootBounds.h);
+
+	// Two phases - measure contents, layout.
+	root->Measure(dc, horiz, vert);
+	// Root has a specified size. Set it, then let root layout all its children.
+	root->SetBounds(rootBounds);
+	root->Layout();
+}
+
+// Tab order navigation. Unlike the directional moves, this doesn't look at where things ended up
+// on screen at all - it just walks the hierarchy in order, which is why it behaves predictably in
+// layouts where "what's to the right of this" has no good answer.
+View *FindTabOrderNeighbor(ViewGroup *root, View *focusedView, FocusMove direction) {
+	std::vector<View *> order;
+	root->CollectTabOrder(&order);
+	if (order.empty()) {
+		return nullptr;
+	}
+
+	const int step = direction == FocusMove::NEXT ? 1 : (int)order.size() - 1;
+
+	// The focused view not being in the list is normal - it can have been hidden or disabled
+	// since it got focus. Start from one end rather than giving up.
+	auto iter = std::find(order.begin(), order.end(), focusedView);
+	if (iter == order.end()) {
+		return direction == FocusMove::NEXT ? order.front() : order.back();
+	}
+
+	const size_t index = iter - order.begin();
+	return order[(index + step) % order.size()];
+}
+
+static void MoveFocus(ViewGroup *root, FocusMove direction) {
+	View *focusedView = GetFocusedView();
+	if (!focusedView) {
+		// Nothing was focused when we got in here. Focus the first non-group in the hierarchy.
+		root->SetFocus(FocusFlags::CAUSE_FOCUS_MOVE);
+		return;
+	}
+
+	if (!focusedView->CanMoveFocus(direction)) {
+		return;
+	}
+
+	View *dest;
+	if (direction == FocusMove::NEXT || direction == FocusMove::PREV) {
+		dest = FindTabOrderNeighbor(root, focusedView, direction);
+		if (dest == focusedView) {
+			// Tabbing around a single stop. Don't re-fire focus events or play a sound for it.
+			// The directional moves below deliberately can land on the origin - FindScrollNeighbor
+			// considers it a candidate - so this only applies here.
+			dest = nullptr;
+		}
+	} else {
+		dest = root->FindNeighbor(focusedView, direction, NeighborResult()).view;
+	}
+
+	if (dest) {
+		dest->SetFocus(FocusFlags::CAUSE_FOCUS_MOVE);
+		root->SubviewFocused(dest);
+
+		// INFO_LOG(Log::UI, "Focus moved from %s to %s", focusedView->DescribeText().c_str(), dest->DescribeText().c_str());
+
+		PlayUISound(UISound::SELECT);
+	}
+}
+
+void SetSoundCallback(std::function<void(UISound)> func) {
+	soundCallback = func;
+}
+
+void SetDisabledActivationCallback(std::function<void(View *)> func) {
+	disabledActivationCallback = func;
+}
+
+void NotifyDisabledActivation(View *view) {
+	if (disabledActivationCallback) {
+		disabledActivationCallback(view);
+	}
+}
+
+void PlayUISound(UISound sound) {
+	if (soundCallback) {
+		soundCallback(sound);
+	}
+}
+
+// Which way, if any, this key moves the focus. DPad keys are remappable, so they're matched
+// through IsDPadKey rather than by keycode here.
+static bool KeyToFocusMove(const KeyInput &key, FocusMove *move) {
+	// Alt+arrows are shortcuts (like Alt+Up for the parent directory in the game browser).
+	if (IsDPadKey(key) && !(key.flags & KeyInputFlags::ModAlt)) {
+		switch (key.keyCode) {
+		case NKCODE_DPAD_LEFT: *move = FocusMove::LEFT; return true;
+		case NKCODE_DPAD_RIGHT: *move = FocusMove::RIGHT; return true;
+		case NKCODE_DPAD_UP: *move = FocusMove::UP; return true;
+		case NKCODE_DPAD_DOWN: *move = FocusMove::DOWN; return true;
+		default: break;
+		}
+	}
+	switch (key.keyCode) {
+	case NKCODE_PAGE_UP: *move = FocusMove::PREV_PAGE; return true;
+	case NKCODE_PAGE_DOWN: *move = FocusMove::NEXT_PAGE; return true;
+	case NKCODE_MOVE_HOME: *move = FocusMove::FIRST; return true;
+	case NKCODE_MOVE_END: *move = FocusMove::LAST; return true;
+	case NKCODE_TAB:
+		// Ctrl+Tab switches tabs rather than moving focus - see ChoiceStrip::Key.
+		if (key.flags & KeyInputFlags::ModCtrl) {
+			return false;
+		}
+		*move = (key.flags & KeyInputFlags::ModShift) ? FocusMove::PREV : FocusMove::NEXT;
+		return true;
+	default:
+		return false;
+	}
+}
+
+KeyEventResult KeyEventToFocusMoves(const KeyInput &key) {
+	std::lock_guard<std::mutex> guard(focusMovesLock);
+	KeyEventResult retval = KeyEventResult::PASS_THROUGH;
+	// The OS's own repeats of a key we're already repeating (see ProcessHeldKeys) would double
+	// up with ours, in a text field for example.
+	if ((key.flags & KeyInputFlags::DOWN) && (key.flags & KeyInputFlags::IS_REPEAT) && !heldKeys.empty()) {
+		HeldKey hk;
+		hk.key = key.keyCode;
+		hk.deviceId = key.deviceId;
+		hk.triggerTime = 0.0;  // irrelevant
+		hk.move = FocusMove::NEXT;  // irrelevant, not part of the comparison
+		if (heldKeys.find(hk) != heldKeys.end()) {
+			return KeyEventResult::IGNORE_KEY;
+		}
+	}
 	// Ignore repeats for focus moves.
-	if ((key.flags & (KEY_DOWN | KEY_IS_REPEAT)) == KEY_DOWN) {
-		if (IsDPadKey(key)) {
+	if ((key.flags & KeyInputFlags::DOWN) && !(key.flags & KeyInputFlags::IS_REPEAT)) {
+		FocusMove move;
+		if (KeyToFocusMove(key, &move)) {
 			// Let's only repeat DPAD initially.
 			HeldKey hk;
 			hk.key = key.keyCode;
 			hk.deviceId = key.deviceId;
 			hk.triggerTime = time_now_d() + repeatDelay;
+			hk.move = move;
 
 			// Check if the key is already held. If it is, ignore it. This is to avoid
 			// multiple key repeat mechanisms colliding.
 			if (heldKeys.find(hk) != heldKeys.end()) {
-				return false;
+				return KeyEventResult::IGNORE_KEY;
 			}
 
 			heldKeys.insert(hk);
-			std::lock_guard<std::mutex> lock(focusLock);
-			focusMoves.push_back(key.keyCode);
-			retval = true;
+			focusMoves.push_back(move);
+			retval = KeyEventResult::ACCEPT;
 		}
 	}
-	if (key.flags & KEY_UP) {
+	if (key.flags & KeyInputFlags::UP) {
 		// We ignore the device ID here (in the comparator for HeldKey), due to the Ouya quirk mentioned above.
 		if (!heldKeys.empty()) {
 			HeldKey hk;
 			hk.key = key.keyCode;
 			hk.deviceId = key.deviceId;
 			hk.triggerTime = 0.0; // irrelevant
+			hk.move = FocusMove::NEXT;  // irrelevant, not part of the comparison
 			if (heldKeys.find(hk) != heldKeys.end()) {
 				heldKeys.erase(hk);
-				retval = true;
+				retval = KeyEventResult::ACCEPT;
 			}
 		}
 	}
-
-	retval = root->Key(key);
-
-	// Ignore volume keys and stuff here. Not elegant but need to propagate bools through the view hierarchy as well...
-	switch (key.keyCode) {
-	case NKCODE_VOLUME_DOWN:
-	case NKCODE_VOLUME_UP:
-	case NKCODE_VOLUME_MUTE:
-		retval = false;
-		break;
-	}
-
 	return retval;
 }
 
-static void ProcessHeldKeys(ViewGroup *root) {
-	double now = time_now_d();
-
-restart:
-
-	for (std::set<HeldKey>::iterator iter = heldKeys.begin(); iter != heldKeys.end(); ++iter) {
-		if (iter->triggerTime < now) {
-			KeyInput key;
-			key.keyCode = iter->key;
-			key.deviceId = iter->deviceId;
-			key.flags = KEY_DOWN;
-			KeyEvent(key, root);
-
-			std::lock_guard<std::mutex> lock(focusLock);
-			focusMoves.push_back(key.keyCode);
-
-			// Cannot modify the current item when looping over a set, so let's do this instead.
-			HeldKey hk = *iter;
-			heldKeys.erase(hk);
-			hk.triggerTime = now + repeatInterval;
-			heldKeys.insert(hk);
-			goto restart;
-		}
-	}
+bool KeyEvent(const KeyInput &key, ViewGroup *root) {
+	return root->Key(key);
 }
 
-bool TouchEvent(const TouchInput &touch, ViewGroup *root) {
+void TouchEvent(const TouchInput &touch, ViewGroup *root) {
 	focusForced = false;
 	root->Touch(touch);
-	if ((touch.flags & TOUCH_DOWN) && !focusForced) {
+	if ((touch.flags & TouchInputFlags::DOWN) && !focusForced) {
 		EnableFocusMovement(false);
 	}
-	return true;
 }
 
-bool AxisEvent(const AxisInput &axis, ViewGroup *root) {
+static void FakeKeyEvent(const KeyInput &key, ViewGroup *root) {
+	KeyEventToFocusMoves(key);
+	KeyEvent(key, root);
+}
+
+void AxisEvent(const AxisInput &axis, ViewGroup *root) {
 	enum class DirState {
 		NONE = 0,
 		POS = 1,
 		NEG = 2,
 	};
 	struct PrevState {
-		PrevState() : x(DirState::NONE), y(DirState::NONE) {
-		}
-
+		PrevState() : x(DirState::NONE), y(DirState::NONE) {}
 		DirState x;
 		DirState y;
 	};
@@ -309,18 +373,18 @@ bool AxisEvent(const AxisInput &axis, ViewGroup *root) {
 
 	// Cannot use the remapper since this is for the menu, so we provide our own
 	// axis->button emulation here.
-	auto GenerateKeyFromAxis = [&](DirState old, DirState cur, keycode_t neg_key, keycode_t pos_key) {
+	auto GenerateKeyFromAxis = [=](DirState old, DirState cur, InputKeyCode neg_key, InputKeyCode pos_key) {
 		if (old == cur)
 			return;
 		if (old == DirState::POS) {
-			KeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, pos_key, KEY_UP }, root);
+			FakeKeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, pos_key, KeyInputFlags::UP }, root);
 		} else if (old == DirState::NEG) {
-			KeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, neg_key, KEY_UP }, root);
+			FakeKeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, neg_key, KeyInputFlags::UP }, root);
 		}
 		if (cur == DirState::POS) {
-			KeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, pos_key, KEY_DOWN }, root);
+			FakeKeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, pos_key, KeyInputFlags::DOWN }, root);
 		} else if (cur == DirState::NEG) {
-			KeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, neg_key, KEY_DOWN }, root);
+			FakeKeyEvent(KeyInput{ DEVICE_ID_KEYBOARD, neg_key, KeyInputFlags::DOWN }, root);
 		}
 	};
 
@@ -329,10 +393,10 @@ bool AxisEvent(const AxisInput &axis, ViewGroup *root) {
 	case DEVICE_ID_PAD_1:
 	case DEVICE_ID_PAD_2:
 	case DEVICE_ID_PAD_3:
-	case DEVICE_ID_X360_0:
-	case DEVICE_ID_X360_1:
-	case DEVICE_ID_X360_2:
-	case DEVICE_ID_X360_3:
+	case DEVICE_ID_XINPUT_0:
+	case DEVICE_ID_XINPUT_1:
+	case DEVICE_ID_XINPUT_2:
+	case DEVICE_ID_XINPUT_3:
 	{
 		PrevState &old = state[stateKey];
 		DirState dir = DirState::NONE;
@@ -351,7 +415,7 @@ bool AxisEvent(const AxisInput &axis, ViewGroup *root) {
 				// We stupidly interpret the joystick Y axis backwards on Android and Linux instead of reversing
 				// it early (see keymaps...). Too late to fix without invalidating a lot of config files, so we
 				// reverse it here too.
-#if PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(LINUX)
+#if PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(LINUX) || PPSSPP_PLATFORM(SWITCH)
 				GenerateKeyFromAxis(old.y, dir, NKCODE_DPAD_UP, NKCODE_DPAD_DOWN);
 #else
 				GenerateKeyFromAxis(old.y, dir, NKCODE_DPAD_DOWN, NKCODE_DPAD_UP);
@@ -365,48 +429,90 @@ bool AxisEvent(const AxisInput &axis, ViewGroup *root) {
 		}
 		break;
 	}
+	default:
+		break;
 	}
 
 	root->Axis(axis);
-	return true;
 }
 
-void UpdateViewHierarchy(ViewGroup *root) {
+static void ProcessHeldKeys(ViewGroup *root) {
+	double now = time_now_d();
+
+	// Collect the due repeats under the lock, then dispatch them without it, since a view's
+	// key handler can call back in here (EnableFocusMovement clears heldKeys).
+	std::vector<HeldKey> due;
+	{
+		std::lock_guard<std::mutex> guard(focusMovesLock);
+		for (auto iter = heldKeys.begin(); iter != heldKeys.end(); ) {
+			if (iter->triggerTime < now) {
+				due.push_back(*iter);
+				iter = heldKeys.erase(iter);
+			} else {
+				++iter;
+			}
+		}
+		for (HeldKey hk : due) {
+			hk.triggerTime = now + repeatInterval;
+			heldKeys.insert(hk);
+		}
+	}
+
+	for (const HeldKey &hk : due) {
+		KeyInput key;
+		key.keyCode = hk.key;
+		key.deviceId = hk.deviceId;
+		key.flags = KeyInputFlags::DOWN;
+		KeyEvent(key, root);
+
+		std::lock_guard<std::mutex> guard(focusMovesLock);
+		focusMoves.push_back(hk.move);
+	}
+}
+
+DialogResult UpdateViewHierarchy(ViewGroup *root, bool canEnableFocusMovement) {
 	ProcessHeldKeys(root);
 	frameCount++;
 
 	if (!root) {
-		ERROR_LOG(SYSTEM, "Tried to update a view hierarchy from a zero pointer root");
-		return;
+		ERROR_LOG(Log::UI, "Tried to update a view hierarchy from a zero pointer root");
+		return DR_NONE;
 	}
 
-	if (focusMoves.size()) {
-		std::lock_guard<std::mutex> lock(focusLock);
+	std::vector<FocusMove> moves;
+	{
+		std::lock_guard<std::mutex> guard(focusMovesLock);
+		moves.swap(focusMoves);
+	}
+
+	if (moves.size() && canEnableFocusMovement) {
 		EnableFocusMovement(true);
 		if (!GetFocusedView()) {
+			// Find a view to focus.
 			View *defaultView = root->GetDefaultFocusView();
 			// Can't focus what you can't see.
 			if (defaultView && defaultView->GetVisibility() == V_VISIBLE) {
-				root->GetDefaultFocusView()->SetFocus();
+				root->GetDefaultFocusView()->SetFocus(UI::FocusFlags::CAUSE_FOCUS_MOVE);
 			} else {
-				root->SetFocus();
+				root->SetFocus(UI::FocusFlags::CAUSE_FOCUS_MOVE);
 			}
 			root->SubviewFocused(GetFocusedView());
 		} else {
-			for (size_t i = 0; i < focusMoves.size(); i++) {
-				switch (focusMoves[i]) {
-				case NKCODE_DPAD_LEFT: MoveFocus(root, FOCUS_LEFT); break;
-				case NKCODE_DPAD_RIGHT: MoveFocus(root, FOCUS_RIGHT); break;
-				case NKCODE_DPAD_UP: MoveFocus(root, FOCUS_UP); break;
-				case NKCODE_DPAD_DOWN: MoveFocus(root, FOCUS_DOWN); break;
-				}
+			for (FocusMove move : moves) {
+				MoveFocus(root, move);
 			}
 		}
-		focusMoves.clear();
+	}
+
+	if (scrollFocusedIntoView) {
+		scrollFocusedIntoView = false;
+		if (focusedView) {
+			root->SubviewFocused(focusedView);
+		}
 	}
 
 	root->Update();
-	DispatchEvents();
+	return DispatchEvents();
 }
 
-}
+}  // namespace UI

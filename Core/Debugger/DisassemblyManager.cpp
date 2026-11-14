@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
+
 #include <string>
 #include <algorithm>
 #include <map>
@@ -23,66 +24,115 @@
 #include "ext/xxhash.h"
 
 #include "Common/CommonTypes.h"
+#include "Common/Data/Encoding/Utf8.h"
+#include "Common/Log.h"
+#include "Common/StringUtils.h"
+#include "Common/Math/math_util.h"
+#include "Core/Core.h"
 #include "Core/MemMap.h"
 #include "Core/System.h"
+#include "Core/MIPS/MIPSDebugInterface.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
 #include "Core/MIPS/MIPSTables.h"
 #include "Core/Debugger/DebugInterface.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/Debugger/DisassemblyManager.h"
 
-std::map<u32, DisassemblyEntry*> DisassemblyManager::entries;
-std::recursive_mutex DisassemblyManager::entriesLock_;
-DebugInterface* DisassemblyManager::cpu;
-int DisassemblyManager::maxParamChars = 29;
+DisassemblyManager g_disassemblyManager;
 
-bool isInInterval(u32 start, u32 size, u32 value)
-{
+void ClearDisassemblyCache() {
+	g_disassemblyManager.clear();
+}
+
+bool isInInterval(u32 start, u32 size, u32 value) {
 	return start <= value && value <= (start+size-1);
 }
 
+bool IsLikelyStringAt(uint32_t addr) {
+	uint32_t maxLen = Memory::ClampValidSizeAt(addr, 128);
+	if (maxLen <= 1)
+		return false;
+	const char *p = Memory::GetCharPointer(addr);
+	// If there's no terminator nearby, let's say no.
+	if (memchr(p, 0, maxLen) == nullptr)
+		return false;
+
+	// Allow tabs and newlines.
+	static constexpr bool validControl[] = {
+		false, false, false, false, false, false, false, false,
+		false, true, true, true, false, true, false, false,
+		false, false, false, false, false, false, false, false,
+		false, false, false, false, false, false, false, false,
+	};
+
+	// Check that there's some bytes before the terminator that look like a string.
+	UTF8 utf(p);
+	if (utf.end())
+		return false;
+
+	char verify[4];
+	while (!utf.end()) {
+		if (utf.invalid())
+			return false;
+
+		int pos = utf.byteIndex();
+		uint32_t c = utf.next();
+		int len = UTF8::encode(verify, c);
+		// Our decoder is a bit lax, so let's verify this is a normal encoding.
+		// This prevents us from trying to output invalid encodings in the debugger.
+		if (memcmp(p + pos, verify, len) != 0 || pos + len != utf.byteIndex())
+			return false;
+
+		if (c < ARRAY_SIZE(validControl) && !validControl[c])
+			return false;
+		if (c > 0x0010FFFF)
+			return false;
+	}
+
+	return true;
+}
 
 static HashType computeHash(u32 address, u32 size)
 {
+	if (!Memory::IsValidAddress(address))
+		return 0;
+
+	size = Memory::ClampValidSizeAt(address, size);
 #if PPSSPP_ARCH(AMD64)
-	return XXH3_64bits(Memory::GetPointer(address), size);
+	return XXH3_64bits(Memory::GetPointerUnchecked(address), size);
 #else
-	return XXH3_64bits(Memory::GetPointer(address), size) & 0xFFFFFFFF;
+	return XXH3_64bits(Memory::GetPointerUnchecked(address), size) & 0xFFFFFFFF;
 #endif
 }
 
 
-void parseDisasm(const char* disasm, char* opcode, char* arguments, bool insertSymbols)
-{
+static void parseDisasm(const char *disasm, char *opcode, size_t opcodeSize, char *arguments, size_t argumentsSize, bool insertSymbols) {
 	// copy opcode
-	while (*disasm != 0 && *disasm != '\t')
-	{
-		*opcode++ = *disasm++;
+	size_t opcodePos = 0;
+	while (*disasm != 0 && *disasm != '\t' && opcodePos + 1 < opcodeSize) {
+		opcode[opcodePos++] = *disasm++;
 	}
-	*opcode = 0;
+	opcode[opcodePos] = 0;
 
-	if (*disasm++ == 0)
-	{
+	// Otherwise it's a tab, and we skip intentionally.
+	if (*disasm++ == 0) {
 		*arguments = 0;
 		return;
 	}
 
 	const char* jumpAddress = strstr(disasm,"->$");
 	const char* jumpRegister = strstr(disasm,"->");
-	while (*disasm != 0)
-	{
+	size_t argumentsPos = 0;
+	while (*disasm != 0 && argumentsPos + 1 < argumentsSize) {
 		// parse symbol
-		if (disasm == jumpAddress)
-		{
-			u32 branchTarget;
-			sscanf(disasm+3,"%08x",&branchTarget);
-
+		if (disasm == jumpAddress) {
+			u32 branchTarget = 0;
+			sscanf(disasm+3, "%08x", &branchTarget);
 			const std::string addressSymbol = g_symbolMap->GetLabelString(branchTarget);
-			if (!addressSymbol.empty() && insertSymbols)
-			{
-				arguments += sprintf(arguments,"%s",addressSymbol.c_str());
+			if (!addressSymbol.empty() && insertSymbols) {
+				argumentsPos += snprintf(&arguments[argumentsPos], argumentsSize - argumentsPos, "%s", addressSymbol.c_str());
 			} else {
-				arguments += sprintf(arguments,"0x%08X",branchTarget);
+				argumentsPos += snprintf(&arguments[argumentsPos], argumentsSize - argumentsPos, "0x%08X", branchTarget);
 			}
 
 			disasm += 3+8;
@@ -92,15 +142,14 @@ void parseDisasm(const char* disasm, char* opcode, char* arguments, bool insertS
 		if (disasm == jumpRegister)
 			disasm += 2;
 
-		if (*disasm == ' ')
-		{
+		if (*disasm == ' ') {
 			disasm++;
 			continue;
 		}
-		*arguments++ = *disasm++;
+		arguments[argumentsPos++] = *disasm++;
 	}
 
-	*arguments = 0;
+	arguments[argumentsPos] = 0;
 }
 
 std::map<u32,DisassemblyEntry*>::iterator findDisassemblyEntry(std::map<u32,DisassemblyEntry*>& entries, u32 address, bool exact)
@@ -139,19 +188,23 @@ std::map<u32,DisassemblyEntry*>::iterator findDisassemblyEntry(std::map<u32,Disa
 	return entries.end();
 }
 
+void DisassemblyManager::setCpu(DebugInterface *cpu) {
+	_dbg_assert_(cpu);
+	cpu_ = cpu;
+};
+
 void DisassemblyManager::analyze(u32 address, u32 size = 1024)
 {
 	u32 end = address+size;
 
-	address &= ~3;
+	address = RoundDownToMultipleOf(address, 4);
 	u32 start = address;
 
 	while (address < end && start <= address)
 	{
-		if (!PSP_IsInited())
+		if (PSP_GetBootState() != BootState::Complete)
 			return;
 
-		auto memLock = Memory::Lock();
 		std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 		auto it = findDisassemblyEntry(entries, address, false);
 		if (it != entries.end())
@@ -186,7 +239,10 @@ void DisassemblyManager::analyze(u32 address, u32 size = 1024)
 					entries[address] = opcode;
 				}
 
-				DisassemblyData* data = new DisassemblyData(address,next-alignedNext,DATATYPE_BYTE);
+				// This entry represents the misaligned tail [alignedNext, next), stored
+				// under key alignedNext - its own address must match, not the (possibly
+				// much earlier) start of the aligned opcode range above.
+				DisassemblyData* data = new DisassemblyData(alignedNext,next-alignedNext,DATATYPE_BYTE);
 				entries[alignedNext] = data;
 			} else {
 				DisassemblyOpcode* opcode = new DisassemblyOpcode(address,(next-address)/4);
@@ -240,12 +296,9 @@ std::vector<BranchLine> DisassemblyManager::getBranchLines(u32 start, u32 size)
 
 void DisassemblyManager::getLine(u32 address, bool insertSymbols, DisassemblyLineInfo &dest, DebugInterface *cpuDebug)
 {
-	// This is here really to avoid lock ordering issues.
-	auto memLock = Memory::Lock();
 	std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 	auto it = findDisassemblyEntry(entries,address,false);
-	if (it == entries.end())
-	{
+	if (it == entries.end()) {
 		analyze(address);
 		it = findDisassemblyEntry(entries,address,false);
 	}
@@ -268,13 +321,12 @@ void DisassemblyManager::getLine(u32 address, bool insertSymbols, DisassemblyLin
 		dest.params = "Disassembly failure";
 	} else {
 		dest.name = "-";
-		dest.params = "";
+		dest.params.clear();
 	}
 }
 
 u32 DisassemblyManager::getStartAddress(u32 address)
 {
-	auto memLock = Memory::Lock();
 	std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 	auto it = findDisassemblyEntry(entries,address,false);
 	if (it == entries.end())
@@ -292,15 +344,13 @@ u32 DisassemblyManager::getStartAddress(u32 address)
 
 u32 DisassemblyManager::getNthPreviousAddress(u32 address, int n)
 {
-	auto memLock = Memory::Lock();
 	std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 	while (Memory::IsValidAddress(address))
 	{
 		auto it = findDisassemblyEntry(entries,address,false);
 		if (it == entries.end())
 			break;
-		while (it != entries.end())
-		{
+		while (it != entries.end()) {
 			DisassemblyEntry* entry = it->second;
 			int oldLineNum = entry->getLineNum(address,true);
 			if (n <= oldLineNum)
@@ -316,12 +366,11 @@ u32 DisassemblyManager::getNthPreviousAddress(u32 address, int n)
 		analyze(address-127,128);
 	}
 	
-	return address-n*4;
+	return (address - n * 4) & ~3;
 }
 
 u32 DisassemblyManager::getNthNextAddress(u32 address, int n)
 {
-	auto memLock = Memory::Lock();
 	std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 	while (Memory::IsValidAddress(address))
 	{
@@ -348,7 +397,7 @@ u32 DisassemblyManager::getNthNextAddress(u32 address, int n)
 		analyze(address);
 	}
 
-	return address+n*4;
+	return (address + n * 4) & ~3;
 }
 
 DisassemblyManager::~DisassemblyManager() {
@@ -356,7 +405,6 @@ DisassemblyManager::~DisassemblyManager() {
 
 void DisassemblyManager::clear()
 {
-	auto memLock = Memory::Lock();
 	std::lock_guard<std::recursive_mutex> guard(entriesLock_);
 	for (auto it = entries.begin(); it != entries.end(); it++)
 	{
@@ -367,8 +415,7 @@ void DisassemblyManager::clear()
 
 DisassemblyFunction::DisassemblyFunction(u32 _address, u32 _size): address(_address), size(_size)
 {
-	auto memLock = Memory::Lock();
-	if (!PSP_IsInited())
+	if (PSP_GetBootState() != BootState::Complete)
 		return;
 
 	hash = computeHash(address,size);
@@ -381,8 +428,7 @@ DisassemblyFunction::~DisassemblyFunction() {
 
 void DisassemblyFunction::recheck()
 {
-	auto memLock = Memory::Lock();
-	if (!PSP_IsInited())
+	if (PSP_GetBootState() != BootState::Complete)
 		return;
 
 	HashType newHash = computeHash(address,size);
@@ -433,6 +479,11 @@ int DisassemblyFunction::getLineNum(u32 address, bool findStart)
 u32 DisassemblyFunction::getLineAddress(int line)
 {
 	std::lock_guard<std::recursive_mutex> guard(lock_);
+	// A zero-size function leaves lineAddresses empty (e.g. from a symbol added
+	// with size 0 via the WebSocket debugger API or a crafted ELF symtab entry);
+	// fall back to the function's own base address rather than indexing OOB.
+	if (line < 0 || (size_t)line >= lineAddresses.size())
+		return address;
 	return lineAddresses[line];
 }
 
@@ -484,10 +535,10 @@ void DisassemblyFunction::generateBranchLines()
 	u32 end = address+size;
 
 	std::lock_guard<std::recursive_mutex> guard(lock_);
-	DebugInterface* cpu = DisassemblyManager::getCpu();
+	DebugInterface *cpu = g_disassemblyManager.getCpu();
 	for (u32 funcPos = address; funcPos < end; funcPos += 4)
 	{
-		MIPSAnalyst::MipsOpcodeInfo opInfo = MIPSAnalyst::GetOpcodeInfo(cpu,funcPos);
+		MIPSAnalyst::MipsOpcodeInfo opInfo = MIPSAnalyst::GetOpcodeInfo(cpu, funcPos);
 
 		bool inFunction = (opInfo.branchTarget >= address && opInfo.branchTarget < end);
 		if (opInfo.isBranch && !opInfo.isBranchToRegister && !opInfo.isLinkedBranch && inFunction) {
@@ -546,6 +597,7 @@ void DisassemblyFunction::addOpcodeSequence(u32 start, u32 end)
 	DisassemblyOpcode* opcode = new DisassemblyOpcode(start,(end-start)/4);
 	std::lock_guard<std::recursive_mutex> guard(lock_);
 	entries[start] = opcode;
+	lineAddresses.reserve((end - start) / 4);
 	for (u32 pos = start; pos < end; pos += 4)
 	{
 		lineAddresses.push_back(pos);
@@ -556,27 +608,7 @@ void DisassemblyFunction::load()
 {
 	generateBranchLines();
 
-	// gather all branch targets
-	std::set<u32> branchTargets;
-	{
-		std::lock_guard<std::recursive_mutex> guard(lock_);
-		for (size_t i = 0; i < lines.size(); i++)
-		{
-			switch (lines[i].type)
-			{
-			case LINE_DOWN:
-				branchTargets.insert(lines[i].second);
-				break;
-			case LINE_UP:
-				branchTargets.insert(lines[i].first);
-				break;
-			default:
-				break;
-			}
-		}
-	}
-	
-	DebugInterface* cpu = DisassemblyManager::getCpu();
+	DebugInterface *cpu = g_disassemblyManager.getCpu();
 	u32 funcPos = address;
 	u32 funcEnd = address+size;
 
@@ -616,7 +648,6 @@ void DisassemblyFunction::load()
 		}
 
 		MIPSAnalyst::MipsOpcodeInfo opInfo = MIPSAnalyst::GetOpcodeInfo(cpu,funcPos);
-		u32 opAddress = funcPos;
 		funcPos += 4;
 
 		// skip branches and their delay slots
@@ -624,84 +655,6 @@ void DisassemblyFunction::load()
 		{
 			funcPos += 4;
 			continue;
-		}
-
-		// lui
-		if (MIPS_GET_OP(opInfo.encodedOpcode) == 0x0F && funcPos < funcEnd && funcPos != nextData)
-		{
-			MIPSOpcode next = Memory::Read_Instruction(funcPos);
-			MIPSInfo nextInfo = MIPSGetInfo(next);
-
-			u32 immediate = ((opInfo.encodedOpcode & 0xFFFF) << 16) + (s16)(next.encoding & 0xFFFF);
-			int rt = MIPS_GET_RT(opInfo.encodedOpcode);
-
-			int nextRs = MIPS_GET_RS(next.encoding);
-			int nextRt = MIPS_GET_RT(next.encoding);
-
-			// both rs and rt of the second op have to match rt of the first,
-			// otherwise there may be hidden consequences if the macro is displayed.
-			// also, don't create a macro if something branches into the middle of it
-			if (nextRs == rt && nextRt == rt && branchTargets.find(funcPos) == branchTargets.end())
-			{
-				DisassemblyMacro* macro = NULL;
-				switch (MIPS_GET_OP(next.encoding))
-				{
-				case 0x09:	// addiu
-					macro = new DisassemblyMacro(opAddress);
-					macro->setMacroLi(immediate,rt);
-					funcPos += 4;
-					break;
-				case 0x20:	// lb
-				case 0x21:	// lh
-				case 0x23:	// lw
-				case 0x24:	// lbu
-				case 0x25:	// lhu
-				case 0x28:	// sb
-				case 0x29:	// sh
-				case 0x2B:	// sw
-					macro = new DisassemblyMacro(opAddress);
-					
-					int dataSize;
-					switch (nextInfo & MEMTYPE_MASK) {
-					case MEMTYPE_BYTE:
-						dataSize = 1;
-						break;
-					case MEMTYPE_HWORD:
-						dataSize = 2;
-						break;
-					case MEMTYPE_WORD:
-					case MEMTYPE_FLOAT:
-						dataSize = 4;
-						break;
-					case MEMTYPE_VQUAD:
-						dataSize = 16;
-						break;
-					default:
-						delete macro;
-						return;
-					}
-
-					macro->setMacroMemory(MIPSGetName(next),immediate,rt,dataSize);
-					funcPos += 4;
-					break;
-				}
-
-				if (macro != NULL)
-				{
-					if (opcodeSequenceStart != opAddress)
-						addOpcodeSequence(opcodeSequenceStart,opAddress);
-
-					std::lock_guard<std::recursive_mutex> guard(lock_);
-					entries[opAddress] = macro;
-					for (int i = 0; i < macro->getNumLines(); i++)
-					{
-						lineAddresses.push_back(macro->getLineAddress(i));
-					}
-
-					opcodeSequenceStart = funcPos;
-					continue;
-				}
-			}
 		}
 
 		// just a normal opcode
@@ -725,14 +678,11 @@ void DisassemblyFunction::clear()
 	hash = 0;
 }
 
-bool DisassemblyOpcode::disassemble(u32 address, DisassemblyLineInfo &dest, bool insertSymbols, DebugInterface *cpuDebug)
-{
-	if (!cpuDebug)
-		cpuDebug = DisassemblyManager::getCpu();
-
+bool DisassemblyOpcode::disassemble(u32 address, DisassemblyLineInfo &dest, bool insertSymbols, DebugInterface *cpuDebug) {
 	char opcode[64],arguments[256];
-	const char *dizz = cpuDebug->disasm(address, 4);
-	parseDisasm(dizz,opcode,arguments,insertSymbols);
+	char dizz[512];
+	DisAsm(address, dizz, sizeof(dizz));
+	parseDisasm(dizz, opcode, sizeof(opcode), arguments, sizeof(arguments), insertSymbols);
 	dest.type = DISTYPE_OPCODE;
 	dest.name = opcode;
 	dest.params = arguments;
@@ -755,7 +705,7 @@ void DisassemblyOpcode::getBranchLines(u32 start, u32 size, std::vector<BranchLi
 	int lane = 0;
 	for (u32 pos = start; pos < start+size; pos += 4)
 	{
-		MIPSAnalyst::MipsOpcodeInfo info = MIPSAnalyst::GetOpcodeInfo(DisassemblyManager::getCpu(),pos);
+		MIPSAnalyst::MipsOpcodeInfo info = MIPSAnalyst::GetOpcodeInfo(g_disassemblyManager.getCpu(),pos);
 		if (info.isBranch && !info.isBranchToRegister && !info.isLinkedBranch) {
 			if (!Memory::IsValidAddress(info.branchTarget))
 				continue;
@@ -779,94 +729,16 @@ void DisassemblyOpcode::getBranchLines(u32 start, u32 size, std::vector<BranchLi
 }
 
 
-void DisassemblyMacro::setMacroLi(u32 _immediate, u8 _rt)
-{
-	type = MACRO_LI;
-	name = "li";
-	immediate = _immediate;
-	rt = _rt;
-	numOpcodes = 2;
-}
-
-void DisassemblyMacro::setMacroMemory(std::string _name, u32 _immediate, u8 _rt, int _dataSize)
-{
-	type = MACRO_MEMORYIMM;
-	name = _name;
-	immediate = _immediate;
-	rt = _rt;
-	dataSize = _dataSize;
-	numOpcodes = 2;
-}
-
-bool DisassemblyMacro::disassemble(u32 address, DisassemblyLineInfo &dest, bool insertSymbols, DebugInterface *cpuDebug)
-{
-	if (!cpuDebug)
-		cpuDebug = DisassemblyManager::getCpu();
-
-	char buffer[64];
-	dest.type = DISTYPE_MACRO;
-	dest.info = MIPSAnalyst::GetOpcodeInfo(cpuDebug, address);
-
-	std::string addressSymbol;
-	switch (type)
-	{
-	case MACRO_LI:
-		dest.name = name;
-		
-		addressSymbol = g_symbolMap->GetLabelString(immediate);
-		if (!addressSymbol.empty() && insertSymbols) {
-			sprintf(buffer, "%s,%s", cpuDebug->GetRegName(0, rt), addressSymbol.c_str());
-		} else {
-			sprintf(buffer, "%s,0x%08X", cpuDebug->GetRegName(0, rt), immediate);
-		}
-
-		dest.params = buffer;
-		
-		dest.info.hasRelevantAddress = true;
-		dest.info.relevantAddress = immediate;
-		break;
-	case MACRO_MEMORYIMM:
-		dest.name = name;
-
-		addressSymbol = g_symbolMap->GetLabelString(immediate);
-		if (!addressSymbol.empty() && insertSymbols) {
-			sprintf(buffer, "%s,%s", cpuDebug->GetRegName(0, rt), addressSymbol.c_str());
-		} else {
-			sprintf(buffer, "%s,0x%08X", cpuDebug->GetRegName(0, rt), immediate);
-		}
-
-		dest.params = buffer;
-
-		dest.info.isDataAccess = true;
-		dest.info.dataAddress = immediate;
-		dest.info.dataSize = dataSize;
-
-		dest.info.hasRelevantAddress = true;
-		dest.info.relevantAddress = immediate;
-		break;
-	default:
-		return false;
-	}
-
-	dest.totalSize = getTotalSize();
-	return true;
-}
-
-
 DisassemblyData::DisassemblyData(u32 _address, u32 _size, DataType _type): address(_address), size(_size), type(_type)
 {
-	auto memLock = Memory::Lock();
-	if (!PSP_IsInited())
-		return;
-
+	_dbg_assert_(PSP_GetBootState() == BootState::Complete);
 	hash = computeHash(address,size);
 	createLines();
 }
 
 void DisassemblyData::recheck()
 {
-	auto memLock = Memory::Lock();
-	if (!PSP_IsInited())
+	if (PSP_GetBootState() != BootState::Complete)
 		return;
 
 	HashType newHash = computeHash(address,size);
@@ -931,8 +803,17 @@ void DisassemblyData::createLines()
 	lineAddresses.clear();
 
 	u32 pos = address;
-	u32 end = address+size;
-	u32 maxChars = DisassemblyManager::getMaxParamChars();
+	const u32 end = address + size;
+
+	if (!Memory::IsValidRange(address, size)) {
+		ERROR_LOG(Log::CPU, "DisassemblyData can't create lines for invalid range 0x%08X-0x%08X", address, end);
+		// The loop below reads through [pos, end) with the Unchecked accessors, which
+		// on non-masked builds do a raw *(base+address) with no bounds check at all -
+		// don't fall through into that for a range we just determined is invalid.
+		return;
+	}
+
+	const u32 maxChars = g_disassemblyManager.getMaxParamChars();
 	
 	std::string currentLine;
 	u32 currentLineStart = pos;
@@ -943,7 +824,7 @@ void DisassemblyData::createLines()
 		bool inString = false;
 		while (pos < end)
 		{
-			u8 b = Memory::Read_U8(pos++);
+			u8 b = Memory::ReadUnchecked_U8(pos++);
 			if (b >= 0x20 && b <= 0x7F)
 			{
 				if (currentLine.size()+1 >= maxChars)
@@ -955,7 +836,7 @@ void DisassemblyData::createLines()
 					lines[currentLineStart] = entry;
 					lineAddresses.push_back(currentLineStart);
 					
-					currentLine = "";
+					currentLine.clear();
 					currentLineStart = pos-1;
 					inString = false;
 				}
@@ -967,9 +848,9 @@ void DisassemblyData::createLines()
 			} else {
 				char buffer[64];
 				if (pos == end && b == 0)
-					strcpy(buffer,"0");
+					truncate_cpy(buffer, "0");
 				else
-					sprintf(buffer,"0x%02X",b);
+					snprintf(buffer, sizeof(buffer), "0x%02X", b);
 
 				if (currentLine.size()+strlen(buffer) >= maxChars)
 				{
@@ -980,7 +861,7 @@ void DisassemblyData::createLines()
 					lines[currentLineStart] = entry;
 					lineAddresses.push_back(currentLineStart);
 					
-					currentLine = "";
+					currentLine.clear();
 					currentLineStart = pos-1;
 					inString = false;
 				}
@@ -1020,18 +901,18 @@ void DisassemblyData::createLines()
 			switch (type)
 			{
 			case DATATYPE_BYTE:
-				value = Memory::Read_U8(pos);
+				value = Memory::ReadUnchecked_U8(pos);
 				snprintf(buffer, sizeof(buffer), "0x%02X", value);
 				pos++;
 				break;
 			case DATATYPE_HALFWORD:
-				value = Memory::Read_U16(pos);
+				value = Memory::ReadUnchecked_U16(pos);
 				snprintf(buffer, sizeof(buffer), "0x%04X", value);
 				pos += 2;
 				break;
 			case DATATYPE_WORD:
 				{
-					value = Memory::Read_U32(pos);
+					value = Memory::ReadUnchecked_U32(pos);
 					const std::string label = g_symbolMap->GetLabelString(value);
 					if (!label.empty())
 						snprintf(buffer, sizeof(buffer), "%s", label.c_str());
@@ -1051,7 +932,7 @@ void DisassemblyData::createLines()
 				lines[currentLineStart] = entry;
 				lineAddresses.push_back(currentLineStart);
 
-				currentLine = "";
+				currentLine.clear();
 				currentLineStart = currentPos;
 			}
 
@@ -1069,17 +950,186 @@ void DisassemblyData::createLines()
 }
 
 
-DisassemblyComment::DisassemblyComment(u32 _address, u32 _size, std::string _name, std::string _param)
-	: address(_address), size(_size), name(_name), param(_param)
-{
+DisassemblyComment::DisassemblyComment(u32 _address, u32 _size, std::string_view _name, std::string_view _param)
+	: address(_address), size(_size), name(_name), param(_param) {}
 
-}
-
-bool DisassemblyComment::disassemble(u32 address, DisassemblyLineInfo &dest, bool insertSymbols, DebugInterface *cpuDebug)
-{
+bool DisassemblyComment::disassemble(u32 address, DisassemblyLineInfo &dest, bool insertSymbols, DebugInterface *cpuDebug) {
 	dest.type = DISTYPE_OTHER;
 	dest.name = name;
 	dest.params = param;
 	dest.totalSize = size;
 	return true;
+}
+
+bool GetDisasmAddressText(u32 address, char *dest, size_t bufSize, bool abbreviateLabels, bool showData, bool displaySymbols) {
+	if (!Memory::IsValid4AlignedAddress(address)) {
+		snprintf(dest, bufSize, "(bad address!)");
+		return true;
+	}
+	if (displaySymbols) {
+		const std::string addressSymbol = g_symbolMap->GetLabelString(address);
+		if (!addressSymbol.empty()) {
+			for (int k = 0; addressSymbol[k] != 0; k++) {
+				// abbreviate long names
+				if (abbreviateLabels && k == 16 && addressSymbol[k+1] != 0) {
+					*dest++ = '+';
+					break;
+				}
+				*dest++ = addressSymbol[k];
+			}
+			*dest++ = ':';
+			*dest = 0;
+			return true;
+		} else {
+			snprintf(dest, bufSize, "    %08X",address);
+			return false;
+		}
+	} else {
+		if (showData) {
+			const u32 encoding = Memory::Read_Instruction(address).encoding;
+			snprintf(dest, bufSize, "%08X %08X", address, encoding);
+		} else {
+			snprintf(dest, bufSize, "%08X", address);
+		}
+		return false;
+	}
+}
+
+// Utilify function from the old debugger.
+std::string DisassembleRange(u32 start, u32 size, bool displaySymbols, MIPSDebugInterface *debugger) {
+	CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+	std::string result;
+
+	// gather all branch targets without labels
+	std::set<u32> branchAddresses;
+	for (u32 i = 0; i < size; i += debugger->getInstructionSize(0)) {
+		MIPSAnalyst::MipsOpcodeInfo info = MIPSAnalyst::GetOpcodeInfo(debugger, start + i);
+
+		if (info.isBranch && g_symbolMap->GetLabelString(info.branchTarget).empty()) {
+			if (branchAddresses.find(info.branchTarget) == branchAddresses.end()) {
+				branchAddresses.insert(info.branchTarget);
+			}
+		}
+	}
+
+	u32 disAddress = start;
+	bool previousLabel = true;
+	DisassemblyLineInfo line;
+	while (disAddress < start + size) {
+		char addressText[64], buffer[512];
+
+		g_disassemblyManager.getLine(disAddress, displaySymbols, line, debugger);
+		bool isLabel = GetDisasmAddressText(disAddress, addressText, sizeof(addressText), false, line.type == DISTYPE_OPCODE, displaySymbols);
+
+		if (isLabel) {
+			if (!previousLabel)
+				result += "\r\n";
+			snprintf(buffer, sizeof(buffer), "%s\r\n\r\n", addressText);
+			result += buffer;
+		} else if (branchAddresses.find(disAddress) != branchAddresses.end()) {
+			if (!previousLabel)
+				result += "\r\n";
+			snprintf(buffer, sizeof(buffer), "pos_%08X:\r\n\r\n", disAddress);
+			result += buffer;
+		}
+
+		if (line.info.isBranch && !line.info.isBranchToRegister
+			&& g_symbolMap->GetLabelString(line.info.branchTarget).empty()
+			&& branchAddresses.find(line.info.branchTarget) != branchAddresses.end()) {
+			snprintf(buffer, sizeof(buffer), "pos_%08X", line.info.branchTarget);
+			line.params = line.params.substr(0, line.params.find("0x")) + buffer;
+		}
+
+		snprintf(buffer, sizeof(buffer), "\t%s\t%s\r\n", line.name.c_str(), line.params.c_str());
+		result += buffer;
+		previousLabel = isLabel;
+		disAddress += line.totalSize;
+	}
+
+	return result;
+}
+
+void DisassemblyLineInfo::ToString(char *text, size_t bufSize, u32 curAddress) const {
+	text[0] = 0;
+	if (type == DISTYPE_OPCODE) {
+		if (info.hasRelevantAddress && IsLikelyStringAt(info.relevantAddress)) {
+			snprintf(text, bufSize, "[%08X] = \"%s\"", info.relevantAddress, Memory::GetCharPointer(info.relevantAddress));
+		}
+
+		if (info.isDataAccess) {
+			if (!Memory::IsValidRange(info.dataAddress, info.dataSize)) {
+				snprintf(text, bufSize, "Invalid address %08X", info.dataAddress);
+			} else {
+				bool isFloat = MIPSGetInfo(info.encodedOpcode) & (IS_FPU | IS_VFPU);
+				switch (info.dataSize) {
+				case 1:
+					snprintf(text, bufSize, "[%08X] = %02X", info.dataAddress, Memory::ReadUnchecked_U8(info.dataAddress));
+					break;
+				case 2:
+					snprintf(text, bufSize, "[%08X] = %04X", info.dataAddress, Memory::ReadUnchecked_U16(info.dataAddress));
+					break;
+				case 4:
+				{
+					u32 dataInt = Memory::ReadUnchecked_U32(info.dataAddress);
+					u32 dataFloat = Memory::ReadUnchecked_Float(info.dataAddress);
+					std::string dataString;
+					if (isFloat)
+						dataString = StringFromFormat("%08X / %f", dataInt, dataFloat);
+					else
+						dataString = StringFromFormat("%08X", dataInt);
+
+					const std::string addressSymbol = g_symbolMap->GetLabelString(dataInt);
+					if (!addressSymbol.empty()) {
+						snprintf(text, bufSize, "[%08X] = %s (%s)", info.dataAddress, addressSymbol.c_str(), dataString.c_str());
+					} else {
+						snprintf(text, bufSize, "[%08X] = %s", info.dataAddress, dataString.c_str());
+					}
+					break;
+				}
+				case 16:
+				{
+					uint32_t dataInt[4];
+					float dataFloat[4];
+					for (int i = 0; i < 4; ++i) {
+						dataInt[i] = Memory::ReadUnchecked_U32(info.dataAddress + i * 4);
+						dataFloat[i] = Memory::ReadUnchecked_Float(info.dataAddress + i * 4);
+					}
+					std::string dataIntString = StringFromFormat("%08X,%08X,%08X,%08X", dataInt[0], dataInt[1], dataInt[2], dataInt[3]);
+					std::string dataFloatString = StringFromFormat("%f,%f,%f,%f", dataFloat[0], dataFloat[1], dataFloat[2], dataFloat[3]);
+
+					snprintf(text, bufSize, "[%08X] = %s / %s", info.dataAddress, dataIntString.c_str(), dataFloatString.c_str());
+					break;
+				}
+				}
+			}
+		}
+
+		if (info.isBranch) {
+			const std::string addressSymbol = g_symbolMap->GetLabelString(info.branchTarget);
+			if (addressSymbol.empty()) {
+				snprintf(text, bufSize, "%08X", info.branchTarget);
+			} else {
+				snprintf(text, bufSize, "%08X = %s", info.branchTarget, addressSymbol.c_str());
+			}
+		}
+	} else if (type == DISTYPE_DATA) {
+		u32 start = g_symbolMap->GetDataStart(curAddress);
+		if (start == -1)
+			start = curAddress;
+
+		u32 diff = curAddress - start;
+		const std::string label = g_symbolMap->GetLabelString(start);
+
+		if (!label.empty()) {
+			if (diff != 0)
+				snprintf(text, bufSize, "%08X (%s) + %08X", start, label.c_str(), diff);
+			else
+				snprintf(text, bufSize, "%08X (%s)", start, label.c_str());
+		} else {
+			if (diff != 0)
+				snprintf(text, bufSize, "%08X + %08X", start, diff);
+			else
+				snprintf(text, bufSize, "%08X", start);
+		}
+	}
 }

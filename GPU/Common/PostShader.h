@@ -19,19 +19,21 @@
 // Postprocessing shader manager
 // For FXAA, "Natural", bloom, B&W, cross processing and whatnot.
 
+#pragma once
+
 #include <string>
 #include <vector>
 
-#include "Common/Data/Format/IniFile.h"
+#include "Common/GPU/thin3d.h"
 
 struct ShaderInfo {
-	std::string iniFile;  // which ini file was this definition in? So we can write settings back later
+	Path iniFile;  // which ini file was this definition in? So we can write settings back later
 	std::string section;  // ini file section. This is saved.
 	std::string name;     // Fancy display name.
 	std::string parent;   // Parent shader ini section name.
 
-	std::string fragmentShaderFile;
-	std::string vertexShaderFile;
+	Path fragmentShaderFile;
+	Path vertexShaderFile;
 
 	// Show this shader in lists (i.e. not just for chaining.)
 	bool visible;
@@ -39,10 +41,14 @@ struct ShaderInfo {
 	bool outputResolution;
 	// Use x1 rendering res + nearest screen scaling filter
 	bool isUpscalingFilter;
+	// Is used to post-process stereo-rendering to mono, like red/blue.
+	bool isStereo;
 	// Use 2x display resolution for supersampling with blurry shaders.
 	int SSAAFilterLevel;
 	// Force constant/max refresh for animated filters
 	bool requires60fps;
+	// Takes previous frame as input (for blending effects.)
+	bool usePreviousFrame;
 
 	struct Setting {
 		std::string name;
@@ -56,37 +62,68 @@ struct ShaderInfo {
 	// TODO: Add support for all kinds of fun options like mapping the depth buffer,
 	// SRGB texture reads, etc.  prev shader?
 
-	bool operator == (const std::string &other) {
+	bool operator == (const std::string &other) const {
 		return name == other;
 	}
-	bool operator == (const ShaderInfo &other) {
+	bool operator == (const ShaderInfo &other) const {
 		return name == other.name;
+	}
+
+	bool operator < (const ShaderInfo &other) const {
+		if (name < other.name) return true;
+		if (name > other.name) return false;
+		// Tie breaker
+		if (iniFile < other.iniFile) return true;
+		if (iniFile > other.iniFile) return false;
+		return false;
 	}
 };
 
 struct TextureShaderInfo {
-	std::string iniFile;
+	Path iniFile;
 	std::string section;
 	std::string name;
 
-	std::string computeShaderFile;
-	int maxScale;
+	Path computeShaderFile;
+	std::vector<Path> computeShaderFiles;
 
-	bool operator == (const std::string &other) {
+	// Upscaling shaders have a fixed scale factor.
+	int scaleFactor;
+
+	// Some shaders need to pass some data to the shader, and this is the buffer for that. It's up to the shader to interpret it.
+	Path constantBuffer;
+	bool hidden = false;
+
+	bool operator == (const std::string &other) const {
 		return name == other;
 	}
-	bool operator == (const TextureShaderInfo &other) {
+	bool operator == (const TextureShaderInfo &other) const {
 		return name == other.name;
+	}
+
+	bool operator < (const TextureShaderInfo &other) const {
+		if (name < other.name) return true;
+		if (name > other.name) return false;
+		// Tie breaker
+		if (iniFile < other.iniFile) return true;
+		if (iniFile > other.iniFile) return false;
+		return false;
 	}
 };
 
-void ReloadAllPostShaderInfo();
+void ReloadAllPostShaderInfo(Draw::DrawContext *draw);
 
-const ShaderInfo *GetPostShaderInfo(const std::string &name);
+const ShaderInfo *GetPostShaderInfo(std::string_view name);
 std::vector<const ShaderInfo *> GetPostShaderChain(const std::string &name);
 std::vector<const ShaderInfo *> GetFullPostShadersChain(const std::vector<std::string> &names);
 bool PostShaderChainRequires60FPS(const std::vector<const ShaderInfo *> &chain);
 const std::vector<ShaderInfo> &GetAllPostShaderInfo();
 
-const TextureShaderInfo *GetTextureShaderInfo(const std::string &name);
+const TextureShaderInfo *GetTextureShaderInfo(std::string_view name);
 const std::vector<TextureShaderInfo> &GetAllTextureShaderInfo();
+void RemoveUnknownPostShaders(std::vector<std::string> *names);
+
+// Call this any time you alter the postshader list. It makes sure
+// that "usePrevFrame" shaders are at the end, and that there's only one.
+// It'll also enforce any similar future rules.
+void FixPostShaderOrder(std::vector<std::string> *names);

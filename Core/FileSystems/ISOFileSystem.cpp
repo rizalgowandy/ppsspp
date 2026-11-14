@@ -15,15 +15,16 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
-#include <ctype.h>
-#include <algorithm>
+#include <ctime>
 
-#include "Common/Common.h"
 #include "Common/CommonTypes.h"
+#include "Common/File/FileUtil.h"  // for localtime_r on Windows
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
+#include "Common/StringUtils.h"
 #include "Core/FileSystems/ISOFileSystem.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/MemMap.h"
@@ -31,15 +32,15 @@
 
 const int sectorSize = 2048;
 
-bool parseLBN(std::string filename, u32 *sectorStart, u32 *readSize) {
+bool parseLBN(const std::string &filename, u32 *sectorStart, u32 *readSize) {
 	// The format of this is: "/sce_lbn" "0x"? HEX* ANY* "_size" "0x"? HEX* ANY*
 	// That means that "/sce_lbn/_size1/" is perfectly valid.
 	// Most commonly, it looks like /sce_lbn0x10_size0x100 or /sce_lbn10_size100 (always hex.)
-
 	// If it doesn't starts with /sce_lbn or doesn't have _size, look for a file instead.
-	if (filename.compare(0, sizeof("/sce_lbn") - 1, "/sce_lbn") != 0)
+	if (!startsWith(filename, "/sce_lbn"))
 		return false;
-	size_t size_pos = filename.find("_size");
+
+	const size_t size_pos = filename.find("_size");
 	if (size_pos == filename.npos)
 		return false;
 
@@ -139,16 +140,68 @@ struct VolDescriptor {
 	char zeroos[653];
 };
 
+// From http://howardhinnant.github.io/date_algorithms.html - same one sceRtc.cpp uses. Beats
+// timegm(), which isn't portable, and mktime(), which would drag the host's timezone in.
+static s64 DaysFromCivil(s64 y, u32 m, u32 d) {
+	y -= m <= 2;
+	const s64 era = (y >= 0 ? y : y - 399) / 400;
+	const u32 yoe = (u32)(y - era * 400);                    // [0, 399]
+	const u32 doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;  // [0, 365]
+	const u32 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;   // [0, 146096]
+	return era * 146097 + (s64)doe - 719468;
+}
+
+// The 7-byte date in a directory record, as Unix UTC seconds. Returns 0 if there isn't a real
+// date in there - plenty of ISOs leave it zeroed, and "1900-00-00" isn't worth propagating.
+static s64 UnixTimeFromDirectoryEntry(const DirectoryEntry &dir) {
+	if (dir.month < 1 || dir.month > 12 || dir.day < 1 || dir.day > 31) {
+		return 0;
+	}
+	// years is an offset from 1900, and offsetFromGMT is a signed count of 15-minute steps.
+	const s64 days = DaysFromCivil(1900 + (s64)dir.years, dir.month, dir.day);
+	return days * 86400 + dir.hour * 3600 + dir.minute * 60 + dir.second - (s64)(s8)dir.offsetFromGMT * 15 * 60;
+}
+
+// ISO9660 has one timestamp per file, so it goes into all three of the PSP's. Local time, to
+// match what the other file systems report.
+static void FillFileTimes(PSPFileInfo *info, s64 unixTime) {
+	if (unixTime == 0) {
+		return;
+	}
+	const time_t t = (time_t)unixTime;
+	localtime_r(&t, &info->mtime);
+	info->atime = info->ctime = info->mtime;
+}
+
+// Removes version numbers from filenames.
+static std::string_view CleanISOFileName(std::string_view name) {
+	auto pos = name.find(';');
+	if (pos != name.npos) {
+		name = name.substr(0, pos);
+	}
+	return name;
+}
+
 #pragma pack(pop)
 
-ISOFileSystem::ISOFileSystem(IHandleAllocator *_hAlloc, BlockDevice *_blockDevice) {
+ISOFileSystem::ISOFileSystem(IHandleAllocator *_hAlloc, std::shared_ptr<BlockDevice> _blockDevice) {
 	blockDevice = _blockDevice;
 	hAlloc = _hAlloc;
 
 	VolDescriptor desc;
-	blockDevice->ReadBlock(16, (u8*)&desc);
+	if (!blockDevice->ReadBlock(16, (u8*)&desc)) {
+		// TODO: This is kinda wacky.
+		blockDevice->NotifyReadError();
+		errorString_ = "ISO: error reading volume descriptor";
+		return;
+	}
 
-	entireISO.name = "";
+	if (memcmp(desc.cd001, "CD001", 5)) {
+		errorString_ = "ISO: missing CD001 signature";
+		return;
+	}
+
+	entireISO.name.clear();
 	entireISO.isDirectory = false;
 	entireISO.startingPosition = 0;
 	entireISO.size = _blockDevice->GetNumBlocks();
@@ -163,26 +216,38 @@ ISOFileSystem::ISOFileSystem(IHandleAllocator *_hAlloc, BlockDevice *_blockDevic
 	treeroot->parent = NULL;
 	treeroot->valid = false;
 
-	if (memcmp(desc.cd001, "CD001", 5)) {
-		ERROR_LOG(FILESYS, "ISO looks bogus, expected CD001 signature not present? Giving up...");
-		return;
-	}
-
 	treeroot->startsector = desc.root.firstDataSector;
 	treeroot->dirsize = desc.root.dataLength;
 }
 
 ISOFileSystem::~ISOFileSystem() {
-	delete blockDevice;
 	delete treeroot;
 }
 
-void ISOFileSystem::ReadDirectory(TreeEntry *root) {
-	for (u32 secnum = root->startsector, endsector = root->startsector + (root->dirsize + 2047) / 2048; secnum < endsector; ++secnum) {
+std::string ISOFileSystem::TreeEntry::BuildPath() {
+	if (parent) {
+		return parent->BuildPath() + "/" + name;
+	} else {
+		return name;
+	}
+}
+
+void ISOFileSystem::ReadDirectory(TreeEntry *root) const {
+	// Real directories are a few KB. The size comes from the image, so cap it to keep a corrupt
+	// one from making us parse (and allocate entries for) gigabytes of sectors.
+	const u32 MAX_DIRECTORY_SIZE = 4 * 1024 * 1024;
+	u32 dirsize = root->dirsize;
+	if (dirsize > MAX_DIRECTORY_SIZE) {
+		blockDevice->NotifyReadError();
+		ERROR_LOG(Log::FileSystem, "Directory '%s' claims an implausible size (%u), truncating", root->name.c_str(), dirsize);
+		dirsize = MAX_DIRECTORY_SIZE;
+	}
+	const u32 endsector = (u32)std::min<u64>((u64)root->startsector + (dirsize + 2047) / 2048, blockDevice->GetNumBlocks());
+	for (u32 secnum = root->startsector; secnum < endsector; ++secnum) {
 		u8 theSector[2048];
 		if (!blockDevice->ReadBlock(secnum, theSector)) {
 			blockDevice->NotifyReadError();
-			ERROR_LOG(FILESYS, "Error reading block for directory %s - skipping", root->name.c_str());
+			ERROR_LOG(Log::FileSystem, "Error reading block for directory '%s' in sector %d - skipping", root->name.c_str(), secnum);
 			root->valid = true;  // Prevents re-reading
 			return;
 		}
@@ -197,9 +262,21 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) {
 				break;
 
 			const int IDENTIFIER_OFFSET = 33;
-			if (offset + IDENTIFIER_OFFSET + dir.identifierLength > 2048) {
+			if (offset + IDENTIFIER_OFFSET > 2048 || offset + IDENTIFIER_OFFSET + dir.identifierLength > 2048) {
 				blockDevice->NotifyReadError();
-				ERROR_LOG(FILESYS, "Directory entry crosses sectors, corrupt iso?");
+				ERROR_LOG(Log::FileSystem, "Directory entry crosses sectors, corrupt iso?");
+				root->valid = true;  // Prevents re-reading (and duplicating the children so far)
+				return;
+			}
+			// dir.size (the record length actually consumed) must cover at least its
+			// own header and identifier, or a crafted sector could set it to 1 and
+			// make the loop reinterpret the same overlapping bytes as many separate
+			// entries, allocating far more TreeEntry objects than the sector's real
+			// size warrants.
+			if (dir.size < IDENTIFIER_OFFSET + dir.identifierLength) {
+				blockDevice->NotifyReadError();
+				ERROR_LOG(Log::FileSystem, "Directory entry size too small, corrupt iso?");
+				root->valid = true;
 				return;
 			}
 
@@ -216,7 +293,7 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) {
 				entry->name = "..";
 				relative = true;
 			} else {
-				entry->name = std::string((const char *)&dir.firstIdChar, dir.identifierLength);
+				entry->name = std::string(CleanISOFileName(std::string_view((const char *)&dir.firstIdChar, dir.identifierLength)));
 				relative = false;
 			}
 
@@ -228,12 +305,38 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) {
 			entry->startsector = dir.firstDataSector;
 			entry->dirsize = dir.dataLength;
 			entry->valid = isFile;  // Can pre-mark as valid if file, as we don't recurse into those.
-			VERBOSE_LOG(FILESYS, "%s: %s %08x %08x %i", entry->isDirectory ? "D" : "F", entry->name.c_str(), (u32)dir.firstDataSector, entry->startingPosition, entry->startingPosition);
+			entry->recordTime = UnixTimeFromDirectoryEntry(dir);
+			VERBOSE_LOG(Log::FileSystem, "%s: %s %08x %08x %d", entry->isDirectory ? "D" : "F", entry->name.c_str(), (u32)dir.firstDataSector, entry->startingPosition, entry->startingPosition);
+
+			// Round down to avoid any false reports.
+			if (isFile && dir.firstDataSector + (dir.dataLength / 2048) > blockDevice->GetNumBlocks()) {
+				blockDevice->NotifyReadError();
+				ERROR_LOG(Log::FileSystem, "File '%s' starts or ends outside ISO. firstDataSector: %d len: %d", entry->BuildPath().c_str(), (int)dir.firstDataSector, (int)dir.dataLength);
+			}
+
+			// The directory record is untrusted, and callers size host buffers from entry->size, so
+			// don't let it claim more data than the image actually contains. We clamp rather than
+			// drop the entry - truncated ISOs are common and used to work with just the warning
+			// above, and dropping EBOOT.BIN would turn that into an unbootable game. For a sane
+			// file this is a no-op, since the extent always fits in its sectors.
+			// Measured in bytes, not whole sectors: an image whose length isn't a multiple of the
+			// sector size still contains its final partial sector, and a file is allowed to end
+			// there. Counting blocks discards that tail, which clamped real files short - a dump
+			// with EBOOT.BIN running to the last byte of the image lost the end of it, and the ELF
+			// section headers that live there went with it.
+			if (isFile) {
+				const u64 imageBytes = blockDevice->GetUncompressedSize();
+				const u64 firstByte = (u64)dir.firstDataSector * (u64)sectorSize;
+				const s64 availableBytes = firstByte >= imageBytes ? 0 : (s64)(imageBytes - firstByte);
+				if (entry->size > availableBytes) {
+					entry->size = availableBytes;
+				}
+			}
 
 			if (entry->isDirectory && !relative) {
 				if (entry->startsector == root->startsector) {
 					blockDevice->NotifyReadError();
-					ERROR_LOG(FILESYS, "WARNING: Appear to have a recursive file system, breaking recursion. Probably corrupt ISO.");
+					ERROR_LOG(Log::FileSystem, "WARNING: Appear to have a recursive file system, breaking recursion. Probably corrupt ISO.");
 				}
 			}
 			root->children.push_back(entry);
@@ -242,7 +345,7 @@ void ISOFileSystem::ReadDirectory(TreeEntry *root) {
 	root->valid = true;
 }
 
-ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(const std::string &path, bool catchError) {
+const ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(std::string_view path, bool catchError) {
 	const size_t pathLength = path.length();
 
 	if (pathLength == 0) {
@@ -263,6 +366,11 @@ ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(const std::string &path, bo
 	if (pathLength <= pathIndex)
 		return treeroot;
 
+	if (!treeroot) {
+		// The constructor gave up - no ISO9660 volume descriptor, or it wouldn't read.
+		return nullptr;
+	}
+
 	TreeEntry *entry = treeroot;
 	while (true) {
 		if (!entry->valid) {
@@ -275,9 +383,9 @@ ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(const std::string &path, bo
 			if (nextSlashIndex == std::string::npos)
 				nextSlashIndex = pathLength;
 
-			const std::string firstPathComponent = path.substr(pathIndex, nextSlashIndex - pathIndex);
+			const std::string_view firstPathComponent = path.substr(pathIndex, nextSlashIndex - pathIndex);
 			for (size_t i = 0; i < entry->children.size(); i++) {
-				const std::string &n = entry->children[i]->name;
+				const std::string_view n = entry->children[i]->name;
 				if (firstPathComponent == n) {
 					//yay we got it
 					nextEntry = entry->children[i];
@@ -289,8 +397,9 @@ ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(const std::string &path, bo
 		
 		if (nextEntry) {
 			entry = nextEntry;
-			if (!entry->valid)
+			if (!entry->valid) {
 				ReadDirectory(entry);
+			}
 			pathIndex += name.length();
 			if (pathIndex < pathLength && path[pathIndex] == '/')
 				++pathIndex;
@@ -298,9 +407,9 @@ ISOFileSystem::TreeEntry *ISOFileSystem::GetFromPath(const std::string &path, bo
 			if (pathLength <= pathIndex)
 				return entry;
 		} else {
-			if (catchError)
-				ERROR_LOG(FILESYS, "File '%s' not found", path.c_str());
-
+			if (catchError) {
+				ERROR_LOG(Log::FileSystem, "File '%.*s' not found", STR_VIEW(path));
+			}
 			return 0;
 		}
 	}
@@ -312,7 +421,7 @@ int ISOFileSystem::OpenFile(std::string filename, FileAccess access, const char 
 	entry.isBlockSectorMode = false;
 
 	if (access & FILEACCESS_WRITE) {
-		ERROR_LOG(FILESYS, "Can't open file '%s' with write access on an ISO partition", filename.c_str());
+		ERROR_LOG(Log::FileSystem, "Can't open file '%s' with write access on an ISO partition", filename.c_str());
 		return SCE_KERNEL_ERROR_ERRNO_INVALID_FLAG;
 	}
 
@@ -321,15 +430,15 @@ int ISOFileSystem::OpenFile(std::string filename, FileAccess access, const char 
 		u32 sectorStart = 0xFFFFFFFF, readSize = 0xFFFFFFFF;
 		parseLBN(filename, &sectorStart, &readSize);
 		if (sectorStart > blockDevice->GetNumBlocks()) {
-			WARN_LOG(FILESYS, "Unable to open raw sector, out of range: '%s', sector %08x, max %08x", filename.c_str(), sectorStart, blockDevice->GetNumBlocks());
+			WARN_LOG(Log::FileSystem, "Unable to open raw sector, out of range: '%s', sector %08x, max %08x", filename.c_str(), sectorStart, blockDevice->GetNumBlocks());
 			return SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
 		}
 		else if (sectorStart == blockDevice->GetNumBlocks())
 		{
-			ERROR_LOG(FILESYS, "Should not be able to open the block after the last on disc! %08x", sectorStart);
+			ERROR_LOG(Log::FileSystem, "Should not be able to open the block after the last on disc! %08x", sectorStart);
 		}
 
-		DEBUG_LOG(FILESYS, "Got a raw sector open: '%s', sector %08x, size %08x", filename.c_str(), sectorStart, readSize);
+		DEBUG_LOG(Log::FileSystem, "Got a raw sector open: '%s', sector %08x, size %08x", filename.c_str(), sectorStart, readSize);
 		u32 newHandle = hAlloc->GetNewHandle();
 		entry.seekPos = 0;
 		entry.file = 0;
@@ -369,7 +478,7 @@ void ISOFileSystem::CloseFile(u32 handle) {
 		entries.erase(iter);
 	} else {
 		//This shouldn't happen...
-		ERROR_LOG(FILESYS, "Hey, what are you doing? Closing non-open files?");
+		ERROR_LOG(Log::FileSystem, "Hey, what are you doing? Closing non-open files?");
 	}
 }
 
@@ -381,7 +490,7 @@ bool ISOFileSystem::OwnsHandle(u32 handle) {
 int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen, int &usec) {
 	EntryMap::iterator iter = entries.find(handle);
 	if (iter == entries.end()) {
-		ERROR_LOG(FILESYS, "Ioctl on a bad file handle");
+		ERROR_LOG(Log::FileSystem, "Ioctl on a bad file handle");
 		return SCE_KERNEL_ERROR_BADF;
 	}
 
@@ -391,44 +500,54 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 	// Get ISO9660 volume descriptor (from open ISO9660 file.)
 	case 0x01020001:
 		if (e.isBlockSectorMode) {
-			ERROR_LOG(FILESYS, "Unsupported read volume descriptor command on a umd block device");
+			ERROR_LOG(Log::FileSystem, "Unsupported read volume descriptor command on a umd block device");
 			return SCE_KERNEL_ERROR_ERRNO_FUNCTION_NOT_SUPPORTED;
 		}
 
-		if (!Memory::IsValidAddress(outdataPtr) || outlen < 0x800) {
-			WARN_LOG_REPORT(FILESYS, "sceIoIoctl: Invalid out pointer while reading ISO9660 volume descriptor");
+		if (!Memory::IsValidRange(outdataPtr, 0x800) || outlen < 0x800) {
+			WARN_LOG(Log::FileSystem, "sceIoIoctl: Invalid out pointer %08x while reading ISO9660 volume descriptor", outdataPtr);
 			return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 		}
 
-		INFO_LOG(SCEIO, "sceIoIoctl: reading ISO9660 volume descriptor read");
-		blockDevice->ReadBlock(16, Memory::GetPointer(outdataPtr));
+		INFO_LOG(Log::sceIo, "sceIoIoctl: reading ISO9660 volume descriptor read");
+		blockDevice->ReadBlock(16, Memory::GetPointerWriteUnchecked(outdataPtr));
 		return 0;
 
 	// Get ISO9660 path table (from open ISO9660 file.)
 	case 0x01020002:
 		if (e.isBlockSectorMode) {
-			ERROR_LOG(FILESYS, "Unsupported read path table command on a umd block device");
+			ERROR_LOG(Log::FileSystem, "Unsupported read path table command on a umd block device");
 			return SCE_KERNEL_ERROR_ERRNO_FUNCTION_NOT_SUPPORTED;
 		}
 
 		VolDescriptor desc;
-		blockDevice->ReadBlock(16, (u8 *)&desc);
+		if (!blockDevice->ReadBlock(16, (u8 *)&desc)) {
+			blockDevice->NotifyReadError();
+			ERROR_LOG(Log::FileSystem, "Failed to read volume descriptor for the path table");
+			return SCE_KERNEL_ERROR_ERRNO_IO_ERROR;
+		}
 		if (outlen < (u32)desc.pathTableLength) {
 			return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 		} else {
 			int block = (u16)desc.firstLETableSector;
-			u32 size = Memory::ValidSize(outdataPtr, (u32)desc.pathTableLength);
-			u8 *out = Memory::GetPointer(outdataPtr);
+			u32 size = Memory::ClampValidSizeAt(outdataPtr, (u32)desc.pathTableLength);
+			u8 *out = Memory::GetPointerWriteRangeOrException(outdataPtr, size);
 
 			int blocks = size / blockDevice->GetBlockSize();
-			blockDevice->ReadBlocks(block, blocks, out);
+			if (blocks > 0) {
+				blockDevice->ReadBlocks(block, blocks, out);
+			}
 			size -= blocks * blockDevice->GetBlockSize();
 			out += blocks * blockDevice->GetBlockSize();
 
 			// The remaining (or, usually, only) partial sector.
 			if (size > 0) {
 				u8 temp[2048];
-				blockDevice->ReadBlock(block, temp);
+				// `blocks` whole sectors starting at `block` were already consumed by
+				// ReadBlocks() above, so the trailing partial sector is the next one.
+				if (!blockDevice->ReadBlock(block + blocks, temp)) {
+					memset(temp, 0, sizeof(temp));
+				}
 				memcpy(out, temp, size);
 			}
 			return 0;
@@ -447,7 +566,7 @@ PSPDevType ISOFileSystem::DevType(u32 handle) {
 	return type;
 }
 
-FileSystemFlags ISOFileSystem::Flags() {
+FileSystemFlags ISOFileSystem::Flags() const {
 	// TODO: Here may be a good place to force things, in case users recompress games
 	// as PBP or CSO when they were originally the other type.
 	return blockDevice->IsDisc() ? FileSystemFlags::UMD : FileSystemFlags::CARD;
@@ -465,7 +584,7 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 		OpenFileEntry &e = iter->second;
 
 		if (size < 0) {
-			ERROR_LOG_REPORT(FILESYS, "Invalid read for %lld bytes from umd %s", size, e.file ? e.file->name.c_str() : "device");
+			ERROR_LOG(Log::FileSystem, "Invalid read for %lld bytes from umd %s", size, e.file ? e.file->name.c_str() : "device");
 			return 0;
 		}
 		
@@ -487,7 +606,7 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 			positionOnIso = e.sectorStart * 2048ULL + e.seekPos;
 			fileSize = (s64)e.openSize;
 		} else if (e.file == nullptr) {
-			ERROR_LOG(FILESYS, "File no longer exists (loaded savestate with different ISO?)");
+			ERROR_LOG(Log::FileSystem, "File no longer exists (loaded savestate with different ISO?)");
 			return 0;
 		} else {
 			positionOnIso = e.file->startingPosition + e.seekPos;
@@ -495,18 +614,18 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 		}
 
 		if ((s64)e.seekPos > fileSize) {
-			WARN_LOG(FILESYS, "Read starting outside of file, at %lld / %lld", (s64)e.seekPos, fileSize);
+			WARN_LOG(Log::FileSystem, "Read starting outside of file, at %lld / %lld", (s64)e.seekPos, fileSize);
 			return 0;
 		}
 		if ((s64)e.seekPos + size > fileSize) {
 			// Clamp to the remaining size, but read what we can.
 			const s64 newSize = fileSize - (s64)e.seekPos;
 			// Reading beyond the file is really quite normal behavior (if return value handled correctly), so
-			// not doing WARN here. Still, can potentially be useful to see so leaving at INFO.
+			// not doing WARN here.
 			if (newSize == 0) {
-				INFO_LOG(FILESYS, "Attempted read at end of file, 0-size read simulated");
+				DEBUG_LOG(Log::FileSystem, "Attempted read at end of file, 0-size read simulated");
 			} else {
-				INFO_LOG(FILESYS, "Reading beyond end of file from seekPos %d, clamping size %lld to %lld", e.seekPos, size, newSize);
+				DEBUG_LOG(Log::FileSystem, "Reading beyond end of file from seekPos %d, clamping size %lld to %lld", e.seekPos, size, newSize);
 			}
 			size = newSize;
 		}
@@ -516,27 +635,35 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 		const int firstBlockSize = firstBlockOffset == 0 ? 0 : (int)std::min(size, 2048LL - firstBlockOffset);
 		const int lastBlockSize = (size - firstBlockSize) & 2047;
 		const s64 middleSize = size - firstBlockSize - lastBlockSize;
+		_dbg_assert_((middleSize & 2047) == 0);
+
 		u32 secNum = (u32)(positionOnIso / 2048);
 		u8 theSector[2048];
 
 		if ((middleSize & 2047) != 0) {
-			ERROR_LOG(FILESYS, "Remaining size should be aligned");
+			ERROR_LOG(Log::FileSystem, "Remaining size should be aligned");
 		}
 
 		const u8 *const start = pointer;
 		if (firstBlockSize > 0) {
-			blockDevice->ReadBlock(secNum++, theSector);
+			// theSector is uninitialized stack memory, so on a failed read we must not copy it out -
+			// that would hand host stack contents to the game.
+			if (!blockDevice->ReadBlock(secNum++, theSector)) {
+				memset(theSector, 0, sizeof(theSector));
+			}
 			memcpy(pointer, theSector + firstBlockOffset, firstBlockSize);
 			pointer += firstBlockSize;
 		}
 		if (middleSize > 0) {
-			const u32 sectors = (u32)(middleSize / 2048);
-			blockDevice->ReadBlocks(secNum, sectors, pointer);
-			secNum += sectors;
+			const u32 middleSectors = (u32)(middleSize / 2048);
+			blockDevice->ReadBlocks(secNum, middleSectors, pointer);
+			secNum += middleSectors;
 			pointer += middleSize;
 		}
 		if (lastBlockSize > 0) {
-			blockDevice->ReadBlock(secNum++, theSector);
+			if (!blockDevice->ReadBlock(secNum++, theSector)) {
+				memset(theSector, 0, sizeof(theSector));
+			}
 			memcpy(pointer, theSector, lastBlockSize);
 			pointer += lastBlockSize;
 		}
@@ -551,18 +678,18 @@ size_t ISOFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) {
 		return (size_t)totalBytes;
 	} else {
 		//This shouldn't happen...
-		ERROR_LOG(FILESYS, "Hey, what are you doing? Reading non-open files?");
+		ERROR_LOG(Log::FileSystem, "Hey, what are you doing? Reading non-open files?");
 		return 0;
 	}
 }
 
 size_t ISOFileSystem::WriteFile(u32 handle, const u8 *pointer, s64 size) {
-	ERROR_LOG(FILESYS, "Hey, what are you doing? You can't write to an ISO!");
+	ERROR_LOG(Log::FileSystem, "Hey, what are you doing? You can't write to an ISO!");
 	return 0;
 }
 
 size_t ISOFileSystem::WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec) {
-	ERROR_LOG(FILESYS, "Hey, what are you doing? You can't write to an ISO!");
+	ERROR_LOG(Log::FileSystem, "Hey, what are you doing? You can't write to an ISO!");
 	return 0;
 }
 
@@ -588,7 +715,7 @@ size_t ISOFileSystem::SeekFile(u32 handle, s32 position, FileMove type) {
 		return (size_t)e.seekPos;
 	} else {
 		//This shouldn't happen...
-		ERROR_LOG(FILESYS, "Hey, what are you doing? Seeking in non-open files?");
+		ERROR_LOG(Log::FileSystem, "Hey, what are you doing? Seeking in non-open files?");
 		return 0;
 	}
 }
@@ -610,7 +737,7 @@ PSPFileInfo ISOFileSystem::GetFileInfo(std::string filename) {
 		return fileInfo;
 	}
 
-	TreeEntry *entry = GetFromPath(filename, false);
+	const TreeEntry *entry = GetFromPath(filename, false);
 	PSPFileInfo x; 
 	if (entry) {
 		x.name = entry->name;
@@ -621,21 +748,46 @@ PSPFileInfo ISOFileSystem::GetFileInfo(std::string filename) {
 		x.type = entry->isDirectory ? FILETYPE_DIRECTORY : FILETYPE_NORMAL;
 		x.isOnSectorSystem = true;
 		x.startSector = entry->startingPosition / 2048;
+		FillFileTimes(&x, entry->recordTime);
 	}
 	return x;
 }
 
-std::vector<PSPFileInfo> ISOFileSystem::GetDirListing(std::string path) {
+PSPFileInfo ISOFileSystem::GetFileInfoByHandle(u32 handle) {
+	auto iter = entries.find(handle);
+	PSPFileInfo x;
+	if (iter != entries.end()) {
+		const TreeEntry *entry = iter->second.file;
+		x.name = entry->name;
+		// Strangely, it seems to be executable even for files.
+		x.access = 0555;
+		x.size = entry->size;
+		x.exists = true;
+		x.type = entry->isDirectory ? FILETYPE_DIRECTORY : FILETYPE_NORMAL;
+		x.isOnSectorSystem = true;
+		x.startSector = entry->startingPosition / 2048;
+		FillFileTimes(&x, entry->recordTime);
+	}
+	return x;
+}
+
+std::vector<PSPFileInfo> ISOFileSystem::GetDirListing(std::string_view path, bool *exists) {
 	std::vector<PSPFileInfo> myVector;
-	TreeEntry *entry = GetFromPath(path);
-	if (!entry)
+	const TreeEntry *entry = GetFromPath(path);
+	if (!entry) {
+		if (exists)
+			*exists = false;
 		return myVector;
+	}
+	if (entry == &entireISO) {
+		entry = GetFromPath("/");
+	}
 
 	const std::string dot(".");
 	const std::string dotdot("..");
 
 	for (size_t i = 0; i < entry->children.size(); i++) {
-		TreeEntry *e = entry->children[i];
+		const TreeEntry *e = entry->children[i];
 
 		// do not include the relative entries in the list
 		if (e->name == dot || e->name == dotdot)
@@ -645,23 +797,27 @@ std::vector<PSPFileInfo> ISOFileSystem::GetDirListing(std::string path) {
 		x.name = e->name;
 		// Strangely, it seems to be executable even for files.
 		x.access = 0555;
+		x.exists = true;
 		x.size = e->size;
 		x.type = e->isDirectory ? FILETYPE_DIRECTORY : FILETYPE_NORMAL;
 		x.isOnSectorSystem = true;
 		x.startSector = e->startingPosition/2048;
+		FillFileTimes(&x, e->recordTime);
 		x.sectorSize = sectorSize;
 		x.numSectors = (u32)((e->size + sectorSize - 1) / sectorSize);
 		myVector.push_back(x);
 	}
+	if (exists)
+		*exists = true;
 	return myVector;
 }
 
-std::string ISOFileSystem::EntryFullPath(TreeEntry *e) {
+std::string ISOFileSystem::EntryFullPath(const TreeEntry *e) {
 	if (e == &entireISO)
 		return "";
 
 	size_t fullLen = 0;
-	TreeEntry *cur = e;
+	const TreeEntry *cur = e;
 	while (cur != NULL && cur != treeroot) {
 		// For the "/".
 		fullLen += 1 + cur->name.size();
@@ -715,6 +871,12 @@ void ISOFileSystem::DoState(PointerWrap &p) {
 				std::string path;
 				Do(p, path);
 				of.file = GetFromPath(path);
+				if (!of.file) {
+					// Loaded against a different image. Like a file that's gone from a directory,
+					// drop the handle rather than keep one that points at nothing.
+					ERROR_LOG(Log::FileSystem, "Failed to reopen file while loading state: %s", path.c_str());
+					continue;
+				}
 			} else {
 				of.file = NULL;
 			}

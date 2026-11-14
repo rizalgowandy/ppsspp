@@ -8,15 +8,23 @@
 #include "Common/Math/geom2d.h"
 #include "Common/Input/GestureDetector.h"
 #include "Common/UI/View.h"
+#include "Common/Render/DrawEnum.h"
+
+class UIScreen;
 
 namespace UI {
 
 class AnchorTranslateTween;
+class ScrollView;
+
+// For the arrow directions: whether candidate is a better place to move the focus to from origin
+// than best (null if there's nothing yet). originPos is where the move starts across the
+// direction of the move, normally origin's center.
+bool IsBetterFocusCandidate(const Bounds &origin, const Point2D &originPos, const Bounds &candidate, const Bounds *best, FocusMove direction);
 
 struct NeighborResult {
-	NeighborResult() : view(0), score(0) {}
+	NeighborResult() : view(nullptr), score(0) {}
 	NeighborResult(View *v, float s) : view(v), score(s) {}
-
 	View *view;
 	float score;
 };
@@ -24,104 +32,127 @@ struct NeighborResult {
 class ViewGroup : public View {
 public:
 	ViewGroup(LayoutParams *layoutParams = 0) : View(layoutParams) {}
-	virtual ~ViewGroup();
+	~ViewGroup();
 
 	// Pass through external events to children.
-	virtual bool Key(const KeyInput &input) override;
-	virtual void Touch(const TouchInput &input) override;
-	virtual void Axis(const AxisInput &input) override;
+	bool Key(const KeyInput &input) override;
+	bool Touch(const TouchInput &input) override;
+	void Axis(const AxisInput &input) override;
 
 	// By default, a container will layout to its own bounds.
-	virtual void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override = 0;
-	virtual void Layout() override = 0;
-	virtual void Update() override;
-	virtual void Query(float x, float y, std::vector<View *> &list) override;
+	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override = 0;
+	void Layout() override = 0;
+	void Update() override;
+	void Query(float x, float y, std::vector<View *> &list) override;
 
-	virtual void DeviceLost() override;
-	virtual void DeviceRestored(Draw::DrawContext *draw) override;
+	void DeviceLost() override;
+	void DeviceRestored(Draw::DrawContext *draw) override;
 
-	virtual void Draw(UIContext &dc) override;
-
-	// These should be unused.
-	virtual float GetContentWidth() const { return 0.0f; }
-	virtual float GetContentHeight() const { return 0.0f; }
+	void Draw(UIContext &dc) override;
 
 	// Takes ownership! DO NOT add a view to multiple parents!
 	template <class T>
 	T *Add(T *view) {
-		std::lock_guard<std::mutex> guard(modifyLock_);
 		views_.push_back(view);
+		SetParentOf(view);
+		return view;
+	}
+	template <class T>
+	T *Insert(int index, T *view) {
+		views_.insert(views_.begin() + index, view);
+		SetParentOf(view);
 		return view;
 	}
 
-	virtual bool SetFocus() override;
-	virtual bool SubviewFocused(View *view) override;
+	// Note: This deletes the old view, if found. Returns whether the view was found.
+	// If it fails, the newView is deleted.
+	bool ReplaceSubview(View *view, View *newView);
+
+	bool SetFocus(FocusFlags cause) override;
+	bool SubviewFocused(View *view) override;
 	virtual void RemoveSubview(View *view);
 
 	void SetDefaultFocusView(View *view) { defaultFocusView_ = view; }
 	View *GetDefaultFocusView() { return defaultFocusView_; }
 
 	// Assumes that layout has taken place.
-	NeighborResult FindNeighbor(View *view, FocusDirection direction, NeighborResult best);
+	NeighborResult FindNeighbor(View *view, FocusMove direction, NeighborResult best);
+	virtual NeighborResult FindScrollNeighbor(View *view, const Point2D &target, FocusMove direction, NeighborResult best);
 
-	virtual bool CanBeFocused() const override { return false; }
-	virtual bool IsViewGroup() const override { return true; }
+	// Appends the views Tab/Shift+Tab step through, in the order they were added, depth first -
+	// so the order follows the hierarchy rather than the geometry, which is what makes tabbing
+	// predictable in a layout that arrow navigation has to guess its way around.
+	// Unlike FindNeighbor, this doesn't need layout to have taken place.
+	virtual void CollectTabOrder(std::vector<View *> *outViews) const;
+
+	bool CanBeFocused() const override { return false; }
+	bool IsViewGroup() const override { return true; }
+	bool ContainsSubview(const View *view) const override;
+	int IndexOfSubview(const View *view) const;
 
 	virtual void SetBG(const Drawable &bg) { bg_ = bg; }
 
-	virtual void Clear();
+	void Clear();
 	void PersistData(PersistStatus status, std::string anonId, PersistMap &storage) override;
-	View *GetViewByIndex(int index) { return views_[index]; }
+	View *GetViewByIndex(int index) const { return views_[index]; }
 	int GetNumSubviews() const { return (int)views_.size(); }
 	void SetHasDropShadow(bool has) { hasDropShadow_ = has; }
 	void SetDropShadowExpand(float s) { dropShadowExpand_ = s; }
-
-	void Lock() { modifyLock_.lock(); }
-	void Unlock() { modifyLock_.unlock(); }
+	void SetExclusiveTouch(bool exclusive) { exclusiveTouch_ = exclusive; }
+	void SetClickableBackground(bool clickableBackground) { clickableBackground_ = clickableBackground; }
+	void SetRadiusFactor(float factor) { radiusFactor_ = factor; }
 
 	void SetClip(bool clip) { clip_ = clip; }
 	std::string DescribeLog() const override { return "ViewGroup: " + View::DescribeLog(); }
 	std::string DescribeText() const override;
 
-protected:
-	std::string DescribeListUnordered(const char *heading) const;
-	std::string DescribeListOrdered(const char *heading) const;
+	void Recurse(std::function<void(View *)> func) override;
 
-	std::mutex modifyLock_;  // Hold this when changing the subviews.
+
+protected:
+	std::string DescribeListUnordered(std::string_view heading) const;
+	std::string DescribeListOrdered(std::string_view heading) const;
+
+	// Anything that adds to views_ without Add or Insert must call this.
+	void SetParentOf(View *view) { view->parent_ = this; }
+
 	std::vector<View *> views_;
 	View *defaultFocusView_ = nullptr;
 	Drawable bg_;
 	float dropShadowExpand_ = 0.0f;
+	float radiusFactor_ = 1.0f;
 	bool hasDropShadow_ = false;
+	bool clickableBackground_ = false;
 	bool clip_ = false;
+	bool exclusiveTouch_ = false;
 };
 
-// A frame layout contains a single child view (normally).
-// It simply centers the child view.
-class FrameLayout : public ViewGroup {
-public:
-	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
-	void Layout() override;
-};
+constexpr float NONE = -FLT_MAX;
 
-const float NONE = -FLT_MAX;
+enum class Centering {
+	None = 0,
+	Vertical = 1,
+	Horizontal = 2,
+	Both = 3,  // 1 | 2
+};
+ENUM_CLASS_BITOPS(Centering);
 
 class AnchorLayoutParams : public LayoutParams {
 public:
-	AnchorLayoutParams(Size w, Size h, float l, float t, float r, float b, bool c = false)
-		: LayoutParams(w, h, LP_ANCHOR), left(l), top(t), right(r), bottom(b), center(c) {
-
+	AnchorLayoutParams(Size w, Size h, float l, float t, float r, float b, Centering c = Centering::None)
+		: LayoutParams(w, h, LP_ANCHOR), left(l), top(t), right(r), bottom(b), centering(c) {}
+	// There's a small hack here to make this behave more intuitively - AnchorLayout ordinarily ignores FILL_PARENT.
+	AnchorLayoutParams(Size w, Size h, Centering c = Centering::None)
+		: LayoutParams(w, h, LP_ANCHOR), left(0), top(0), right(w == FILL_PARENT ? 0 : NONE), bottom(h == FILL_PARENT ? 0 : NONE), centering(c) {
 	}
-	AnchorLayoutParams(Size w, Size h, bool c = false)
-		: LayoutParams(w, h, LP_ANCHOR), left(0), top(0), right(NONE), bottom(NONE), center(c) {
-	}
-	AnchorLayoutParams(float l, float t, float r, float b, bool c = false)
-		: LayoutParams(WRAP_CONTENT, WRAP_CONTENT, LP_ANCHOR), left(l), top(t), right(r), bottom(b), center(c) {}
+	AnchorLayoutParams(float l, float t, float r, float b, Centering c = Centering::None)
+		: LayoutParams(WRAP_CONTENT, WRAP_CONTENT, LP_ANCHOR), left(l), top(t), right(r), bottom(b), centering(c) {}
 
 	// These are not bounds, but distances from the container edges.
 	// Set to NONE to not attach this edge to the container.
+	// If two opposite edges are NONE, centering will happen.
 	float left, top, right, bottom;
-	bool center;  // If set, only two "sides" can be set, and they refer to the center, not the edge, of the view being layouted.
+	Centering centering;  // If set, only two "sides" can be set, and they refer to the center, not the edge, of the view being layouted.
 
 	static LayoutParamsType StaticType() {
 		return LP_ANCHOR;
@@ -130,7 +161,7 @@ public:
 
 class AnchorLayout : public ViewGroup {
 public:
-	AnchorLayout(LayoutParams *layoutParams = 0) : ViewGroup(layoutParams), overflow_(true) {}
+	AnchorLayout(LayoutParams *layoutParams = 0) : ViewGroup(layoutParams) {}
 	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
 	void Layout() override;
 	void Overflow(bool allow) {
@@ -140,27 +171,31 @@ public:
 
 private:
 	void MeasureViews(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert);
-	bool overflow_;
+	bool overflow_ = true;
 };
 
 class LinearLayoutParams : public LayoutParams {
 public:
 	LinearLayoutParams()
-		: LayoutParams(LP_LINEAR), weight(0.0f), gravity(G_TOPLEFT), hasMargins_(false) {}
-	explicit LinearLayoutParams(float wgt, Gravity grav = G_TOPLEFT)
+		: LayoutParams(LP_LINEAR), weight(0.0f), gravity(Gravity::G_TOPLEFT), hasMargins_(false) {}
+	explicit LinearLayoutParams(float wgt, Gravity grav = Gravity::G_TOPLEFT)
 		: LayoutParams(LP_LINEAR), weight(wgt), gravity(grav), hasMargins_(false) {}
 	LinearLayoutParams(float wgt, const Margins &mgn)
-		: LayoutParams(LP_LINEAR), weight(wgt), gravity(G_TOPLEFT), margins(mgn), hasMargins_(true) {}
-	LinearLayoutParams(Size w, Size h, float wgt = 0.0f, Gravity grav = G_TOPLEFT)
-		: LayoutParams(w, h, LP_LINEAR), weight(wgt), gravity(grav), hasMargins_(false) {}
+		: LayoutParams(LP_LINEAR), weight(wgt), gravity(Gravity::G_TOPLEFT), margins(mgn), hasMargins_(true) {}
+	LinearLayoutParams(float wgt, Gravity grav, const Margins &mgn)
+		: LayoutParams(LP_LINEAR), weight(wgt), gravity(grav), margins(mgn), hasMargins_(true) {}
+	LinearLayoutParams(Size w, Size h, float wgt = 0.0f, Gravity grav = Gravity::G_TOPLEFT)
+		: LayoutParams(w, h, LP_LINEAR), weight(wgt), gravity(grav), margins(0), hasMargins_(false) {}
 	LinearLayoutParams(Size w, Size h, float wgt, Gravity grav, const Margins &mgn)
 		: LayoutParams(w, h, LP_LINEAR), weight(wgt), gravity(grav), margins(mgn), hasMargins_(true) {}
 	LinearLayoutParams(Size w, Size h, const Margins &mgn)
-		: LayoutParams(w, h, LP_LINEAR), weight(0.0f), gravity(G_TOPLEFT), margins(mgn), hasMargins_(true) {}
+		: LayoutParams(w, h, LP_LINEAR), weight(0.0f), gravity(Gravity::G_TOPLEFT), margins(mgn), hasMargins_(true) {}
+	LinearLayoutParams(Size w, Size h, Gravity grav, const Margins &mgn)
+		: LayoutParams(w, h, LP_LINEAR), weight(0.0f), gravity(grav), margins(mgn), hasMargins_(true) {}
 	LinearLayoutParams(Size w, Size h, float wgt, const Margins &mgn)
-		: LayoutParams(w, h, LP_LINEAR), weight(wgt), gravity(G_TOPLEFT), margins(mgn), hasMargins_(true) {}
+		: LayoutParams(w, h, LP_LINEAR), weight(wgt), gravity(Gravity::G_TOPLEFT), margins(mgn), hasMargins_(true) {}
 	LinearLayoutParams(const Margins &mgn)
-		: LayoutParams(WRAP_CONTENT, WRAP_CONTENT, LP_LINEAR), weight(0.0f), gravity(G_TOPLEFT), margins(mgn), hasMargins_(true) {}
+		: LayoutParams(WRAP_CONTENT, WRAP_CONTENT, LP_LINEAR), weight(0.0f), gravity(Gravity::G_TOPLEFT), margins(mgn), hasMargins_(true) {}
 
 	float weight;
 	Gravity gravity;
@@ -179,20 +214,37 @@ private:
 class LinearLayout : public ViewGroup {
 public:
 	LinearLayout(Orientation orientation, LayoutParams *layoutParams = 0)
-		: ViewGroup(layoutParams), orientation_(orientation), defaultMargins_(0), spacing_(10) {}
+		: ViewGroup(layoutParams), orientation_(orientation), defaultMargins_(0) {}
 
 	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
 	void Layout() override;
 	void SetSpacing(float spacing) {
 		spacing_ = spacing;
 	}
+	// Space between the layout's edges and its children, on top of the children's own margins.
+	void SetPadding(const Margins &padding) {
+		padding_ = padding;
+	}
+	// Where the children go along the layout direction when they don't fill it, as a group. Only the
+	// gravity's component along the layout direction is used (G_HCENTER or G_RIGHT when horizontal,
+	// G_VCENTER or G_BOTTOM when vertical). Each child's own gravity still places it across.
+	void SetContentGravity(Gravity gravity) {
+		contentGravity_ = gravity;
+	}
+
+	// Override, applies rounding to the corners of the child views, based on their position in the layout and the orientation. Masked by the outerCorners.
+	// Note that if the view's spacing is not 0.0f, all views will get the rounded corners since they will appear separate.
+	void SetRoundCorners(RoundCorners outerCorners = RoundCorners::All) override;
+
 	std::string DescribeLog() const override { return (orientation_ == ORIENT_HORIZONTAL ? "LinearLayoutHoriz: " : "LinearLayoutVert: ") + View::DescribeLog(); }
 
 protected:
 	Orientation orientation_;
 private:
 	Margins defaultMargins_;
-	float spacing_;
+	Margins padding_;
+	Gravity contentGravity_ = Gravity::G_TOPLEFT;
+	float spacing_ = 10.0f;
 };
 
 class LinearLayoutList : public LinearLayout {
@@ -201,22 +253,108 @@ public:
 		: LinearLayout(orientation, layoutParams) {
 	}
 
+	// The only difference with a LinearLayout is the DescribeText, which is a list of the items in the layout.
+	// Not sure if we really need this.
 	std::string DescribeText() const override;
 };
 
-// GridLayout is a little different from the Android layout. This one has fixed size
-// rows and columns. Items are not allowed to deviate from the set sizes.
-// Initially, only horizontal layout is supported.
-struct GridLayoutSettings {
-	GridLayoutSettings() : orientation(ORIENT_HORIZONTAL), columnWidth(100), rowHeight(50), spacing(5), fillCells(false) {}
-	GridLayoutSettings(int colW, int colH, int spac = 5)
-		: orientation(ORIENT_HORIZONTAL), columnWidth(colW), rowHeight(colH), spacing(spac), fillCells(false) {}
+// These are pretty vertical LinearLayout, with a title and a roundrect background.
+// They have no margins: put them in a ChoiceGroupList, or another layout that spaces them out.
+class ChoiceGroup : public LinearLayout {
+public:
+	ChoiceGroup(std::string_view title = "", LayoutParams *layoutParams = nullptr);
 
-	Orientation orientation;
+	void Draw(UIContext &dc) override;
+
+private:
+	std::string title_;
+};
+
+// A vertical list that spaces out the ChoiceGroups in it and keeps them off its edges.
+class ChoiceGroupList : public LinearLayoutList {
+public:
+	ChoiceGroupList(LayoutParams *layoutParams = nullptr);
+};
+
+// A vertical list that spaces out the ChoiceGroups in it and keeps them off its edges.
+// This one is adjusted for popups (i.e. smaller margins and spacing).
+class PopupChoiceGroupList : public LinearLayoutList {
+public:
+	PopupChoiceGroupList(LayoutParams *layoutParams = nullptr);
+};
+
+// Lays out its children left to right at their natural size, starting a new row when the next
+// one doesn't fit. Takes LinearLayoutParams: the gravity places a child vertically in its row,
+// and children with weight share whatever space is left in their row.
+class FlowLayout : public ViewGroup {
+public:
+	FlowLayout(LayoutParams *layoutParams = nullptr) : ViewGroup(layoutParams) {}
+
+	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
+	void Layout() override;
+	void SetSpacing(float spacing) {
+		spacing_ = spacing;
+	}
+	void SetRowSpacing(float spacing) {
+		rowSpacing_ = spacing;
+	}
+	// Where the children go in a row that has space left over, and no weighted children to take it.
+	// G_LEFT, G_RIGHT or G_HCENTER.
+	void SetRowGravity(Gravity gravity) {
+		rowGravity_ = gravity;
+	}
+	// Space between the layout's edges and its children, on top of the children's own margins.
+	void SetPadding(const Margins &padding) {
+		padding_ = padding;
+	}
+	std::string DescribeLog() const override { return "FlowLayout: " + View::DescribeLog(); }
+
+private:
+	struct Row {
+		size_t first;  // Index into views_.
+		size_t end;
+		float width;  // Including margins and spacing.
+		float height;
+		float weightSum;
+	};
+	void BuildRows(float maxWidth, std::vector<Row> *rows) const;
+
+	Margins padding_;
+	float spacing_ = 5.0f;
+	float rowSpacing_ = 5.0f;
+	Gravity rowGravity_ = Gravity::G_LEFT;
+};
+
+// GridLayout is a little different from the Android layout. This one has fixed size
+// rows and columns, filled row by row. Items are not allowed to deviate from the set sizes.
+struct GridLayoutSettings {
+	GridLayoutSettings() : columnWidth(100), rowHeight(50), spacing(5), fillCells(false) {}
+	GridLayoutSettings(int colW, int colH, int spac = 5)
+		: columnWidth(colW), rowHeight(colH), spacing(spac), fillCells(false) {}
+
 	int columnWidth;
 	int rowHeight;
 	int spacing;
 	bool fillCells;
+};
+
+class GridLayoutParams : public LayoutParams {
+public:
+	GridLayoutParams()
+		: LayoutParams(LP_GRID), gravity(Gravity::G_CENTER) {}
+	explicit GridLayoutParams(Gravity grav)
+		: LayoutParams(LP_GRID), gravity(grav) {
+	}
+	GridLayoutParams(Gravity grav, const Margins &mgn)
+		: LayoutParams(LP_GRID), gravity(grav), margins(mgn) {
+	}
+
+	Gravity gravity;
+	Margins margins;
+
+	static LayoutParamsType StaticType() {
+		return LP_GRID;
+	}
 };
 
 class GridLayout : public ViewGroup {
@@ -227,9 +365,20 @@ public:
 	void Layout() override;
 	std::string DescribeLog() const override { return "GridLayout: " + View::DescribeLog(); }
 
+	// Space between the layout's edges and the cells.
+	void SetPadding(const Margins &padding) {
+		padding_ = padding;
+	}
+	// Takes effect at the next layout.
+	void SetCellSize(int columnWidth, int rowHeight) {
+		settings_.columnWidth = columnWidth;
+		settings_.rowHeight = rowHeight;
+	}
+
 private:
 	GridLayoutSettings settings_;
-	int numColumns_;
+	Margins padding_;
+	int numColumns_ = 1;
 };
 
 class GridLayoutList : public GridLayout {
@@ -241,181 +390,36 @@ public:
 	std::string DescribeText() const override;
 };
 
-// A scrollview usually contains just a single child - a linear layout or similar.
-class ScrollView : public ViewGroup {
+class CollapsibleHeader;
+
+class CollapsibleSection : public LinearLayout {
 public:
-	ScrollView(Orientation orientation, LayoutParams *layoutParams = 0, bool rememberPosition = false)
-		: ViewGroup(layoutParams), orientation_(orientation), rememberPosition_(rememberPosition) {}
+	CollapsibleSection(std::string_view title, LayoutParams *layoutParams = nullptr);
 
-	void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
-	void Layout() override;
-
-	bool Key(const KeyInput &input) override;
-	void Touch(const TouchInput &input) override;
-	void Draw(UIContext &dc) override;
-	std::string DescribeLog() const override { return "ScrollView: " + View::DescribeLog(); }
-
-	void ScrollTo(float newScrollPos);
-	void ScrollToBottom();
-	void ScrollRelative(float distance);
-	float GetScrollPosition();
-	bool CanScroll() const;
 	void Update() override;
 
-	// Override so that we can scroll to the active one after moving the focus.
-	bool SubviewFocused(View *view) override;
-	void PersistData(PersistStatus status, std::string anonId, PersistMap &storage) override;
-	void SetVisibility(Visibility visibility) override;
-
-	// Quick hack to prevent scrolling to top in some lists
-	void SetScrollToTop(bool t) { scrollToTopOnSizeChange_ = t; }
-
-private:
-	float ClampedScrollPos(float pos);
-
-	GestureDetector gesture_;
-	Orientation orientation_;
-	float scrollPos_ = 0.0f;
-	float scrollStart_ = 0.0f;
-	float scrollTarget_ = 0.0f;
-	int scrollTouchId_ = -1;
-	bool scrollToTarget_ = false;
-	float inertia_ = 0.0f;
-	float pull_ = 0.0f;
-	float lastViewSize_ = 0.0f;
-	bool scrollToTopOnSizeChange_ = false;
-	bool rememberPosition_;
-};
-
-class ViewPager : public ScrollView {
-public:
-};
-
-
-class ChoiceStrip : public LinearLayout {
-public:
-	ChoiceStrip(Orientation orientation, LayoutParams *layoutParams = 0);
-
-	void AddChoice(const std::string &title);
-	void AddChoice(ImageID buttonImage);
-
-	int GetSelection() const { return selected_; }
-	void SetSelection(int sel, bool triggerClick);
-
-	void HighlightChoice(unsigned int choice);
-
-	bool Key(const KeyInput &input) override;
-
-	void SetTopTabs(bool tabs) { topTabs_ = tabs; }
-	void Draw(UIContext &dc) override;
-
-	std::string DescribeLog() const override { return "ChoiceStrip: " + View::DescribeLog(); }
-	std::string DescribeText() const override;
-
-	Event OnChoice;
-
-private:
-	StickyChoice *Choice(int index);
-	EventReturn OnChoiceClick(EventParams &e);
-
-	int selected_;
-	bool topTabs_;  // Can be controlled with L/R.
-};
-
-
-class TabHolder : public LinearLayout {
-public:
-	TabHolder(Orientation orientation, float stripSize, LayoutParams *layoutParams = 0);
-
-	template <class T>
-	T *AddTab(const std::string &title, T *tabContents) {
-		AddTabContents(title, (View *)tabContents);
-		return tabContents;
+	// If you call this at creation, call it AFTER adding the subviews!
+	void SetOpen(bool open) {
+		_dbg_assert_(open_);
+		*open_ = open;
+		UpdateVisibility();
+	}
+	void SetOpenPtr(bool *open) {
+		_dbg_assert_(header_);
+		_dbg_assert_(open);
+		header_->SetOpenPtr(open);
+		open_ = open;
+		UpdateVisibility();
+	}
+	CollapsibleHeader *Header() {
+		return header_;
 	}
 
-	void SetCurrentTab(int tab, bool skipTween = false);
-
-	int GetCurrentTab() const { return currentTab_; }
-	std::string DescribeLog() const override { return "TabHolder: " + View::DescribeLog(); }
-
-	void PersistData(PersistStatus status, std::string anonId, PersistMap &storage) override;
-
 private:
-	void AddTabContents(const std::string &title, View *tabContents);
-	EventReturn OnTabClick(EventParams &e);
-
-	ChoiceStrip *tabStrip_ = nullptr;
-	ScrollView *tabScroll_ = nullptr;
-	AnchorLayout *contents_ = nullptr;
-
-	float stripSize_;
-	int currentTab_ = 0;
-	std::vector<View *> tabs_;
-	std::vector<AnchorTranslateTween *> tabTweens_;
-};
-
-// Yes, this feels a bit Java-ish...
-class ListAdaptor {
-public:
-	virtual ~ListAdaptor() {}
-	virtual View *CreateItemView(int index) = 0;
-	virtual int GetNumItems() = 0;
-	virtual bool AddEventCallback(View *view, std::function<EventReturn(EventParams&)> callback) { return false; }
-	virtual std::string GetTitle(int index) const { return ""; }
-	virtual void SetSelected(int sel) { }
-	virtual int GetSelected() { return -1; }
-};
-
-class ChoiceListAdaptor : public ListAdaptor {
-public:
-	ChoiceListAdaptor(const char *items[], int numItems) : items_(items), numItems_(numItems) {}
-	virtual View *CreateItemView(int index);
-	virtual int GetNumItems() { return numItems_; }
-	virtual bool AddEventCallback(View *view, std::function<EventReturn(EventParams&)> callback);
-
-private:
-	const char **items_;
-	int numItems_;
-};
-
-
-// The "selected" item is what was previously selected (optional). This items will be drawn differently.
-class StringVectorListAdaptor : public ListAdaptor {
-public:
-	StringVectorListAdaptor() : selected_(-1) {}
-	StringVectorListAdaptor(const std::vector<std::string> &items, int selected = -1) : items_(items), selected_(selected) {}
-	virtual View *CreateItemView(int index) override;
-	virtual int GetNumItems() override { return (int)items_.size(); }
-	virtual bool AddEventCallback(View *view, std::function<EventReturn(EventParams&)> callback) override;
-	void SetSelected(int sel) override { selected_ = sel; }
-	virtual std::string GetTitle(int index) const override { return items_[index]; }
-	virtual int GetSelected() override { return selected_; }
-
-private:
-	std::vector<std::string> items_;
-	int selected_;
-};
-
-// A list view is a scroll view with autogenerated items.
-// In the future, it might be smart and load/unload items as they go, but currently not.
-class ListView : public ScrollView {
-public:
-	ListView(ListAdaptor *a, std::set<int> hidden = std::set<int>(), LayoutParams *layoutParams = 0);
-
-	int GetSelected() { return adaptor_->GetSelected(); }
-	virtual void Measure(const UIContext &dc, MeasureSpec horiz, MeasureSpec vert) override;
-	virtual void SetMaxHeight(float mh) { maxHeight_ = mh; }
-	Event OnChoice;
-	std::string DescribeLog() const override { return "ListView: " + View::DescribeLog(); }
-	std::string DescribeText() const override;
-
-private:
-	void CreateAllItems();
-	EventReturn OnItemCallback(int num, EventParams &e);
-	ListAdaptor *adaptor_;
-	LinearLayout *linLayout_;
-	float maxHeight_;
-	std::set<int> hidden_;
+	void UpdateVisibility();
+	bool localOpen_ = true;
+	bool *open_ = nullptr;
+	CollapsibleHeader *header_ = nullptr;
 };
 
 }  // namespace UI

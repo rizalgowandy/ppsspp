@@ -24,14 +24,17 @@
 // with CISO images.
 
 #include <mutex>
+#include <memory>
 
 #include "Common/CommonTypes.h"
-#include "Core/ELF/PBPReader.h"
+
+#include "ext/libkirk/kirk_engine.h"
 
 class FileLoader;
 
 class BlockDevice {
 public:
+	BlockDevice(FileLoader *fileLoader) : fileLoader_(fileLoader) {}
 	virtual ~BlockDevice() {}
 	virtual bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) = 0;
 	virtual bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) {
@@ -43,16 +46,28 @@ public:
 		}
 		return true;
 	}
-	int GetBlockSize() const { return 2048;}  // forced, it cannot be changed by subclasses
-	virtual u32 GetNumBlocks() = 0;
-	virtual bool IsDisc() = 0;
+	int constexpr GetBlockSize() const { return 2048;}  // forced, it cannot be changed by subclasses. If a subclass uses bigger blocks internally, it must cache and virtualize.
+	virtual u32 GetNumBlocks() const = 0;
+	virtual u64 GetUncompressedSize() const {
+		return (u64)GetNumBlocks() * (u64)GetBlockSize();
+	}
+	virtual bool IsDisc() const = 0;
 
-	u32 CalculateCRC(volatile bool *cancel = nullptr);
 	void NotifyReadError();
 
+	bool IsOK() const { return errorString_.empty(); }
+	const std::string &ErrorString() { return errorString_; }
+
 protected:
+	FileLoader *fileLoader_;
 	bool reportedError_ = false;
+
+	std::string errorString_;
 };
+
+// A dual-layer UMD holds 1.8 GB, so this is generous. A CSO header can claim any size,
+// independent of how big the file is.
+constexpr u64 MAX_CSO_IMAGE_SIZE = 8ULL * 1024 * 1024 * 1024;
 
 class CISOFileBlockDevice : public BlockDevice {
 public:
@@ -60,23 +75,22 @@ public:
 	~CISOFileBlockDevice();
 	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
 	bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) override;
-	u32 GetNumBlocks() override { return numBlocks; }
-	bool IsDisc() override { return true; }
+	u32 GetNumBlocks() const override { return numBlocks; }
+	bool IsDisc() const override { return true; }
 
 private:
-	FileLoader *fileLoader_;
-	u32 *index;
-	u8 *readBuffer;
-	u8 *zlibBuffer;
-	u32 zlibBufferFrame;
-	u8 indexShift;
-	u8 blockShift;
-	u32 frameSize;
-	u32 numBlocks;
-	u32 numFrames;
-	int ver_;
+	u32 *index = nullptr;
+	u8 *readBuffer = nullptr;
+	size_t readBufferSize = 0;
+	u8 *zlibBuffer = nullptr;
+	u32 zlibBufferFrame = 0;
+	u8 indexShift = 0;
+	u8 blockShift = 0;
+	u32 frameSize = 0;
+	u32 numBlocks = 0;
+	u32 numFrames = 0;
+	int ver_ = 0;
 };
-
 
 class FileBlockDevice : public BlockDevice {
 public:
@@ -84,12 +98,60 @@ public:
 	~FileBlockDevice();
 	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
 	bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) override;
-	u32 GetNumBlocks() override {return (u32)(filesize_ / GetBlockSize());}
-	bool IsDisc() override { return true; }
+	u32 GetNumBlocks() const override {return (u32)(filesize_ / GetBlockSize());}
+	bool IsDisc() const override { return true; }
+	u64 GetUncompressedSize() const override {
+		return filesize_;
+	}
+private:
+	u64 filesize_;
+};
+
+class UDFFileBlockDevice : public BlockDevice {
+public:
+	UDFFileBlockDevice(FileLoader *fileLoader);
+	~UDFFileBlockDevice();
+	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
+	bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) override;
+	u32 GetNumBlocks() const override { return numBlocks_; }
+	bool IsDisc() const override { return true; }
+	u64 GetUncompressedSize() const override {
+		return (u64)numBlocks_ * (u64)GetBlockSize();
+	}
 
 private:
-	FileLoader *fileLoader_;
-	u64 filesize_;
+	struct Extent {
+		u32 startBlock = 0;
+		u32 numBlocks = 0;
+	};
+
+	Extent layer0_{};
+	Extent layer1_{};
+	u32 numBlocks_ = 0;
+};
+
+class ISOContainerFileBlockDevice : public BlockDevice {
+public:
+	ISOContainerFileBlockDevice(FileLoader *fileLoader);
+	~ISOContainerFileBlockDevice();
+	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
+	bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) override;
+	u32 GetNumBlocks() const override { return numBlocks_; }
+	bool IsDisc() const override { return true; }
+	u64 GetUncompressedSize() const override {
+		return (u64)numBlocks_ * (u64)GetBlockSize();
+	}
+
+private:
+	struct Extent {
+		u32 startBlock = 0;
+		u32 numBlocks = 0;
+	};
+
+	std::shared_ptr<BlockDevice> outerBlockDevice_;
+	Extent layer0_{};
+	Extent layer1_{};
+	u32 numBlocks_ = 0;
 };
 
 
@@ -109,27 +171,54 @@ public:
 	~NPDRMDemoBlockDevice();
 
 	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
-	u32 GetNumBlocks() override {return (u32)lbaSize;}
-	bool IsDisc() override { return false; }
+	u32 GetNumBlocks() const override {return (u32)lbaSize_;}
+	bool IsDisc() const override { return false; }
 
 private:
-	FileLoader *fileLoader_;
-	static std::mutex mutex_;
-	u32 lbaSize;
+	// This is in case two threads hit this same block device, which shouldn't really happen.
+	std::mutex mutex_;
 
-	u32 psarOffset;
-	int blockSize;
-	int blockLBAs;
-	u32 numBlocks;
+	u32 lbaSize_ = 0;
 
-	u8 vkey[16];
-	u8 hkey[16];
-	struct table_info *table;
+	u32 psarOffset = 0;
+	int blockSize_ = 0;
+	int blockLBAs_ = 0;
+	u32 numBlocks_ = 0;
 
-	int currentBlock;
-	u8 *blockBuf;
-	u8 *tempBuf;
+	u8 vkey[16]{};
+	u8 hkey[16]{};
+	struct table_info *table_ = nullptr;
+
+	int currentBlock_ = 0;
+	u8 *blockBuf_ = nullptr;
+	u8 *tempBuf_ = nullptr;
+
+	// Each block device gets its own private kirk. Multiple ones can be in flight
+	// to load metadata.
+	KirkState kirk_{};
 };
 
+struct CHDImpl;
 
-BlockDevice *constructBlockDevice(FileLoader *fileLoader);
+struct _chd_file;
+
+// Opens a CHD that's read through fileLoader, which has to outlive it. Null, and *error set, if it can't.
+struct _chd_file *OpenCHDThroughLoader(FileLoader *fileLoader, std::string *error);
+
+class CHDFileBlockDevice : public BlockDevice {
+public:
+	CHDFileBlockDevice(FileLoader *fileLoader);
+	~CHDFileBlockDevice();
+	bool ReadBlock(int blockNumber, u8 *outPtr, bool uncached = false) override;
+	bool ReadBlocks(u32 minBlock, int count, u8 *outPtr) override;
+	u32 GetNumBlocks() const override { return numBlocks; }
+	bool IsDisc() const override { return true; }
+private:
+	std::unique_ptr<CHDImpl> impl_;
+	u8 *readBuffer = nullptr;
+	u32 currentHunk = 0;
+	u32 blocksPerHunk = 0;
+	u32 numBlocks = 0;
+};
+
+BlockDevice *ConstructBlockDevice(FileLoader *fileLoader, std::string *errorString);

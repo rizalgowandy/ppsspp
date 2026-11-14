@@ -18,43 +18,155 @@
 #include "ppsspp_config.h"
 #include "ext/xxhash.h"
 #include "Common/UI/UI.h"
+#include "Common/UI/PopupScreens.h"
 
 #include "Common/Data/Text/I18n.h"
 #include "Common/Data/Encoding/Utf8.h"
 #include "Common/File/FileUtil.h"
+#include "Common/Net/HTTPClient.h"
 #include "Common/StringUtils.h"
 #include "Common/System/System.h"
-#include "Core/Core.h"
+#include "Common/System/Request.h"
+#include "Common/UI/ScreenManager.h"
+#include "Core/System.h"
 #include "Core/Config.h"
 #include "Core/CwCheat.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
-
+#undef new
+#ifdef SYSTEM_RAPIDJSON
+#include <rapidjson/document.h>
+#else
+#include "ext/rapidjson/include/rapidjson/document.h"
+#endif
+#include "Common/DbgNew.h"
 #include "UI/GameInfoCache.h"
 #include "UI/CwCheatScreen.h"
+#include "UI/MiscViews.h"
 
 static const int FILE_CHECK_FRAME_INTERVAL = 53;
 
-CwCheatScreen::CwCheatScreen(const std::string &gamePath)
-	: UIDialogScreenWithBackground() {
-	gamePath_ = gamePath;
+constexpr char g_cheatDBListUrl[] = "https://metadata.ppsspp.org/cheats.json";
+
+static Path GetGlobalCheatFilePath() {
+	return GetSysDirectory(DIRECTORY_CHEATS) / "cheat.db";
+}
+
+struct CheatDatabaseDownloadInfo {
+	std::string name;
+	std::string maintainer;
+	std::string url;
+};
+
+// Use rapidjson to parse the cheat database list.
+std::vector<CheatDatabaseDownloadInfo> ParseJson(std::string_view json) {
+	rapidjson::Document d;
+	d.Parse(json.data(), json.size());
+
+	std::vector<CheatDatabaseDownloadInfo> downloads;
+
+	if (d.HasParseError()) {
+		ERROR_LOG(Log::CwCheats, "Failed to parse cheat database list: %.*s", STR_VIEW(json));
+		return downloads;
+	}
+	if (!d.IsObject()) {
+		ERROR_LOG(Log::CwCheats, "1");
+		return downloads;
+	}
+	if (!d.HasMember("databases") || !d["databases"].IsArray()) {
+		ERROR_LOG(Log::CwCheats, "databases is not an array");
+		return downloads;
+	}
+
+	const auto& dbs = d["databases"];
+	for (auto& db : dbs.GetArray()) {
+		if (!db.IsObject())
+			continue;
+		CheatDatabaseDownloadInfo info;
+		if (!db.HasMember("name") || !db["name"].IsString())
+			continue;
+		info.name = db["name"].GetString();
+		if (!db.HasMember("maintainer") || !db["maintainer"].IsString())
+			continue;
+		info.maintainer = db["maintainer"].GetString();
+		if (!db.HasMember("url") || !db["url"].IsString())
+			continue;
+		info.url = db["url"].GetString();
+		downloads.push_back(info);
+	}
+	return downloads;
+}
+
+class CwCheatDownloadPopupScreen : public UI::PopupScreen {
+public:
+	CwCheatDownloadPopupScreen();
+
+	void CreatePopupContents(UI::ViewGroup *parent) override;
+	void update() override;
+
+	const char *tag() const override { return "CwCheatDownloadScreen"; }
+
+	const std::string &ChosenUrl() const { return chosenUrl_; }
+
+private:
+	std::shared_ptr<http::Request> cheatsRequest_;
+	std::string chosenUrl_;
+	std::vector<CheatDatabaseDownloadInfo> cheatDbs_;
+};
+
+CwCheatDownloadPopupScreen::CwCheatDownloadPopupScreen() : PopupScreen(T(I18NCat::DIALOG, "Back")) {
+	cheatsRequest_ = g_DownloadManager.StartDownload(g_cheatDBListUrl, Path(), http::RequestFlags::KeepInMemory, nullptr, "cheatdblist");
+}
+
+void CwCheatDownloadPopupScreen::update() {
+	UI::PopupScreen::update();
+	if (cheatsRequest_ && cheatsRequest_->Done()) {
+		std::string data;
+		cheatsRequest_->buffer().TakeAll(&data);
+		cheatDbs_ = ParseJson(data);
+		cheatsRequest_.reset();
+		RecreateViews();
+	}
+}
+
+void CwCheatDownloadPopupScreen::CreatePopupContents(UI::ViewGroup *parent) {
+	using namespace UI;
+	auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+
+	if (File::Exists(GetGlobalCheatFilePath())) {
+		parent->Add(new NoticeView(NoticeLevel::WARN, cw->T("A cheat database already exists. Downloading a new one will overwrite it."), ""));
+	}
+
+	for (auto &db : cheatDbs_) {
+		parent->Add(new Choice(db.name + " - " + db.maintainer, ImageID("I_DOWNLOAD")))->OnClick.Add([this, url = db.url](UI::EventParams &) {
+			INFO_LOG(Log::CwCheats, "Chosen cheat database URL: %s", url.c_str());
+			chosenUrl_ = url;
+			TriggerFinish(DialogResult::DR_OK);
+		});
+	}
+}
+
+CwCheatScreen::CwCheatScreen(const Path &gamePath)
+	: UITwoPaneBaseDialogScreen(gamePath, TwoPaneFlags::Default) {
 }
 
 CwCheatScreen::~CwCheatScreen() {
 	delete engine_;
 }
 
-void CwCheatScreen::LoadCheatInfo() {
-	std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, gamePath_, 0);
-	std::string gameID;
-	if (info && info->paramSFOLoaded) {
-		gameID = info->paramSFO.GetValueString("DISC_ID");
-	}
-	if ((info->id.empty() || !info->disc_total)
-		&& gamePath_.find("/PSP/GAME/") != std::string::npos) {
-		gameID = g_paramSFO.GenerateFakeID(gamePath_);
-	}
+bool CwCheatScreen::WantsTextInput() const {
+	// We don't want to pop a software keyboard on the cheat screen, just for type-to-search.
+	return !System_GetPropertyBool(SYSPROP_KEYBOARD_IS_SOFT);
+}
 
-	if (engine_ == nullptr || gameID != gameID_) {
+bool CwCheatScreen::TryLoadCheatInfo() {
+	std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, gamePath_, GameInfoFlags::PARAM_SFO);
+	if (!info->Ready(GameInfoFlags::PARAM_SFO)) {
+		return false;
+	}
+	// The cache has already replaced the ID of homebrew with a generated one.
+	const std::string &gameID = info->id;
+
+	if (!engine_ || gameID != gameID_) {
 		gameID_ = gameID;
 		delete engine_;
 		engine_ = new CWCheatEngine(gameID_);
@@ -63,64 +175,192 @@ void CwCheatScreen::LoadCheatInfo() {
 
 	// We won't parse this, just using it to detect changes to the file.
 	std::string str;
-	if (readFileToString(true, engine_->CheatFilename().c_str(), str)) {
+	if (File::ReadTextFileToString(engine_->CheatFilename(), &str)) {
 		fileCheckHash_ = XXH3_64bits(str.c_str(), str.size());
 	}
 	fileCheckCounter_ = 0;
 
-	fileInfo_ = engine_->FileInfo();
+	fileInfo_ = engine_->FileInfo(&parseErrors_);
 
 	// Let's also trigger a reload, in case it changed.
 	g_Config.bReloadCheats = true;
+	return true;
 }
 
-void CwCheatScreen::CreateViews() {
-	using namespace UI;
-	auto cw = GetI18NCategory("CwCheats");
-	auto di = GetI18NCategory("Dialog");
+void CwCheatScreen::BeforeCreateViews() {
+	TryLoadCheatInfo();  // in case the info is already in cache.
+}
 
-	root_ = new AnchorLayout(new LayoutParams(FILL_PARENT, FILL_PARENT));
-
-	LoadCheatInfo();
-	Margins actionMenuMargins(50, -15, 15, 0);
-
-	LinearLayout *leftColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(400, FILL_PARENT));
-	leftColumn->Add(new ItemHeader(cw->T("Options")));
-	//leftColumn->Add(new Choice(cw->T("Add Cheat")))->OnClick.Handle(this, &CwCheatScreen::OnAddCheat);
-	leftColumn->Add(new Choice(cw->T("Import Cheats")))->OnClick.Handle(this, &CwCheatScreen::OnImportCheat);
-#if !defined(MOBILE_DEVICE)
-	leftColumn->Add(new Choice(cw->T("Edit Cheat File")))->OnClick.Handle(this, &CwCheatScreen::OnEditCheatFile);
-#endif
-	leftColumn->Add(new Choice(cw->T("Enable/Disable All")))->OnClick.Handle(this, &CwCheatScreen::OnEnableAll);
-	leftColumn->Add(new PopupSliderChoice(&g_Config.iCwCheatRefreshRate, 1, 1000, cw->T("Refresh Rate"), 1, screenManager()));
-
-	rightScroll_ = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 0.5f));
-	rightScroll_->SetTag("CwCheats");
-	rightScroll_->SetScrollToTop(false);
-	rightScroll_->ScrollTo(g_Config.fCwCheatScrollPosition);
-	LinearLayout *rightColumn = new LinearLayoutList(ORIENT_VERTICAL, new LinearLayoutParams(200, FILL_PARENT, actionMenuMargins));
-	rightScroll_->Add(rightColumn);
-
-	rightColumn->Add(new ItemHeader(cw->T("Cheats")));
-	for (size_t i = 0; i < fileInfo_.size(); ++i) {
-		rightColumn->Add(new CheckBox(&fileInfo_[i].enabled, fileInfo_[i].name))->OnClick.Add([=](UI::EventParams &) {
-			return OnCheckBox((int)i);
-		});
+bool CwCheatScreen::key(const KeyInput &input) {
+	if (search_.Key(cheatList_, input)) {
+		// This will eat up the ESC key, which is used to cancel searches.
+		return true;
 	}
 
-	LinearLayout *layout = new LinearLayout(ORIENT_HORIZONTAL, new LayoutParams(FILL_PARENT, FILL_PARENT));
-	layout->Add(leftColumn);
-	layout->Add(rightScroll_);
-	root_->Add(layout);
+	return UITwoPaneBaseDialogScreen::key(input);
+}
 
-	AddStandardBack(root_);
+void CwCheatScreen::dialogFinished(const Screen *dialog, DialogResult result) {
+	if (auto downloadScreen = dynamic_cast<const CwCheatDownloadPopupScreen *>(dialog)) {
+		if (result != DR_OK || downloadScreen->ChosenUrl().empty()) {
+			return;
+		}
+		if (downloadRequest_) {
+			ERROR_LOG(Log::CwCheats, "Download already in progress, ignoring new download request.");
+			return;
+		}
+		INFO_LOG(Log::CwCheats, "Starting download of cheat database from %s", downloadScreen->ChosenUrl().c_str());
+		downloadRequest_ = g_DownloadManager.StartDownload(downloadScreen->ChosenUrl(), GetGlobalCheatFilePath(), http::RequestFlags::ProgressBar, nullptr, "cheatdbdownload");
+	} else {
+		UITwoPaneBaseDialogScreen::dialogFinished(dialog, result);
+	}
+}
+
+void CwCheatScreen::CreateSettingsViews(UI::ViewGroup *leftColumn) {
+	using namespace UI;
+	auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+	auto di = GetI18NCategory(I18NCat::DIALOG);
+	auto mm = GetI18NCategory(I18NCat::MAINMENU);
+
+	ChoiceGroupList *groups = leftColumn->Add(new ChoiceGroupList());
+	//leftColumn->Add(new Choice(cw->T("Add Cheat")))->OnClick.Handle(this, &CwCheatScreen::OnAddCheat);
+	ChoiceGroup *importGroup = groups->Add(new ChoiceGroup(cw->T("Import Cheats")));
+
+	importGroup->Add(new Choice(cw->T("Download cheat database")))->OnClick.Add([this](UI::EventParams &) {
+		screenManager()->push(new CwCheatDownloadPopupScreen());
+	});
+
+	Path cheatPath = GetGlobalCheatFilePath();
+
+	std::string root = GetSysDirectory(DIRECTORY_MEMSTICK_ROOT).ToString();
+
+	std::string title = ApplySafeSubstitutions(cw->T("Import from %1"), "PSP/Cheats/cheat.db");
+
+	importGroup->Add(new Choice(title))->OnClick.Handle(this, &CwCheatScreen::OnImportCheat);
+	importGroup->Add(new Choice(mm->T("Browse"), ImageID("I_FOLDER_OPEN")))->OnClick.Handle(this, &CwCheatScreen::OnImportBrowse);
+
+	ChoiceGroup *optionsGroup = groups->Add(new ChoiceGroup(di->T("Options")));
+	Choice *searchChoice = optionsGroup->Add(new Choice(di->T("Search"), ImageID("I_SEARCH")));
+	searchChoice->OnClick.Add([this, searchChoice, screenManager = screenManager(), token = GetRequesterToken()](UI::EventParams &) {
+		auto di = GetI18NCategory(I18NCat::DIALOG);
+		AskForInput(screenManager, token, searchChoice, di->T("Search"), [this](const std::string &text, bool success) {
+			if (!success) {
+				return;
+			}
+			search_.searchFilter = text;
+			search_.ApplySearchFilter(cheatList_, false);
+		});
+	});
+#if !defined(MOBILE_DEVICE)
+	optionsGroup->Add(new Choice(cw->T("Edit Cheat File")))->OnClick.Handle(this, &CwCheatScreen::OnEditCheatFile);
+#endif
+	optionsGroup->Add(new Choice(di->T("Disable All")))->OnClick.Handle(this, &CwCheatScreen::OnDisableAll);
+	optionsGroup->Add(new PopupSliderChoice(&g_Config.iCwCheatRefreshIntervalMs, 1, 1000, 77, cw->T("Refresh interval"), 1, screenManager()))->SetFormat(di->T("%d ms"));
+}
+
+void CwCheatScreen::CreateContentViews(UI::ViewGroup *parent) {
+	using namespace UI;
+	auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+	auto di = GetI18NCategory(I18NCat::DIALOG);
+	auto mm = GetI18NCategory(I18NCat::MAINMENU);
+
+	UI::LinearLayout *rightSide = parent->Add(new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 0.5f)));
+	search_.searchFilter.clear();
+	search_.searchBar = rightSide->Add(new SearchBar(new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT)));
+	search_.searchBar->OnCancel.Add([this](UI::EventParams &) {
+		search_.searchFilter.clear();
+		search_.ApplySearchFilter(cheatList_, false);
+	});
+
+	UI::ScrollView *rightScroll = rightSide->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f)));
+	rightScroll->SetTag("CwCheats");
+	rightScroll->RememberPosition(&g_Config.fCwCheatScrollPosition);
+
+	LinearLayout *rightColumn = new LinearLayoutList(ORIENT_VERTICAL, new LinearLayoutParams(200, FILL_PARENT));
+	rightColumn->SetSpacing(0.0f);
+	rightScroll->Add(rightColumn);
+
+	cheatList_ = rightColumn;
+
+	if (!errorMessage_.empty()) {
+		rightColumn->Add(new NoticeView(errorLevel_, errorMessage_, errorDetails_));
+		rightColumn->Add(new Spacer(8.0f));
+	}
+
+	if (!parseErrors_.empty()) {
+		// Cheats with a bad line are left out of the list, so say why.
+		const size_t maxShown = 5;
+		std::string details;
+		for (size_t i = 0; i < parseErrors_.size() && i < maxShown; i++) {
+			if (i > 0) {
+				details += '\n';
+			}
+			details += parseErrors_[i];
+		}
+		if (parseErrors_.size() > maxShown) {
+			details += "\n...";
+		}
+		rightColumn->Add(new NoticeView(NoticeLevel::WARN, cw->T("Some lines in the cheat file could not be read"), details));
+		rightColumn->Add(new Spacer(8.0f));
+	}
+
+	rightColumn->Add(new ItemHeader(cw->T("Cheats")));
+
+	bool prevIsTitle = false;
+	CheckBox *prev = nullptr;
+	for (size_t i = 0; i < fileInfo_.size(); ++i) {
+		std::string_view text;
+		if (fileInfo_[i].IsTitle(&text)) {
+			// Title.
+			TextView *titleView = rightColumn->Add(new TextView(text, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT, UI::Margins(8, 8, 8, 0))));
+			titleView->SetTextSize(UI::TextSize::Big);
+			titleView->SetAlwaysVisibleInSearch(true);
+			prevIsTitle = true;
+			prev = nullptr;
+		} else if (fileInfo_[i].IsPostComment(&text)) {
+			if (prev) {
+				// A cheat's comment lines go in its checkbox.
+				std::string hint = prev->GetHintText();
+				if (!hint.empty()) {
+					hint += '\n';
+				}
+				hint += text;
+				prev->SetHintText(hint);
+			} else {
+				rightColumn->Add(new SettingHint(text, nullptr));
+			}
+			prevIsTitle = false;
+		} else {
+			// Regular cheat code.
+			if (!prevIsTitle) {
+				rightColumn->Add(new Spacer(8.0f));
+			}
+			CheckBox *checkBox = rightColumn->Add(new CheckBox(&fileInfo_[i].enabled, fileInfo_[i].name));
+			checkBox->OnClick.Add([=](UI::EventParams &) {
+				OnCheckBox((int)i);
+			});
+			prev = checkBox;
+			prevIsTitle = false;
+		}
+	}
+}
+
+std::string_view CwCheatScreen::GetTitle() const {
+	auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+	return cw->T("Cheats");
 }
 
 void CwCheatScreen::update() {
+	if (gameID_.empty()) {
+		if (TryLoadCheatInfo()) {
+			RecreateViews();
+		}
+	}
+
 	if (fileCheckCounter_++ >= FILE_CHECK_FRAME_INTERVAL && engine_) {
 		// Check if the file has changed.  If it has, we'll reload.
 		std::string str;
-		if (readFileToString(true, engine_->CheatFilename().c_str(), str)) {
+		if (File::ReadTextFileToString(engine_->CheatFilename(), &str)) {
 			uint64_t newHash = XXH3_64bits(str.c_str(), str.size());
 			if (newHash != fileCheckHash_) {
 				// This will update the hash.
@@ -130,168 +370,251 @@ void CwCheatScreen::update() {
 		fileCheckCounter_ = 0;
 	}
 
-	UIDialogScreenWithBackground::update();
+	if (downloadRequest_ && downloadRequest_->Done()) {
+		if (!downloadRequest_->Failed()) {
+			INFO_LOG(Log::CwCheats, "Cheat database downloaded successfully to %s.", GetGlobalCheatFilePath().ToVisualString().c_str());
+			RecreateViews();
+		} else {
+			ERROR_LOG(Log::CwCheats, "Failed to download cheat database");
+		}
+		downloadRequest_.reset();
+	}
+
+	UIBaseDialogScreen::update();
 }
 
 void CwCheatScreen::onFinish(DialogResult result) {
 	if (result != DR_BACK) // This only works for BACK here.
 		return;
 
-	if (MIPSComp::jit) {
-		MIPSComp::jit->ClearCache();
+	if (mipsr4k.jit) {
+		mipsr4k.jit->ClearCache();
 	}
-	g_Config.fCwCheatScrollPosition = rightScroll_->GetScrollPosition();
 }
 
-UI::EventReturn CwCheatScreen::OnEnableAll(UI::EventParams &params) {
-	enableAllFlag_ = !enableAllFlag_;
-
-	// Flip all the switches.
+void CwCheatScreen::OnDisableAll(UI::EventParams &params) {
+	// Disable all the switches.
 	for (auto &info : fileInfo_) {
-		info.enabled = enableAllFlag_;
+		info.enabled = false;
 	}
 
 	if (!RebuildCheatFile(INDEX_ALL)) {
 		// Probably the file was modified outside PPSSPP, refresh.
 		// TODO: Report error.
 		RecreateViews();
-		return UI::EVENT_SKIPPED;
 	}
-
-	return UI::EVENT_DONE;
 }
 
-UI::EventReturn CwCheatScreen::OnAddCheat(UI::EventParams &params) {
+void CwCheatScreen::OnAddCheat(UI::EventParams &params) {
 	TriggerFinish(DR_OK);
 	g_Config.bReloadCheats = true;
-	return UI::EVENT_DONE;
 }
 
-UI::EventReturn CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
+void CwCheatScreen::OnEditCheatFile(UI::EventParams &params) {
 	g_Config.bReloadCheats = true;
-	if (MIPSComp::jit) {
-		MIPSComp::jit->ClearCache();
+	if (mipsr4k.jit) {
+		mipsr4k.jit->ClearCache();
 	}
 	if (engine_) {
-#if PPSSPP_PLATFORM(UWP)
-		LaunchBrowser(engine_->CheatFilename().c_str());
-#else
-		File::openIniFile(engine_->CheatFilename());
-#endif
+		File::OpenFileInEditor(engine_->CheatFilename());
 	}
-	return UI::EVENT_DONE;
 }
 
-UI::EventReturn CwCheatScreen::OnImportCheat(UI::EventParams &params) {
-	if (gameID_.length() != 9 || !engine_) {
-		WARN_LOG(COMMON, "CWCHEAT: Incorrect ID(%s) - can't import cheats.", gameID_.c_str());
-		return UI::EVENT_DONE;
-	}
-	std::string line;
-	std::vector<std::string> title;
-	bool finished = false;
-	std::vector<std::string> newList;
+static char *GetLineNoNewline(char *temp, int sz, FILE *fp) {
+	char *line = fgets(temp, sz, fp);
+	if (!line)
+		return nullptr;
+	// fgets() doesn't stop at embedded NUL bytes, so a "line" starting with one would
+	// otherwise make strlen() return 0 here, and `end` would point before the buffer.
+	if (line[0] == '\0')
+		return line;
 
-	std::string cheatFile = GetSysDirectory(DIRECTORY_CHEATS) + "cheat.db";
-	std::string gameID = StringFromFormat("_S %s-%s", gameID_.substr(0, 4).c_str(), gameID_.substr(4).c_str());
+	// If the last character is \n, just make it the terminator.
+	char *end = line + strlen(line) - 1;
+	if (*end == '\n')
+		*end = '\0';
+	return line;
+}
 
-	std::fstream fs;
-	File::OpenCPPFile(fs, cheatFile, std::ios::in);
-
-	if (!fs.is_open()) {
-		WARN_LOG(COMMON, "Unable to open %s\n", cheatFile.c_str());
-	}
-
-	while (fs.good()) {
-		getline(fs, line); // get line from file
-		if (line == gameID) {
-			title.push_back(line);
-			getline(fs, line);
-			title.push_back(line);
-			do {
-				if (finished == false){
-					getline(fs, line);
-				}
-				if (line[0] == '_' && line[1] == 'C') {
-					// Test if cheat already exists.
-					for (const auto &existing : fileInfo_) {
-						if (line.substr(4) == existing.name) {
-							finished = false;
-							goto loop;
-						}
-					}
-
-					newList.push_back(line);
-					getline(fs, line);
-					do {
-						newList.push_back(line);
-						getline(fs, line);
-					} while ((line[0] == '_' && line[1] == 'L') || line[0] == '/' || line[0] == '#');
-					finished = true;
-				} else {
-					continue;
-				}
-			loop:;
-			} while (fs.good() && ((line[0] == '_' && line[1] != 'S') || line[0] == '/' || line[0] == '#'));
-			finished = true;
+void CwCheatScreen::ImportAndReport(const Path &cheatFile) {
+	int cheatCount = 0;
+	if (!ImportCheats(cheatFile, &cheatCount)) {
+		// Show an error message?
+		if (!File::Exists(cheatFile)) {
+			auto er = GetI18NCategory(I18NCat::ERRORS);
+			errorMessage_ = ApplySafeSubstitutions(er->T("File not found: %1"), "");
+			errorLevel_ = NoticeLevel::WARN;
+		} else {
+			auto di = GetI18NCategory(I18NCat::DIALOG);
+			errorMessage_ = di->T("LoadingFailed");
+			errorLevel_ = NoticeLevel::ERROR;
 		}
-		if (finished == true)
-			break;
+		errorDetails_ = GetFriendlyPath(cheatFile);
+	} else if (cheatCount == 0) {
+		auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+		// Show an error message?
+		errorLevel_ = NoticeLevel::INFO;
+		errorMessage_ = cw->T("No new cheats found for this game");
+		errorDetails_.clear();
+	} else {
+		auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+		// Show a success message?
+		errorLevel_ = NoticeLevel::SUCCESS;
+		errorMessage_ = ApplySafeSubstitutions(cw->T("Added %1 cheats for this game"), cheatCount);
+		errorDetails_ = GetFriendlyPath(cheatFile);
 	}
-	fs.close();
-	std::string title2;
-	File::OpenCPPFile(fs, engine_->CheatFilename(), std::ios::in);
-	getline(fs, title2);
-	fs.close();
-	File::OpenCPPFile(fs, engine_->CheatFilename(), std::ios::out | std::ios::app);
-
-	auto it = title.begin();
-	if (((title2[0] == '_' && title2[1] != 'S') || title2[0] == '/' || title2[0] == '#') && it != title.end() && (++it) != title.end()) {
-		fs << title[0] << "\n" << title[1];
-	}
-
-	NOTICE_LOG(COMMON, "Imported %u entries from %s.\n", (int)newList.size(), cheatFile.c_str());
-	if (newList.size() != 0) {
-		fs << "\n";
-	}
-
-	for (int i = 0; i < (int)newList.size(); i++) {
-		fs << newList[i];
-		if (i < (int)newList.size() - 1) {
-			fs << "\n";
-		}
-	}
-	fs.close();
-
 	g_Config.bReloadCheats = true;
 	RecreateViews();
-	return UI::EVENT_DONE;
 }
 
-UI::EventReturn CwCheatScreen::OnCheckBox(int index) {
-	if (!RebuildCheatFile(index)) {
-		// TODO: Report error.  Let's reload the file, presumably it changed.
-		RecreateViews();
-		return UI::EVENT_SKIPPED;
-	}
-
-	return UI::EVENT_DONE;
+void CwCheatScreen::OnImportBrowse(UI::EventParams &params) {
+	System_BrowseForFile(GetRequesterToken(), "Open cheat DB file", BrowseFileType::DB, [this](std::string_view value, int) {
+		if (value.empty()) {
+			return;
+		}
+		Path path(value);
+		INFO_LOG(Log::CwCheats, "Attempting to load cheats from: '%s'", path.ToVisualString().c_str());
+		int cheatsFound = 0;
+		ImportAndReport(path);
+	});
 }
 
-bool CwCheatScreen::RebuildCheatFile(int index) {
-	std::fstream fs;
-	if (!engine_ || !File::OpenCPPFile(fs, engine_->CheatFilename(), std::ios::in)) {
+void CwCheatScreen::OnImportCheat(UI::EventParams &params) {
+	const Path importPath = GetGlobalCheatFilePath();
+	ImportAndReport(importPath);
+}
+
+bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
+	if (gameID_.length() != 9 || !engine_) {
+		WARN_LOG(Log::CwCheats, "CWCHEAT: Incorrect ID(%s) - can't import cheats.", gameID_.c_str());
 		return false;
 	}
 
+	FILE *in = File::OpenCFile(cheatFile, "rt");
+	if (!in) {
+		WARN_LOG(Log::CwCheats, "Unable to open %s\n", cheatFile.c_str());
+		return false;
+	}
+
+	std::string gameID = StringFromFormat("_S %s-%s", gameID_.substr(0, 4).c_str(), gameID_.substr(4).c_str());
+
+	std::vector<std::string> title;
+	std::vector<std::string> newList;
+
+	char linebuf[2048]{};
+	bool parseGameEntry = false;
+	bool parseCheatEntry = false;
+
+	(*cheatsFound) = 0;
+	while (in && !feof(in)) {
+		char *line = GetLineNoNewline(linebuf, sizeof(linebuf), in);
+
+		if (!line) {
+			continue;
+		}
+
+		if (line[0] == '_' && line[1] == 'S') {
+			parseGameEntry = gameID == line;
+			parseCheatEntry = false;
+		} else if (parseGameEntry && line[0] == '_' && line[1] == 'C') {
+			// Test if cheat already exists. A malformed/truncated line (e.g. just
+			// "_C" or "_C0" with no name) is shorter than 4 chars - substr(4) would
+			// throw std::out_of_range, uncaught here, crashing the whole app.
+			std::string lineStr(line);
+			parseCheatEntry = lineStr.size() < 4 || !HasCheatWithName(lineStr.substr(4));
+		}
+
+		if (!parseGameEntry) {
+			if (newList.size() > 0) {
+				// Only parse the first matching game entry.
+				break;
+			} else {
+				// Haven't yet found a matching game entry, continue parsing.
+				continue;
+			}
+		}
+
+		if (line[0] == '_' && (line[1] == 'S' || line[1] == 'G') && title.size() < 2) {
+			title.push_back(line);
+		} else if (parseCheatEntry && ((line[0] == '_' && (line[1] == 'C' || line[1] == 'L' || line[1] == 'M')) || line[0] == '/' || line[0] == '#')) {
+			newList.push_back(line);
+			(*cheatsFound)++;
+		}
+	}
+	fclose(in);
+
+	std::string title2;
+	// Hmm, this probably gets confused about BOMs?
+	FILE *inTitle2 = File::OpenCFile(engine_->CheatFilename(), "rt");
+	if (inTitle2) {
+		char temp[2048];
+		char *line = GetLineNoNewline(temp, sizeof(temp), inTitle2);
+		if (line)
+			title2 = line;
+		fclose(inTitle2);
+	}
+
+	FILE *append = File::OpenCFile(engine_->CheatFilename(), "at");
+	if (!append) {
+		return false;
+	}
+
+	if (title2.size() == 0 || title2[0] != '_' || title2[1] != 'S') {
+		for (int i = (int)title.size(); i > 0; i--) {
+			newList.insert(newList.begin(), title[i - 1]);
+		}
+	}
+
+	NOTICE_LOG(Log::Common, "Imported %u lines from %s.\n", (int)newList.size(), cheatFile.c_str());
+	if (newList.size() != 0) {
+		fputc('\n', append);
+	}
+
+	for (int i = 0; i < (int)newList.size(); i++) {
+		fprintf(append, "%s", newList[i].c_str());
+		if (i < (int)newList.size() - 1) {
+			fputc('\n', append);
+		}
+	}
+	fclose(append);
+	return true;
+}
+
+void CwCheatScreen::OnCheckBox(int index) {
+	if (!RebuildCheatFile(index)) {
+		// TODO: Report error.  Let's reload the file, presumably it changed.
+		RecreateViews();
+	}
+}
+
+bool CwCheatScreen::HasCheatWithName(const std::string &name) {
+	for (const auto &existing : fileInfo_) {
+		if (name == existing.name) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool CwCheatScreen::RebuildCheatFile(int index) {
+	if (!engine_)
+		return false;
+	FILE *in = File::OpenCFile(engine_->CheatFilename(), "rt");
+	if (!in)
+		return false;
+
 	// In case lines were edited while we weren't looking, reload them.
 	std::vector<std::string> lines;
-	for (; fs && !fs.eof(); ) {
-		std::string line;
-		std::getline(fs, line, '\n');
+	for (; !feof(in); ) {
+		char temp[2048];
+		char *line = GetLineNoNewline(temp, sizeof(temp), in);
+		if (!line)
+			break;
+
 		lines.push_back(line);
 	}
-	fs.close();
+	fclose(in);
 
 	auto updateLine = [&](const CheatFileInfo &info) {
 		// Line numbers start with one, not zero.
@@ -324,17 +647,24 @@ bool CwCheatScreen::RebuildCheatFile(int index) {
 		}
 	}
 
-
-	if (!File::OpenCPPFile(fs, engine_->CheatFilename(), std::ios::out | std::ios::trunc)) {
+	FILE *out = File::OpenCFile(engine_->CheatFilename(), "wt");
+	if (!out) {
 		return false;
 	}
 
-	for (int i = 0; i < lines.size(); ++i) {
-		fs << lines[i];
-		if (i != lines.size()-1)
-			fs << '\n';
+	for (size_t i = 0; i < lines.size(); ++i) {
+		fprintf(out, "%s", lines[i].c_str());
+		if (i != lines.size() - 1)
+			fputc('\n', out);
 	}
-	fs.close();
+	fclose(out);
+
+	// Don't force an auto-reload, though.
+	std::string str;
+	if (File::ReadTextFileToString(engine_->CheatFilename(), &str)) {
+		uint64_t newHash = XXH3_64bits(str.c_str(), str.size());
+		fileCheckHash_ = newHash;
+	}
 
 	// Cheats will need to be reparsed now.
 	g_Config.bReloadCheats = true;

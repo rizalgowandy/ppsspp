@@ -1,11 +1,7 @@
 #pragma once
-#ifdef _MSC_VER
-#include "SDL/SDL.h"
-#include "SDL/SDL_thread.h"
-#else
-#include "SDL.h"
-#include "SDL_thread.h"
-#endif
+#include <SDL3/SDL.h>
+#include <map>
+#include <vector>
 
 #include "Common/Input/InputState.h"
 #include "Common/Input/KeyCodes.h"
@@ -17,14 +13,19 @@ public:
 	~SDLJoystick();
 
 	void registerEventHandler();
-	void ProcessInput(SDL_Event &event);
+	void ProcessInput(const SDL_Event &event);
 
 private:
-	void setUpController(int deviceIndex);
+	void setUpController(SDL_JoystickID deviceID);
 	void setUpControllers();
-	keycode_t getKeycodeForButton(SDL_GameControllerButton button);
+	InputKeyCode getKeycodeForButton(SDL_GamepadButton button);
 	int getDeviceIndex(int instanceId);
+	void releaseAllKeys();
+
 	bool registeredAsEventHandler;
-	std::vector<SDL_GameController *> controllers;
+	std::vector<SDL_Gamepad *> controllers;
 	std::map<int, int> controllerDeviceMap;
+
+	// Deduplicate axis events. Pair is device, axis.
+	std::map<std::pair<InputDeviceID, InputAxis>, float> prevAxisValue_;
 };

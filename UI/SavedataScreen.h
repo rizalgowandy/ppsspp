@@ -19,12 +19,17 @@
 
 #include <functional>
 #include <string>
+#include <vector>
+
+#include "Common/File/Path.h"
 
 #include "Common/UI/UIScreen.h"
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
 
-#include "UI/MiscScreens.h"
+#include "UI/BaseScreens.h"
+#include "UI/GameInfoCache.h"
+#include "UI/TabbedDialogScreen.h"
 
 enum class SavedataSortOption {
 	FILENAME,
@@ -34,7 +39,8 @@ enum class SavedataSortOption {
 
 class SavedataBrowser : public UI::LinearLayout {
 public:
-	SavedataBrowser(std::string path, UI::LayoutParams *layoutParams = 0);
+	// Entries whose names start with highlightPrefix (a game ID) are outlined, and the first one scrolled to.
+	SavedataBrowser(const Path &path, std::string_view highlightPrefix, UI::LayoutParams *layoutParams = 0);
 
 	void Update() override;
 
@@ -44,41 +50,141 @@ public:
 	UI::Event OnChoice;
 
 private:
+	static void PrepFilename(UI::View *);
+	static void PrepSize(UI::View *);
+	static void PrepDate(UI::View *);
 	static bool ByFilename(const UI::View *, const UI::View *);
 	static bool BySize(const UI::View *, const UI::View *);
 	static bool ByDate(const UI::View *, const UI::View *);
-	static bool SortDone();
 
 	void Refresh();
-	UI::EventReturn SavedataButtonClick(UI::EventParams &e);
+	void SavedataButtonClick(UI::EventParams &e);
+
+	void ScrollToHighlighted();
 
 	SavedataSortOption sortOption_ = SavedataSortOption::FILENAME;
 	UI::ViewGroup *gameList_ = nullptr;
 	UI::TextView *noMatchView_ = nullptr;
 	UI::TextView *searchingView_ = nullptr;
-	std::string path_;
+	Path path_;
+	std::string highlightPrefix_;
 	std::string searchFilter_;
 	bool searchPending_ = false;
+	bool scrollPending_ = false;
 };
 
-class SavedataScreen : public UIDialogScreenWithGameBackground {
+class SavedataView;
+
+class SavedataPopupScreen : public UI::PopupScreen {
+public:
+	SavedataPopupScreen(Path gamePath, Path savePath, bool showHint, std::string_view title);
+
+	const char *tag() const override { return "SavedataPopup"; }
+	void update() override;
+	void CreatePopupContents(UI::ViewGroup *parent) override;
+
+protected:
+	UI::Size PopupWidth() const override { return 600; }
+
+private:
+	SavedataView *savedataView_ = nullptr;
+	Path savePath_;
+	Path gamePath_;
+	bool showHint_ = false;
+};
+
+class SavedataScreen : public UITabbedBaseDialogScreen {
 public:
 	// gamePath can be empty, in that case this screen will show all savedata in the save directory.
-	SavedataScreen(std::string gamePath);
+	SavedataScreen(const Path &gamePath) : UITabbedBaseDialogScreen(gamePath) {}
 	~SavedataScreen();
 
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
-	void sendMessage(const char *message, const char *value) override;
+	void sendMessage(UIMessage message, const char *value) override;
+	void update() override;
+
+	ViewLayoutMode LayoutMode() const override {
+		return ViewLayoutMode::ApplyInsets;
+	}
+
+	const char *tag() const override { return "Savedata"; }
 
 protected:
-	UI::EventReturn OnSavedataButtonClick(UI::EventParams &e);
-	UI::EventReturn OnSortClick(UI::EventParams &e);
-	UI::EventReturn OnSearch(UI::EventParams &e);
-	void CreateViews() override;
+	void PreCreateViews() override;
+	void CreateTabs() override;
+	void CreateExtraButtons(UI::ViewGroup *verticalLayout, int margins) override;
 
-	bool gridStyle_;
+	
+private:
+	void OnSavedataButtonClick(UI::EventParams &e);
+	void OnSearch(UI::EventParams &e);
+
+	void CreateSavedataTab(UI::ViewGroup *savedata);
+	void CreateSavestateTab(UI::ViewGroup *savestate);
+	// The ID of the game the screen was opened for (its saves are highlighted), once its PARAM.SFO is loaded.
+	bool LookUpGame();
+
+	std::string gameID_;
+	bool gameLookupPending_ = false;
 	SavedataSortOption sortOption_ = SavedataSortOption::FILENAME;
-	SavedataBrowser *dataBrowser_;
-	SavedataBrowser *stateBrowser_;
+	SavedataBrowser *dataBrowser_ = nullptr;
+	SavedataBrowser *stateBrowser_ = nullptr;
 	std::string searchFilter_;
 };
+
+class SavedataButton : public UI::Clickable {
+public:
+	SavedataButton(const Path &gamePath, UI::LayoutParams *layoutParams = 0)
+		: UI::Clickable(layoutParams), savePath_(gamePath) {
+		SetTag(gamePath.ToString());
+	}
+
+	void Draw(UIContext &dc) override;
+	bool UpdateText();
+	std::string DescribeText() const override;
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override {
+		w = 500;
+		h = 74;
+	}
+
+	const Path &GamePath() const { return savePath_; }
+
+	uint64_t GetTotalSize() const {
+		return totalSize_;
+	}
+	int64_t GetDateSeconds() const {
+		return dateSeconds_;
+	}
+
+	void UpdateTotalSize();
+	void UpdateDateSeconds();
+
+private:
+	void UpdateText(const std::shared_ptr<GameInfo> &ginfo);
+
+	Path savePath_;
+	std::string title_;
+	std::string subtitle_;
+	uint64_t totalSize_ = 0;
+	int64_t dateSeconds_ = 0;
+	bool hasTotalSize_ = false;
+	bool hasDateSeconds_ = false;
+};
+
+// View used for the detailed popup, and also in the import savedata comparison.
+// It doesn't do its own data loading for that reason.
+class SavedataView : public UI::LinearLayout {
+public:
+	SavedataView(UIContext &dc, GameInfo *ginfo, IdentifiedFileType type, bool showIcon, UI::LayoutParams *layoutParams = nullptr);
+	SavedataView(UIContext &dc, const Path &savePath, IdentifiedFileType type, std::string_view title, std::string_view savedataTitle, std::string_view savedataDetail, std::string_view fileSize, std::string_view mtime, bool showIcon, UI::LayoutParams *layoutParams = nullptr);
+
+	void UpdateGame(GameInfo *ginfo);
+private:
+	UI::TextView *savedataTitle_ = nullptr;
+	UI::TextView *detail_ = nullptr;
+	UI::TextView *mTime_ = nullptr;
+	UI::TextView *fileSize_ = nullptr;
+};
+
+// Zips a game's saves (without installed data) and shares the zip.
+void ExportAllGameSavesForGame(GameInfo *info);

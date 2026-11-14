@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <cstdio>
+#include <mutex>
 #include "Common/Data/Encoding/Utf8.h"
 #include "Core/Core.h"
+#include "Core/System.h"
 #include "Core/HLE/ReplaceTables.h"
 #include "Core/MemMap.h"
-#include "Core/MIPS/JitCommon/JitBlockCache.h"
+#include "Core/MIPS/MIPSDebugInterface.h"
 #include "Windows/Debugger/DumpMemoryWindow.h"
 #include "Windows/resource.h"
 #include "Windows/W32Util/ShellUtil.h"
@@ -18,7 +20,7 @@ void DumpMemoryWindow::HandleBrowseClick(HWND hwnd) {
 	GetWindowTextW(filenameWnd, &buffer[0], (int)buffer.size());
 	std::string fn = ConvertWStringToUTF8(buffer);
 
-	bool result = W32Util::BrowseForFileName(false, hwnd, L"Select filename", NULL, NULL, NULL, fn);
+	bool result = W32Util::BrowseForFileName(false, hwnd, L"Select filename", nullptr, L"dump.bin", nullptr, nullptr, fn);
 	if (result) {
 		filenameChosen_ = true;
 		buffer = ConvertUTF8ToWString(fn);
@@ -78,55 +80,44 @@ INT_PTR CALLBACK DumpMemoryWindow::dlgFunc(HWND hwnd, UINT iMsg, WPARAM wParam, 
 			break;
 		case IDOK:
 			if (bp->fetchDialogData(hwnd)) {
-				bool priorDumpWasStepping = Core_IsStepping();
-				if (!priorDumpWasStepping && PSP_IsInited()) {
-					// If emulator isn't paused force paused state, but wait before locking.
-					Core_EnableStepping(true);
-					Core_WaitInactive();
-				}
 
-				auto memLock = Memory::Lock();
-				if (!PSP_IsInited())
-					break;
+				// Route the actual memory dump to the CPU thread instead of forcing the emulator
+				// to pause and poking at it directly from this GUI thread - see
+				// Core_RunOnCPUThread() in Core.h. MessageBoxA() is modal, so it stays outside the
+				// queued callback.
+				enum class Outcome { NotInited, OpenFailed, Success } outcome = Outcome::NotInited;
+				Core_RunOnCPUThread([&] {
+					CoreShutdownLock coreLock = Core_LockAgainstShutdown();
+					if (!PSP_IsInited())
+						return;
 
-				FILE *output = _wfopen(bp->fileName_.c_str(), L"wb");
-				if (output == nullptr) {
+					FILE *output = _wfopen(bp->fileName_.c_str(), L"wb");
+					if (output == nullptr) {
+						outcome = Outcome::OpenFailed;
+						return;
+					}
+
+					fwrite(Memory::GetPointerOrException(bp->start), 1, bp->size, output);
+
+					fclose(output);
+					outcome = Outcome::Success;
+				});
+
+				if (outcome == Outcome::OpenFailed) {
 					char errorMessage[2048];
 					snprintf(errorMessage, sizeof(errorMessage), "Could not open file \"%S\".", bp->fileName_.c_str());
 					MessageBoxA(hwnd, errorMessage, "Error", MB_OK);
-					break;
+				} else if (outcome == Outcome::Success) {
+					MessageBoxA(hwnd, "Done.", "Information", MB_OK);
+					EndDialog(hwnd, true);
 				}
-
-				bool includeReplacements = SendMessage(GetDlgItem(hwnd, IDC_DUMP_INCLUDEHACKS), BM_GETCHECK, 0, 0) != 0;
-				if (includeReplacements) {
-					fwrite(Memory::GetPointer(bp->start), 1, bp->size, output);
-				} else {
-					auto savedReplacements = SaveAndClearReplacements();
-					if (MIPSComp::jit) {
-						auto savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
-						fwrite(Memory::GetPointer(bp->start), 1, bp->size, output);
-						MIPSComp::jit->RestoreSavedEmuHackOps(savedBlocks);
-					} else {
-						fwrite(Memory::GetPointer(bp->start), 1, bp->size, output);
-					}
-					RestoreSavedReplacements(savedReplacements);
-				}
-
-				fclose(output);
-				if (!priorDumpWasStepping) {
-					// If emulator wasn't paused before memory dump resume emulation automatically.
-					Core_EnableStepping(false);
-				}
-
-				MessageBoxA(hwnd, "Done.", "Information", MB_OK);
-				EndDialog(hwnd, true);
 			}
 			break;
 		case IDCANCEL:
 			EndDialog(hwnd,false);
 			break;
 		}
-
+		break;
 	case WM_KEYDOWN:
 
 		break;
@@ -147,20 +138,20 @@ bool DumpMemoryWindow::fetchDialogData(HWND hwnd)
 
 	// parse start address
 	GetWindowTextA(GetDlgItem(hwnd,IDC_DUMP_STARTADDRESS),str,256);
-	if (cpu->initExpression(str,exp) == false
-		|| cpu->parseExpression(exp,start) == false)
+	if (initExpression(cpu, str,exp) == false
+		|| parseExpression(cpu, exp,start) == false)
 	{
-		sprintf(errorMessage,"Invalid address expression \"%s\".",str);
+		snprintf(errorMessage, sizeof(errorMessage), "Invalid address expression \"%s\".",str);
 		MessageBoxA(hwnd,errorMessage,"Error",MB_OK);
 		return false;
 	}
 	
 	// parse size
 	GetWindowTextA(GetDlgItem(hwnd,IDC_DUMP_SIZE),str,256);
-	if (cpu->initExpression(str,exp) == false
-		|| cpu->parseExpression(exp,size) == false)
+	if (initExpression(cpu, str,exp) == false
+		|| parseExpression(cpu, exp,size) == false)
 	{
-		sprintf(errorMessage,"Invalid size expression \"%s\".",str);
+		snprintf(errorMessage, sizeof(errorMessage), "Invalid size expression \"%s\".",str);
 		MessageBoxA(hwnd,errorMessage,"Error",MB_OK);
 		return false;
 	}
@@ -196,12 +187,12 @@ bool DumpMemoryWindow::fetchDialogData(HWND hwnd)
 
 	if (invalidAddress)
 	{
-		sprintf(errorMessage,"Invalid address 0x%08X.",start);
+		snprintf(errorMessage, sizeof(errorMessage), "Invalid address 0x%08X.",start);
 		MessageBoxA(hwnd,errorMessage,"Error",MB_OK);
 		return false;
 	} else if (invalidSize)
 	{
-		sprintf(errorMessage,"Invalid end address 0x%08X.",start+size);
+		snprintf(errorMessage, sizeof(errorMessage), "Invalid end address 0x%08X.",start+size);
 		MessageBoxA(hwnd,errorMessage,"Error",MB_OK);
 		return false;
 	}
@@ -227,11 +218,10 @@ void DumpMemoryWindow::changeMode(HWND hwnd, Mode newMode)
 		if (filenameChosen_ == false)
 			SetWindowTextA(GetDlgItem(hwnd,IDC_DUMP_FILENAME),"Custom.dump");
 	} else {
-		u32 start, size;
-		const char* defaultFileName;
+		u32 start = 0, size = 0;
+		const char *defaultFileName = "";
 
-		switch (selectedMode)
-		{
+		switch (selectedMode) {
 		case MODE_RAM:
 			start = PSP_GetUserMemoryBase();
 			size = PSP_GetUserMemoryEnd()-start;
@@ -247,13 +237,15 @@ void DumpMemoryWindow::changeMode(HWND hwnd, Mode newMode)
 			size = PSP_GetScratchpadMemoryEnd()-start;
 			defaultFileName = "Scratchpad.dump";
 			break;
+		case MODE_CUSTOM:
+			break;
 		}
 		
-		sprintf(buffer,"0x%08X",start);
+		snprintf(buffer, sizeof(buffer), "0x%08X", start);
 		SetWindowTextA(GetDlgItem(hwnd,IDC_DUMP_STARTADDRESS),buffer);
 		EnableWindow(GetDlgItem(hwnd,IDC_DUMP_STARTADDRESS),FALSE);
 
-		sprintf(buffer,"0x%08X",size);
+		snprintf(buffer, sizeof(buffer), "0x%08X", size);
 		SetWindowTextA(GetDlgItem(hwnd,IDC_DUMP_SIZE),buffer);
 		EnableWindow(GetDlgItem(hwnd,IDC_DUMP_SIZE),FALSE);
 		

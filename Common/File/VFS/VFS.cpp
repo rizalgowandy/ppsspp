@@ -1,118 +1,111 @@
+#include <cstring>
+#include "Common/Common.h"
 #include "Common/Log.h"
 #include "Common/File/VFS/VFS.h"
-#include "Common/File/VFS/AssetReader.h"
+#include "Common/File/FileUtil.h"
+#include "Common/File/AndroidStorage.h"
+#include "Common/StringUtils.h"
 
-struct VFSEntry {
-	const char *prefix;
-	AssetReader *reader;
-};
+VFS g_VFS;
 
-static VFSEntry entries[16];
-static int num_entries = 0;
-
-void VFSRegister(const char *prefix, AssetReader *reader) {
-	entries[num_entries].prefix = prefix;
-	entries[num_entries].reader = reader;
-	DEBUG_LOG(IO, "Registered VFS for prefix %s: %s", prefix, reader->toString().c_str());
-	num_entries++;
-}
-
-void VFSShutdown() {
-	for (int i = 0; i < num_entries; i++) {
-		delete entries[i].reader;
+void VFS::Register(std::string_view prefix, VFSBackend *reader) {
+	if (reader) {
+		entries_.push_back(VFSEntry{ prefix, reader });
+		DEBUG_LOG(Log::IO, "Registered VFS for prefix %.*s: %s", STR_VIEW(prefix), reader->toString().c_str());
+	} else {
+		ERROR_LOG(Log::IO, "Trying to register null VFS backend for prefix %.*s", STR_VIEW(prefix));
 	}
-	num_entries = 0;
 }
 
-static bool IsLocalPath(const char *path) {
+void VFS::Clear() {
+	for (auto &entry : entries_) {
+		delete entry.reader;
+	}
+	entries_.clear();
+}
+
+// TODO: Use Path more.
+static bool IsLocalAbsolutePath(std::string_view path) {
+	if (path.empty())
+		return false;
 	bool isUnixLocal = path[0] == '/';
 #ifdef _WIN32
-	bool isWindowsLocal = isalpha(path[0]) && path[1] == ':';
+	bool isWindowsLocal = (path.size() >= 2 && isalpha((unsigned char)path[0]) && path[1] == ':') || startsWith(path, "\\\\") || startsWith(path, "//");
 #else
 	bool isWindowsLocal = false;
 #endif
-	return isUnixLocal || isWindowsLocal;
+	bool isContentURI = Android_IsContentUri(path);
+	return isUnixLocal || isWindowsLocal || isContentURI;
 }
 
-// The returned data should be free'd with delete[].
-uint8_t *VFSReadFile(const char *filename, size_t *size) {
-	if (IsLocalPath(filename)) {
-		// Local path, not VFS.
-		// INFO_LOG(IO, "Not a VFS path: %s . Reading local file.", filename);
-		return ReadLocalFile(filename, size);
-	}
-
-	int fn_len = (int)strlen(filename);
+// This allows empty prefixes for multiple systems, which effectively becomes a union mount.
+// Which is useful for PPSSPP's asset files, but not much else. We should use prefixes for everything.
+template<class RetType, class Func>
+inline RetType RouteVFSOperation(const std::vector<VFSEntry> &entries, std::string_view filename, Func func) {
+	const int fn_len = (int)filename.length();
 	bool fileSystemFound = false;
-	for (int i = 0; i < num_entries; i++) {
-		int prefix_len = (int)strlen(entries[i].prefix);
+	for (const auto &entry : entries) {
+		int prefix_len = (int)entry.prefix.length();
 		if (prefix_len >= fn_len) continue;
-		if (0 == memcmp(filename, entries[i].prefix, prefix_len)) {
+		if (0 == memcmp(filename.data(), entry.prefix.data(), prefix_len)) {
 			fileSystemFound = true;
-			// INFO_LOG(IO, "Prefix match: %s (%s) -> %s", entries[i].prefix, filename, filename + prefix_len);
-			uint8_t *data = entries[i].reader->ReadAsset(filename + prefix_len, size);
-			if (data)
-				return data;
+			RetType result = func(entry.reader, filename.substr(prefix_len));
+			if (result)
+				return result;
 			else
 				continue;
+			// INFO_LOG(Log::IO, "Prefix match: %s (%s) -> %s", entries[i].prefix, filename, filename + prefix_len);
 			// Else try the other registered file systems.
 		}
 	}
 	if (!fileSystemFound) {
-		ERROR_LOG(IO, "Missing filesystem for '%s'", filename);
+		ERROR_LOG(Log::IO, "Missing filesystem for '%.*s'", STR_VIEW(filename));
 	}  // Otherwise, the file was just missing. No need to log.
-	return 0;
+	return RetType();
 }
 
-bool VFSGetFileListing(const char *path, std::vector<FileInfo> *listing, const char *filter) {
-	if (IsLocalPath(path)) {
+// The returned data should be free'd with delete[].
+uint8_t *VFS::ReadFile(std::string_view filename, size_t *size) {
+	if (IsLocalAbsolutePath(filename)) {
 		// Local path, not VFS.
-		// INFO_LOG(IO, "Not a VFS path: %s . Reading local directory.", path);
-		getFilesInDir(path, listing, filter);
+		// INFO_LOG(Log::IO, "Not a VFS path: %.*s . Reading local file.", STR_VIEW(filename));
+		return File::ReadLocalFile(Path(filename), size);
+	}
+	return RouteVFSOperation<uint8_t *>(entries_, filename, [size](VFSBackend *reader, std::string_view path) {
+		return reader->ReadFile(path, size);
+	});
+}
+
+bool VFS::GetFileListing(std::string_view path, std::vector<File::FileInfo> *listing, const char *filter) {
+	if (IsLocalAbsolutePath(path)) {
+		// Local path, not VFS.
+		// INFO_LOG(Log::IO, "Not a VFS path: %s . Reading local directory.", path);
+		File::GetFilesInDir(Path(path), listing, filter);
 		return true;
 	}
-
-	int fn_len = (int)strlen(path);
-	bool fileSystemFound = false;
-	for (int i = 0; i < num_entries; i++) {
-		int prefix_len = (int)strlen(entries[i].prefix);
-		if (prefix_len >= fn_len) continue;
-		if (0 == memcmp(path, entries[i].prefix, prefix_len)) {
-			fileSystemFound = true;
-			if (entries[i].reader->GetFileListing(path + prefix_len, listing, filter)) {
-				return true;
-			}
-		}
-	}
-
-	if (!fileSystemFound) {
-		ERROR_LOG(IO, "Missing filesystem for %s", path);
-	}  // Otherwise, the file was just missing. No need to log.
-	return false;
+	return RouteVFSOperation<bool>(entries_, path, [listing, filter](VFSBackend *reader, std::string_view path) {
+		return reader->GetFileListing(path, listing, filter);
+	});
 }
 
-bool VFSGetFileInfo(const char *path, FileInfo *info) {
-	if (IsLocalPath(path)) {
+bool VFS::GetFileInfo(std::string_view path, File::FileInfo *info) {
+	if (IsLocalAbsolutePath(path)) {
 		// Local path, not VFS.
-		// INFO_LOG(IO, "Not a VFS path: %s . Getting local file info.", path);
-		return getFileInfo(path, info);
+		// INFO_LOG(Log::IO, "Not a VFS path: %s . Getting local file info.", path);
+		return File::GetFileInfo(Path(path), info);
 	}
+	return RouteVFSOperation<bool>(entries_, path, [info](VFSBackend *reader, std::string_view path) {
+		return reader->GetFileInfo(path, info);
+	});
+}
 
-	bool fileSystemFound = false;
-	int fn_len = (int)strlen(path);
-	for (int i = 0; i < num_entries; i++) {
-		int prefix_len = (int)strlen(entries[i].prefix);
-		if (prefix_len >= fn_len) continue;
-		if (0 == memcmp(path, entries[i].prefix, prefix_len)) {
-			fileSystemFound = true;
-			if (entries[i].reader->GetFileInfo(path + prefix_len, info))
-				return true;
-			else
-				continue;
-		}
+bool VFS::Exists(std::string_view path) {
+	if (IsLocalAbsolutePath(path)) {
+		// Local path, not VFS.
+		// INFO_LOG(Log::IO, "Not a VFS path: %s . Getting local file info.", path);
+		return File::Exists(Path(path));
 	}
-	if (!fileSystemFound) {
-		ERROR_LOG(IO, "Missing filesystem for %s", path);
-	}  // Otherwise, the file was just missing. No need to log.
-	return false;
+	return RouteVFSOperation<bool>(entries_, path, [](VFSBackend *reader, std::string_view path) {
+		return reader->Exists(path);
+	});
 }

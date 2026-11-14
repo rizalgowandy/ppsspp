@@ -1,11 +1,13 @@
 
 #include <ctime>
+#include <string>
 
 #include "ppsspp_config.h"
 #include "Common/Log.h"
 #include "Core/Config.h"
-#include "DiscordIntegration.h"
+#include "UI/DiscordIntegration.h"
 #include "Common/Data/Text/I18n.h"
+#include "Common/System/System.h"
 
 #if (PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(LINUX)) && !PPSSPP_PLATFORM(ANDROID) && !PPSSPP_PLATFORM(UWP)
 
@@ -30,22 +32,31 @@
 Discord g_Discord;
 
 static const char *ppsspp_app_id = "423397985041383434";
+static const char *ppsspp_app_id_gold = "1471464214710190152";
 
 #ifdef ENABLE_DISCORD
 // No context argument? What?
 static void handleDiscordError(int errCode, const char *message) {
-	ERROR_LOG(SYSTEM, "Discord error code %d: '%s'", errCode, message);
+	ERROR_LOG(Log::System, "Discord error code %d: '%s'", errCode, message);
 }
 #endif
 
 Discord::~Discord() {
 	if (initialized_) {
-		ERROR_LOG(SYSTEM, "Discord destructor running though g_Discord.Shutdown() has not been called.");
+		ERROR_LOG(Log::System, "Discord destructor running though g_Discord.Shutdown() has not been called.");
 	}
 }
 
+bool Discord::IsAvailable() {
+#ifdef ENABLE_DISCORD
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool Discord::IsEnabled() const {
-	return g_Config.bDiscordPresence;
+	return g_Config.bDiscordRichPresence;
 }
 
 void Discord::Init() {
@@ -55,8 +66,14 @@ void Discord::Init() {
 #ifdef ENABLE_DISCORD
 	DiscordEventHandlers eventHandlers{};
 	eventHandlers.errored = &handleDiscordError;
-	Discord_Initialize(ppsspp_app_id, &eventHandlers, 0, nullptr);
-	INFO_LOG(SYSTEM, "Discord connection initialized");
+
+	const char *appId = ppsspp_app_id;
+	if (System_GetPropertyBool(SYSPROP_APP_GOLD)) {
+		appId = ppsspp_app_id_gold;
+	}
+
+	Discord_Initialize(appId, &eventHandlers, 0, nullptr);
+	INFO_LOG(Log::System, "Discord connection initialized");
 #endif
 
 	initialized_ = true;
@@ -91,7 +108,7 @@ void Discord::Update() {
 #endif
 }
 
-void Discord::SetPresenceGame(const char *gameTitle) {
+void Discord::SetPresenceGame(std::string_view gameTitle) {
 	if (!IsEnabled())
 		return;
 	
@@ -100,19 +117,14 @@ void Discord::SetPresenceGame(const char *gameTitle) {
 	}
 
 #ifdef ENABLE_DISCORD
-	auto sc = GetI18NCategory("Screen");
-
+	auto sc = GetI18NCategory(I18NCat::SCREEN);
+	std::string title(gameTitle);
 	DiscordRichPresence discordPresence{};
-	discordPresence.state = gameTitle;
-	std::string details = sc->T("Playing");
-	discordPresence.details = details.c_str();
+	discordPresence.state = title.c_str();
+	discordPresence.details = sc->T_cstr("Playing");
 	discordPresence.startTimestamp = time(0);
 	discordPresence.largeImageText = "PPSSPP is the best PlayStation Portable emulator around!";
-#ifdef GOLD
-	discordPresence.largeImageKey = "icon_gold_png";
-#else
-	discordPresence.largeImageKey = "icon_regular_png";
-#endif
+	discordPresence.largeImageKey = System_GetPropertyBool(SYSPROP_APP_GOLD) ? "icon_gold_png" : "icon_regular_png";
 	Discord_UpdatePresence(&discordPresence);
 #endif
 }
@@ -126,18 +138,14 @@ void Discord::SetPresenceMenu() {
 	}
 
 #ifdef ENABLE_DISCORD
-	auto sc = GetI18NCategory("Screen");
+	auto sc = GetI18NCategory(I18NCat::SCREEN);
 
 	DiscordRichPresence discordPresence{};
-	discordPresence.state = sc->T("In menu");
+	discordPresence.state = sc->T_cstr("In menu");
 	discordPresence.details = "";
 	discordPresence.startTimestamp = time(0);
 	discordPresence.largeImageText = "PPSSPP is the best PlayStation Portable emulator around!";
-#ifdef GOLD
-	discordPresence.largeImageKey = "icon_gold_png";
-#else
-	discordPresence.largeImageKey = "icon_regular_png";
-#endif
+	discordPresence.largeImageKey = System_GetPropertyBool(SYSPROP_APP_GOLD) ? "icon_gold_png" : "icon_regular_png";
 	Discord_UpdatePresence(&discordPresence);
 #endif
 }

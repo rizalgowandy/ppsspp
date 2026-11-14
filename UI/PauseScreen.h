@@ -17,82 +17,84 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
+#include "Common/File/Path.h"
 #include "Common/UI/UIScreen.h"
 #include "Common/UI/ViewGroup.h"
-#include "UI/MiscScreens.h"
-#include "UI/TextureUtil.h"
+#include "Core/SaveState.h"
+#include "Core/ControlMapper.h"
+#include "UI/BaseScreens.h"
+#include "UI/Screen.h"
+#include "UI/GameInfoCache.h"
 
-class GamePauseScreen : public UIDialogScreenWithGameBackground {
+class GamePauseScreen : public UIBaseDialogScreen, protected ControlListener {
 public:
-	GamePauseScreen(const std::string &filename) : UIDialogScreenWithGameBackground(filename), gamePath_(filename) {}
-	virtual ~GamePauseScreen();
+	GamePauseScreen(const Path &filename, bool bootPending);
+	~GamePauseScreen();
 
-	virtual void dialogFinished(const Screen *dialog, DialogResult dr) override;
+	void dialogFinished(const Screen *dialog, DialogResult dr) override;
+	void sendMessage(UIMessage message, const char *value) override;
+
+	const char *tag() const override { return "GamePause"; }
+
+	InputMode PassInputToMapper() const override {
+		return InputMode::ImDebuggerToggle;
+	}
 
 protected:
-	virtual void CreateViews() override;
-	virtual void update() override;
-	void CallbackDeleteConfig(bool yes);
+	void CreateViews() override;
+	void update() override;
+	UI::Margins RootMargins() const override;
+	ViewLayoutMode LayoutMode() const override {
+		return ViewLayoutMode::ApplyInsets;
+	}
+	bool ReserveHiddenNavBar() const override { return true; }
+	void OnVKey(VirtKey virtualKeyCode, bool down) override;
 
 private:
-	UI::EventReturn OnGameSettings(UI::EventParams &e);
-	UI::EventReturn OnExitToMenu(UI::EventParams &e);
-	UI::EventReturn OnReportFeedback(UI::EventParams &e);
+	void CreateSavestateControls(UI::LinearLayout *viewGroup, UI::LinearLayout **extraRow);
 
-	UI::EventReturn OnRewind(UI::EventParams &e);
+	void OnGameSettings(UI::EventParams &e);
+	void OnExit(UI::EventParams &e);
+	void OnReportFeedback(UI::EventParams &e);
 
-	UI::EventReturn OnScreenshotClicked(UI::EventParams &e);
-	UI::EventReturn OnCwCheat(UI::EventParams &e);
+	void OnCreateConfig(UI::EventParams &e);
+	void OnDeleteConfig(UI::EventParams &e);
 
-	UI::EventReturn OnCreateConfig(UI::EventParams &e);
-	UI::EventReturn OnDeleteConfig(UI::EventParams &e);
+	void OnState(UI::EventParams &e);
+	void ShowContextMenu(UI::View *menuButton, bool portrait);
 
-	UI::EventReturn OnSwitchUMD(UI::EventParams &e);
-	UI::EventReturn OnState(UI::EventParams &e);
+	void AddExtraOptions(UI::ViewGroup *parent);
+
+	void FinishNextFrame(DialogResult finishNextFrameResult);
+	// Starts a savestate load (or rewind) with the callback it's given, and closes the menu once the
+	// state is in place. Closing right away would let the game run a few frames first.
+	void CloseAfterStateLoad(const std::function<void(SaveState::Callback)> &load);
+	// Set by the load's callback.
+	std::shared_ptr<std::atomic<bool>> stateLoadDone_;
 
 	// hack
+	std::mutex finishNextFrameMutex_;
 	bool finishNextFrame_ = false;
-	std::string gamePath_;
+	DialogResult finishNextFrameResult_ = DR_CANCEL;
+
+	UI::Choice *playButton_ = nullptr;
+
+	// State change tracking, a bit ugly heh, but works.
+	bool lastOnline_ = false;
+	bool lastNetInited_ = false;
+	bool lastNetInetInited_ = false;
+	bool lastAdhocServerConnected_ = false;
+	bool lastDNSConfigLoaded_ = false;
+
+	bool bootPending_ = false;
+
+	std::string saveStatePrefix_;
+	double createdTime_ = 0.0;
 };
 
-class PrioritizedWorkQueue;
-
-// AsyncImageFileView loads a texture from a file, and reloads it as necessary.
-// TODO: Actually make async, doh.
-class AsyncImageFileView : public UI::Clickable {
-public:
-	AsyncImageFileView(const std::string &filename, UI::ImageSizeMode sizeMode, PrioritizedWorkQueue *wq, UI::LayoutParams *layoutParams = 0);
-	~AsyncImageFileView();
-
-	void GetContentDimensionsBySpec(const UIContext &dc, UI::MeasureSpec horiz, UI::MeasureSpec vert, float &w, float &h) const override;
-	void Draw(UIContext &dc) override;
-	std::string DescribeText() const override { return text_; }
-
-	void DeviceLost() override;
-	void DeviceRestored(Draw::DrawContext *draw) override;
-
-	void SetFilename(std::string filename);
-	void SetColor(uint32_t color) { color_ = color; }
-	void SetOverlayText(std::string text) { text_ = text; }
-	void SetFixedSize(float fixW, float fixH) { fixedSizeW_ = fixW; fixedSizeH_ = fixH; }
-	void SetCanBeFocused(bool can) { canFocus_ = can; }
-
-	bool CanBeFocused() const override { return canFocus_; }
-
-	const std::string &GetFilename() const { return filename_; }
-
-private:
-	bool canFocus_;
-	std::string filename_;
-	std::string text_;
-	uint32_t color_;
-	UI::ImageSizeMode sizeMode_;
-
-	std::unique_ptr<ManagedTexture> texture_;
-	bool textureFailed_;
-	float fixedSizeW_;
-	float fixedSizeH_;
-};
+std::string GetConfirmExitMessage();
+void ShowMessageAfterSaveStateAction(SaveState::Status status, std::string_view message, std::string_view metadata);

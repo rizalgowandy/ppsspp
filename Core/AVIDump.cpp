@@ -23,15 +23,16 @@ extern "C" {
 
 #endif
 
+#include "Common/Data/Convert/ColorConv.h"
 #include "Common/File/FileUtil.h"
-#include "Common/ColorConv.h"
+#include "Common/File/Path.h"
 
 #include "Core/Config.h"
 #include "Core/AVIDump.h"
 #include "Core/System.h"
 #include "Core/Screenshot.h"
 
-#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GPUCommon.h"
 
 #include "Core/ELF/ParamSFO.h"
 #include "Core/HLE/sceKernelTime.h"
@@ -43,6 +44,8 @@ extern "C" {
 #define av_frame_alloc avcodec_alloc_frame
 #define av_frame_free avcodec_free_frame
 #endif
+
+#include "FFMPEGCompat.h"
 
 static AVFormatContext *s_format_context = nullptr;
 static AVCodecContext *s_codec_context = nullptr;
@@ -61,6 +64,7 @@ static int s_current_width;
 static int s_current_height;
 static int s_file_index = 0;
 static GPUDebugBuffer buf;
+static Path g_filename;
 
 static void InitAVCodec() {
 	static bool first_run = true;
@@ -94,26 +98,26 @@ bool AVIDump::CreateAVI() {
 
 	// Use gameID_EmulatedTimestamp for filename
 	std::string discID = g_paramSFO.GetDiscID();
-	std::string video_file_name = StringFromFormat("%s%s_%s.avi", GetSysDirectory(DIRECTORY_VIDEO).c_str(), discID.c_str(), KernelTimeNowFormatted().c_str()).c_str();
+	g_filename = GetSysDirectory(DIRECTORY_VIDEO) / StringFromFormat("%s_%s.avi", discID.c_str(), KernelTimeNowFormatted().c_str());
 
 	s_format_context = avformat_alloc_context();
 
 #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(58, 7, 0)
-	char *filename = av_strdup(video_file_name.c_str());
+	char *filename = av_strdup(g_filename.c_str());
 	// Freed when the context is freed.
 	s_format_context->url = filename;
 #else
 	const char *filename = s_format_context->filename;
-	snprintf(s_format_context->filename, sizeof(s_format_context->filename), "%s", video_file_name.c_str());
+	snprintf(s_format_context->filename, sizeof(s_format_context->filename), "%s", g_filename.c_str());
 #endif
-	INFO_LOG(COMMON, "Recording Video to: %s", filename);
+	INFO_LOG(Log::Common, "Recording Video to: %s", g_filename.ToVisualString().c_str());
 
 	// Make sure that the path exists
 	if (!File::Exists(GetSysDirectory(DIRECTORY_VIDEO)))
 		File::CreateDir(GetSysDirectory(DIRECTORY_VIDEO));
 
-	if (File::Exists(filename))
-		File::Delete(filename);
+	if (File::Exists(g_filename))
+		File::Delete(g_filename);
 
 	s_format_context->oformat = av_guess_format("avi", nullptr, nullptr);
 	if (!s_format_context->oformat)
@@ -127,9 +131,8 @@ bool AVIDump::CreateAVI() {
 #else
 	s_codec_context = avcodec_alloc_context3(codec);
 #endif
-	s_codec_context->codec_id = g_Config.bUseFFV1 ? AV_CODEC_ID_FFV1 : s_format_context->oformat->video_codec;
-	if (!g_Config.bUseFFV1)
-		s_codec_context->codec_tag = MKTAG('X', 'V', 'I', 'D');  // Force XVID FourCC for better compatibility
+	// Lossless. For lossy footage, capture the output with a screen recorder instead.
+	s_codec_context->codec_id = AV_CODEC_ID_FFV1;
 	s_codec_context->codec_type = AVMEDIA_TYPE_VIDEO;
 	s_codec_context->bit_rate = 400000;
 	s_codec_context->width = s_width;
@@ -137,7 +140,7 @@ bool AVIDump::CreateAVI() {
 	s_codec_context->time_base.num = 1001;
 	s_codec_context->time_base.den = 60000;
 	s_codec_context->gop_size = 12;
-	s_codec_context->pix_fmt = g_Config.bUseFFV1 ? AV_PIX_FMT_BGRA : AV_PIX_FMT_YUV420P;
+	s_codec_context->pix_fmt = AV_PIX_FMT_BGRA;
 
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 48, 101)
 	if (avcodec_parameters_from_context(s_stream->codecpar, s_codec_context) < 0)
@@ -165,9 +168,9 @@ bool AVIDump::CreateAVI() {
 		return false;
 #endif
 
-	NOTICE_LOG(G3D, "Opening file %s for dumping", filename);
+	NOTICE_LOG(Log::G3D, "Opening file '%s' for dumping", g_filename.ToVisualString().c_str());
 	if (avio_open(&s_format_context->pb, filename, AVIO_FLAG_WRITE) < 0 || avformat_write_header(s_format_context, nullptr)) {
-		WARN_LOG(G3D, "Could not open %s", filename);
+		WARN_LOG(Log::G3D, "Could not open %s", g_filename.ToVisualString().c_str());
 		return false;
 	}
 
@@ -191,11 +194,11 @@ void AVIDump::AddFrame() {
 	u32 w = 0;
 	u32 h = 0;
 	if (g_Config.bDumpVideoOutput) {
-		gpuDebug->GetOutputFramebuffer(buf);
+		gpu->GetOutputFramebuffer(buf);
 		w = buf.GetStride();
 		h = buf.GetHeight();
 	} else {
-		gpuDebug->GetCurrentFramebuffer(buf, GPU_DBG_FRAMEBUF_RENDER);
+		gpu->GetCurrentFramebuffer(buf, GPU_DBG_FRAMEBUF_RENDER);
 		w = PSP_CoreParameter().renderWidth;
 		h = PSP_CoreParameter().renderHeight;
 	}
@@ -261,23 +264,26 @@ void AVIDump::AddFrame() {
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 48, 101)
 	av_packet_unref(&pkt);
 	if (error < 0 && error != AVERROR(EAGAIN) && error != AVERROR_EOF)
-		ERROR_LOG(G3D, "Error while encoding video: %d", error);
+		ERROR_LOG(Log::G3D, "Error while encoding video: %d", error);
 #else
 	if (error < 0)
-		ERROR_LOG(G3D, "Error while encoding video: %d", error);
+		ERROR_LOG(Log::G3D, "Error while encoding video: %d", error);
 #endif
 #endif
 	delete[] flipbuffer;
 }
 
+Path AVIDump::LastFilename() {
+	return g_filename;
+}
+
 void AVIDump::Stop() {
 #ifdef USE_FFMPEG
-
 	av_write_trailer(s_format_context);
 	CloseFile();
 	s_file_index = 0;
 #endif
-	NOTICE_LOG(G3D, "Stopping frame dump");
+	NOTICE_LOG(Log::G3D, "Stopping frame dump to '%s'", g_filename.ToVisualString().c_str());
 }
 
 void AVIDump::CloseFile() {

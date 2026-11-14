@@ -24,6 +24,7 @@
 #include "Core/CoreTiming.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/HLE/HLE.h"
+#include "Core/HLE/ErrorCodes.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceKernelMsgPipe.h"
 #include "Core/HLE/sceKernelMemory.h"
@@ -45,260 +46,208 @@ static const u32 MSGPIPE_WAIT_VALUE_SEND = 0;
 static const u32 MSGPIPE_WAIT_VALUE_RECV = 1;
 
 // State: the timer for MsgPipe timeouts.
-static int waitTimer = -1;
 
-struct NativeMsgPipe
+// NativeMsgPipe/MsgPipeWaitingThread/MsgPipe itself now live in sceKernelMsgPipe.h - see the
+// comment on the class there for why.
+
+bool MsgPipeWaitingThread::IsStillWaiting(SceUID waitID) const
 {
-	SceSize_le size;
-	char name[32];
-	SceUInt_le attr;
-	s32_le bufSize;
-	s32_le freeSize;
-	s32_le numSendWaitThreads;
-	s32_le numReceiveWaitThreads;
-};
-
-struct MsgPipeWaitingThread
-{
-	SceUID threadID;
-	u32 bufAddr;
-	u32 bufSize;
-	// Free space at the end for receive, valid/free to read bytes from end for send.
-	u32 freeSize;
-	s32 waitMode;
-	PSPPointer<u32_le> transferredBytes;
-	u64 pausedTimeout;
-
-	bool IsStillWaiting(SceUID waitID) const
-	{
-		return HLEKernel::VerifyWait(threadID, WAITTYPE_MSGPIPE, waitID);
-	}
-
-	void WriteCurrentTimeout(SceUID waitID) const
-	{
-		u32 error;
-		if (IsStillWaiting(waitID))
-		{
-			u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
-			if (timeoutPtr != 0 && waitTimer != -1)
-			{
-				// Remove any event for this thread.
-				s64 cyclesLeft = CoreTiming::UnscheduleEvent(waitTimer, threadID);
-				Memory::Write_U32((u32) cyclesToUs(cyclesLeft), timeoutPtr);
-			}
-		}
-	}
-
-	void Complete(SceUID waitID, int result) const
-	{
-		if (IsStillWaiting(waitID))
-		{
-			WriteCurrentTimeout(waitID);
-			__KernelResumeThreadFromWait(threadID, result);
-		}
-	}
-
-	void Cancel(SceUID waitID, int result) const
-	{
-		Complete(waitID, result);
-	}
-
-	void ReadBuffer(u32 destPtr, u32 len)
-	{
-		Memory::Memcpy(destPtr, bufAddr + bufSize - freeSize, len, "MsgPipeReadBuffer");
-		freeSize -= len;
-		if (transferredBytes.IsValid())
-			*transferredBytes += len;
-	}
-
-	void WriteBuffer(u32 srcPtr, u32 len)
-	{
-		Memory::Memcpy(bufAddr + (bufSize - freeSize), srcPtr, len, "MsgPipeWriteBuffer");
-		freeSize -= len;
-		if (transferredBytes.IsValid())
-			*transferredBytes += len;
-	}
-
-	bool operator ==(const SceUID &otherThreadID) const
-	{
-		return threadID == otherThreadID;
-	}
-};
-
-static bool __KernelMsgPipeThreadSortPriority(MsgPipeWaitingThread thread1, MsgPipeWaitingThread thread2)
-{
-	return __KernelThreadSortPriority(thread1.threadID, thread2.threadID);
+	return HLEKernel::VerifyWait(threadID, WAITTYPE_MSGPIPE, waitID);
 }
 
-struct MsgPipe : public KernelObject
+void MsgPipeWaitingThread::WriteCurrentTimeout(SceUID waitID) const
 {
-	const char *GetName() override { return nmp.name; }
-	const char *GetTypeName() override { return GetStaticTypeName(); }
-	static const char *GetStaticTypeName() { return "MsgPipe"; }
-	static u32 GetMissingErrorCode() { return SCE_KERNEL_ERROR_UNKNOWN_MPPID; }
-	static int GetStaticIDType() { return SCE_KERNEL_TMID_Mpipe; }
-	int GetIDType() const override { return SCE_KERNEL_TMID_Mpipe; }
-
-	MsgPipe() : buffer(0) {}
-	~MsgPipe()
+	u32 error;
+	if (IsStillWaiting(waitID))
 	{
-		if (buffer != 0)
-			userMemory.Free(buffer);
+		u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
+		HLEKernel::WriteRemainingTimeout(threadID, timeoutPtr);
 	}
+}
 
-	u32 GetUsedSize()
+void MsgPipeWaitingThread::Complete(SceUID waitID, int result) const
+{
+	if (IsStillWaiting(waitID))
 	{
-		return (u32)(nmp.bufSize - nmp.freeSize);
+		WriteCurrentTimeout(waitID);
+		__KernelResumeThreadFromWait(threadID, result);
 	}
+}
 
-	void AddWaitingThread(std::vector<MsgPipeWaitingThread> &list, SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
-	{
-		MsgPipeWaitingThread thread = { id, addr, size, size, waitMode, { transferredBytesAddr } };
-		// Start out with 0 transferred bytes while waiting.
-		// TODO: for receive, it might be a different (partial) number.
-		if (thread.transferredBytes.IsValid())
-			*thread.transferredBytes = 0;
+void MsgPipeWaitingThread::Cancel(SceUID waitID, int result) const
+{
+	Complete(waitID, result);
+}
 
-		list.push_back(thread);
+void MsgPipeWaitingThread::ReadBuffer(u32 destPtr, u32 len)
+{
+	Memory::Memcpy(destPtr, bufAddr + bufSize - freeSize, len, "MsgPipeReadBuffer");
+	freeSize -= len;
+	if (transferredBytes.IsValid())
+		*transferredBytes += len;
+}
+
+void MsgPipeWaitingThread::WriteBuffer(u32 srcPtr, u32 len)
+{
+	Memory::Memcpy(bufAddr + (bufSize - freeSize), srcPtr, len, "MsgPipeWriteBuffer");
+	freeSize -= len;
+	if (transferredBytes.IsValid())
+		*transferredBytes += len;
+}
+
+MsgPipe::MsgPipe() : buffer(0) {}
+MsgPipe::~MsgPipe() {
+	if (buffer != 0) {
+		BlockAllocator *alloc = BlockAllocatorFromAddr(buffer);
+		_assert_msg_(alloc != nullptr, "Should always have a valid allocator/address");
+		if (alloc)
+			alloc->Free(buffer);
 	}
+}
 
-	void AddSendWaitingThread(SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
+u32 MsgPipe::GetUsedSize()
+{
+	return (u32)(nmp.bufSize - nmp.freeSize);
+}
+
+void MsgPipe::AddWaitingThread(std::vector<MsgPipeWaitingThread> &list, SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
+{
+	MsgPipeWaitingThread thread = { id, addr, size, size, waitMode, { transferredBytesAddr } };
+	// Start out with 0 transferred bytes while waiting.
+	// TODO: for receive, it might be a different (partial) number.
+	if (thread.transferredBytes.IsValid())
+		*thread.transferredBytes = 0;
+
+	list.push_back(thread);
+}
+
+void MsgPipe::AddSendWaitingThread(SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
+{
+	AddWaitingThread(sendWaitingThreads, id, addr, size, waitMode, transferredBytesAddr);
+}
+
+void MsgPipe::AddReceiveWaitingThread(SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
+{
+	AddWaitingThread(receiveWaitingThreads, id, addr, size, waitMode, transferredBytesAddr);
+}
+
+bool MsgPipe::CheckSendThreads()
+{
+	SortSendThreads();
+
+	bool wokeThreads = false;
+	bool filledSpace = false;
+	while (!sendWaitingThreads.empty() && nmp.freeSize > 0)
 	{
-		AddWaitingThread(sendWaitingThreads, id, addr, size, waitMode, transferredBytesAddr);
-	}
+		MsgPipeWaitingThread *thread = &sendWaitingThreads.front();
+		u32 bytesToSend = std::min(thread->freeSize, (u32) nmp.freeSize);
 
-	void AddReceiveWaitingThread(SceUID id, u32 addr, u32 size, int waitMode, u32 transferredBytesAddr)
-	{
-		AddWaitingThread(receiveWaitingThreads, id, addr, size, waitMode, transferredBytesAddr);
-	}
+		thread->ReadBuffer(buffer + GetUsedSize(), bytesToSend);
+		nmp.freeSize -= bytesToSend;
+		filledSpace = true;
 
-	bool CheckSendThreads()
-	{
-		SortSendThreads();
-
-		bool wokeThreads = false;
-		bool filledSpace = false;
-		while (!sendWaitingThreads.empty() && nmp.freeSize > 0)
+		if (thread->waitMode == SCE_KERNEL_MPW_ASAP || thread->freeSize == 0)
 		{
-			MsgPipeWaitingThread *thread = &sendWaitingThreads.front();
-			u32 bytesToSend = std::min(thread->freeSize, (u32) nmp.freeSize);
-
-			thread->ReadBuffer(buffer + GetUsedSize(), bytesToSend);
-			nmp.freeSize -= bytesToSend;
-			filledSpace = true;
-
-			if (thread->waitMode == SCE_KERNEL_MPW_ASAP || thread->freeSize == 0)
-			{
-				thread->Complete(GetUID(), 0);
-				sendWaitingThreads.erase(sendWaitingThreads.begin());
-				wokeThreads = true;
-				thread = NULL;
-			}
-			// Unlike receives, we don't do partial sends.  Stop at first blocked thread.
-			else
-				break;
+			thread->Complete(GetUID(), 0);
+			sendWaitingThreads.erase(sendWaitingThreads.begin());
+			wokeThreads = true;
+			thread = NULL;
 		}
-
-		if (filledSpace)
-			wokeThreads |= CheckReceiveThreads();
-
-		return wokeThreads;
+		// Unlike receives, we don't do partial sends.  Stop at first blocked thread.
+		else
+			break;
 	}
 
-	// This function should be only ran when the temporary buffer size is not 0 (otherwise, data is copied directly to the threads)
-	bool CheckReceiveThreads()
-	{
-		SortReceiveThreads();
+	if (filledSpace)
+		wokeThreads |= CheckReceiveThreads();
 
-		bool wokeThreads = false;
-		bool freedSpace = false;
-		while (!receiveWaitingThreads.empty() && GetUsedSize() > 0)
+	return wokeThreads;
+}
+
+// This function should be only ran when the temporary buffer size is not 0 (otherwise, data is copied directly to the threads)
+bool MsgPipe::CheckReceiveThreads()
+{
+	SortReceiveThreads();
+
+	bool wokeThreads = false;
+	bool freedSpace = false;
+	while (!receiveWaitingThreads.empty() && GetUsedSize() > 0)
+	{
+		MsgPipeWaitingThread *thread = &receiveWaitingThreads.front();
+		// Receive as much as possible, even if it's not enough to wake up.
+		u32 bytesToSend = std::min(thread->freeSize, GetUsedSize());
+
+		u8* ptr = Memory::GetPointerWriteOrException(buffer);
+		thread->WriteBuffer(buffer, bytesToSend);
+		// Put the unused data at the start of the buffer.
+		nmp.freeSize += bytesToSend;
+		memmove(ptr, ptr + bytesToSend, GetUsedSize());
+		freedSpace = true;
+
+		if (thread->waitMode == SCE_KERNEL_MPW_ASAP || thread->freeSize == 0)
 		{
-			MsgPipeWaitingThread *thread = &receiveWaitingThreads.front();
-			// Receive as much as possible, even if it's not enough to wake up.
-			u32 bytesToSend = std::min(thread->freeSize, GetUsedSize());
-
-			u8* ptr = Memory::GetPointer(buffer);
-			thread->WriteBuffer(buffer, bytesToSend);
-			// Put the unused data at the start of the buffer.
-			nmp.freeSize += bytesToSend;
-			memmove(ptr, ptr + bytesToSend, GetUsedSize());
-			freedSpace = true;
-
-			if (thread->waitMode == SCE_KERNEL_MPW_ASAP || thread->freeSize == 0)
-			{
-				thread->Complete(GetUID(), 0);
-				receiveWaitingThreads.erase(receiveWaitingThreads.begin());
-				wokeThreads = true;
-				thread = NULL;
-			}
-			// Stop at the first that can't wake up.
-			else
-				break;
+			thread->Complete(GetUID(), 0);
+			receiveWaitingThreads.erase(receiveWaitingThreads.begin());
+			wokeThreads = true;
+			thread = NULL;
 		}
-
-		if (freedSpace)
-			wokeThreads |= CheckSendThreads();
-
-		return wokeThreads;
+		// Stop at the first that can't wake up.
+		else
+			break;
 	}
 
-	void SortThreads(std::vector<MsgPipeWaitingThread> &waitingThreads, bool usePrio)
-	{
-		// Clean up any not waiting at the same time.
-		HLEKernel::CleanupWaitingThreads(WAITTYPE_MSGPIPE, GetUID(), waitingThreads);
+	if (freedSpace)
+		wokeThreads |= CheckSendThreads();
 
-		if (usePrio)
-			std::stable_sort(waitingThreads.begin(), waitingThreads.end(), __KernelMsgPipeThreadSortPriority);
-	}
+	return wokeThreads;
+}
 
-	void SortReceiveThreads()
-	{
-		bool usePrio = (nmp.attr & SCE_KERNEL_MPA_THPRI_R) != 0;
-		SortThreads(receiveWaitingThreads, usePrio);
-	}
+void MsgPipe::SortThreads(std::vector<MsgPipeWaitingThread> &waitingThreads, bool usePrio)
+{
+	// Clean up any not waiting at the same time.
+	HLEKernel::CleanupWaitingThreads(WAITTYPE_MSGPIPE, GetUID(), waitingThreads);
 
-	void SortSendThreads()
-	{
-		bool usePrio = (nmp.attr & SCE_KERNEL_MPA_THPRI_S) != 0;
-		SortThreads(sendWaitingThreads, usePrio);
-	}
+	if (usePrio)
+		HLEKernel::SortWaitingThreadsByPriority(waitingThreads);
+}
 
-	void RemoveReceiveWaitingThread(SceUID threadID)
-	{
-		HLEKernel::RemoveWaitingThread(receiveWaitingThreads, threadID);
-	}
+void MsgPipe::SortReceiveThreads()
+{
+	bool usePrio = (nmp.attr & SCE_KERNEL_MPA_THPRI_R) != 0;
+	SortThreads(receiveWaitingThreads, usePrio);
+}
 
-	void RemoveSendWaitingThread(SceUID threadID)
-	{
-		HLEKernel::RemoveWaitingThread(sendWaitingThreads, threadID);
-	}
+void MsgPipe::SortSendThreads()
+{
+	bool usePrio = (nmp.attr & SCE_KERNEL_MPA_THPRI_S) != 0;
+	SortThreads(sendWaitingThreads, usePrio);
+}
 
-	void DoState(PointerWrap &p) override
-	{
-		auto s = p.Section("MsgPipe", 1);
-		if (!s)
-			return;
+void MsgPipe::RemoveReceiveWaitingThread(SceUID threadID)
+{
+	HLEKernel::RemoveWaitingThread(receiveWaitingThreads, threadID);
+}
 
-		Do(p, nmp);
-		MsgPipeWaitingThread mpwt1 = {0}, mpwt2 = {0};
-		Do(p, sendWaitingThreads, mpwt1);
-		Do(p, receiveWaitingThreads, mpwt2);
-		Do(p, pausedSendWaits);
-		Do(p, pausedReceiveWaits);
-		Do(p, buffer);
-	}
+void MsgPipe::RemoveSendWaitingThread(SceUID threadID)
+{
+	HLEKernel::RemoveWaitingThread(sendWaitingThreads, threadID);
+}
 
-	NativeMsgPipe nmp;
+void MsgPipe::DoState(PointerWrap &p)
+{
+	auto s = p.Section("MsgPipe", 1);
+	if (!s)
+		return;
 
-	std::vector<MsgPipeWaitingThread> sendWaitingThreads;
-	std::vector<MsgPipeWaitingThread> receiveWaitingThreads;
-	// Key is the callback id it was for, or if no callback, the thread id.
-	std::map<SceUID, MsgPipeWaitingThread> pausedSendWaits;
-	std::map<SceUID, MsgPipeWaitingThread> pausedReceiveWaits;
-
-	u32 buffer;
-};
+	Do(p, nmp);
+	TerminateLoadedCString(p, nmp.name);
+	MsgPipeWaitingThread mpwt1 = {0}, mpwt2 = {0};
+	Do(p, sendWaitingThreads, mpwt1);
+	Do(p, receiveWaitingThreads, mpwt2);
+	Do(p, pausedSendWaits);
+	Do(p, pausedReceiveWaits);
+	Do(p, buffer);
+}
 
 KernelObject *__KernelMsgPipeObject()
 {
@@ -311,21 +260,19 @@ static void __KernelMsgPipeTimeout(u64 userdata, int cyclesLate)
 	HLEKernel::WaitExecTimeout<MsgPipe, WAITTYPE_MSGPIPE>(threadID);
 }
 
-static bool __KernelSetMsgPipeTimeout(u32 timeoutPtr)
-{
-	if (timeoutPtr == 0 || waitTimer == -1)
+static bool __KernelSetMsgPipeTimeout(u32 timeoutPtr) {
+	if (timeoutPtr == 0)
 		return true;
 
-	int micro = (int) Memory::Read_U32(timeoutPtr);
-	if (micro <= 2)
-	{
+	// Always at once up to 2us, never from 3us: what threads/msgpipe/send and receive record, where
+	// each call comes straight after a checkpoint and the code is presumably cold. Back to back the
+	// hardware does 2us at once less often, as other waits do.
+	if (__KernelWaitTimesOutAtOnce(timeoutPtr, 210, 55)) {
 		// Don't wait or reschedule, just timeout immediately.
 		return false;
 	}
 
-	if (micro <= 210)
-		micro = 250;
-	CoreTiming::ScheduleEvent(usToCycles(micro), waitTimer, __KernelGetCurThread());
+	__KernelScheduleWaitTimeout(__KernelGetCurThread(), timeoutPtr);
 	return true;
 }
 
@@ -366,8 +313,8 @@ static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int wa
 			if (poll)
 			{
 				// Generally, result is not updated in this case.  But for a 0 size buffer in ASAP mode, it is.
-				if (Memory::IsValidAddress(resultAddr) && waitMode == SCE_KERNEL_MPW_ASAP)
-					Memory::Write_U32(curSendAddr - sendBufAddr, resultAddr);
+				if (Memory::IsValid4AlignedAddress(resultAddr) && waitMode == SCE_KERNEL_MPW_ASAP)
+					Memory::WriteUnchecked_U32(curSendAddr - sendBufAddr, resultAddr);
 				return SCE_KERNEL_ERROR_MPP_FULL;
 			}
 			else
@@ -382,7 +329,7 @@ static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int wa
 	{
 		if (sendSize > (u32) m->nmp.bufSize)
 		{
-			ERROR_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): size %d too large for buffer", uid, sendSize);
+			ERROR_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): size %d too large for buffer", uid, sendSize);
 			return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
 		}
 
@@ -421,8 +368,8 @@ static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int wa
 	}
 
 	// We didn't wait, so update the number of bytes transferred now.
-	if (Memory::IsValidAddress(resultAddr))
-		Memory::Write_U32(curSendAddr - sendBufAddr, resultAddr);
+	if (Memory::IsValid4AlignedAddress(resultAddr))
+		Memory::WriteUnchecked_U32(curSendAddr - sendBufAddr, resultAddr);
 
 	return 0;
 }
@@ -466,8 +413,8 @@ static int __KernelReceiveMsgPipe(MsgPipe *m, u32 receiveBufAddr, u32 receiveSiz
 			if (poll)
 			{
 				// Generally, result is not updated in this case.  But for a 0 size buffer in ASAP mode, it is.
-				if (Memory::IsValidAddress(resultAddr) && waitMode == SCE_KERNEL_MPW_ASAP)
-					Memory::Write_U32(curReceiveAddr - receiveBufAddr, resultAddr);
+				if (Memory::IsValid4AlignedAddress(resultAddr) && waitMode == SCE_KERNEL_MPW_ASAP)
+					Memory::WriteUnchecked_U32(curReceiveAddr - receiveBufAddr, resultAddr);
 				return SCE_KERNEL_ERROR_MPP_EMPTY;
 			}
 			else
@@ -483,7 +430,7 @@ static int __KernelReceiveMsgPipe(MsgPipe *m, u32 receiveBufAddr, u32 receiveSiz
 	{
 		if (receiveSize > (u32) m->nmp.bufSize)
 		{
-			ERROR_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): size %d too large for buffer", uid, receiveSize);
+			ERROR_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): size %d too large for buffer", uid, receiveSize);
 			return SCE_KERNEL_ERROR_ILLEGAL_SIZE;
 		}
 
@@ -494,7 +441,7 @@ static int __KernelReceiveMsgPipe(MsgPipe *m, u32 receiveBufAddr, u32 receiveSiz
 			{
 				Memory::Memcpy(curReceiveAddr, m->buffer, bytesToReceive, "MsgPipeReceive");
 				m->nmp.freeSize += bytesToReceive;
-				memmove(Memory::GetPointer(m->buffer), Memory::GetPointer(m->buffer) + bytesToReceive, m->GetUsedSize());
+				memmove(Memory::GetPointerWriteOrException(m->buffer), Memory::GetPointerOrException(m->buffer) + bytesToReceive, m->GetUsedSize());
 				curReceiveAddr += bytesToReceive;
 				receiveSize -= bytesToReceive;
 
@@ -517,8 +464,8 @@ static int __KernelReceiveMsgPipe(MsgPipe *m, u32 receiveBufAddr, u32 receiveSiz
 		}
 	}
 
-	if (Memory::IsValidAddress(resultAddr))
-		Memory::Write_U32(curReceiveAddr - receiveBufAddr, resultAddr);
+	if (Memory::IsValid4AlignedAddress(resultAddr))
+		Memory::WriteUnchecked_U32(curReceiveAddr - receiveBufAddr, resultAddr);
 
 	return 0;
 }
@@ -536,31 +483,31 @@ static void __KernelMsgPipeBeginCallback(SceUID threadID, SceUID prevCallbackId)
 	case MSGPIPE_WAIT_VALUE_SEND:
 		if (ko)
 		{
-			auto result = HLEKernel::WaitBeginCallback<MsgPipeWaitingThread>(threadID, prevCallbackId, waitTimer, ko->sendWaitingThreads, ko->pausedSendWaits, timeoutPtr != 0);
+			auto result = HLEKernel::WaitBeginCallback<MsgPipeWaitingThread>(threadID, prevCallbackId, __KernelWaitTimeoutEvent(), ko->sendWaitingThreads, ko->pausedSendWaits, timeoutPtr != 0);
 			if (result == HLEKernel::WAIT_CB_SUCCESS)
-				DEBUG_LOG(SCEKERNEL, "sceKernelSendMsgPipeCB: Suspending wait for callback");
+				DEBUG_LOG(Log::sceKernel, "sceKernelSendMsgPipeCB: Suspending wait for callback");
 			else if (result == HLEKernel::WAIT_CB_BAD_WAIT_DATA)
-				ERROR_LOG_REPORT(SCEKERNEL, "sceKernelSendMsgPipeCB: wait not found to pause for callback");
+				ERROR_LOG_REPORT(Log::sceKernel, "sceKernelSendMsgPipeCB: wait not found to pause for callback");
 		}
 		else
-			WARN_LOG_REPORT(SCEKERNEL, "sceKernelSendMsgPipeCB: beginning callback with bad wait id?");
+			WARN_LOG_REPORT(Log::sceKernel, "sceKernelSendMsgPipeCB: beginning callback with bad wait id?");
 		break;
 
 	case MSGPIPE_WAIT_VALUE_RECV:
 		if (ko)
 		{
-			auto result = HLEKernel::WaitBeginCallback<MsgPipeWaitingThread>(threadID, prevCallbackId, waitTimer, ko->receiveWaitingThreads, ko->pausedReceiveWaits, timeoutPtr != 0);
+			auto result = HLEKernel::WaitBeginCallback<MsgPipeWaitingThread>(threadID, prevCallbackId, __KernelWaitTimeoutEvent(), ko->receiveWaitingThreads, ko->pausedReceiveWaits, timeoutPtr != 0);
 			if (result == HLEKernel::WAIT_CB_SUCCESS)
-				DEBUG_LOG(SCEKERNEL, "sceKernelReceiveMsgPipeCB: Suspending wait for callback");
+				DEBUG_LOG(Log::sceKernel, "sceKernelReceiveMsgPipeCB: Suspending wait for callback");
 			else if (result == HLEKernel::WAIT_CB_BAD_WAIT_DATA)
-				ERROR_LOG_REPORT(SCEKERNEL, "sceKernelReceiveMsgPipeCB: wait not found to pause for callback");
+				ERROR_LOG_REPORT(Log::sceKernel, "sceKernelReceiveMsgPipeCB: wait not found to pause for callback");
 		}
 		else
-			WARN_LOG_REPORT(SCEKERNEL, "sceKernelReceiveMsgPipeCB: beginning callback with bad wait id?");
+			WARN_LOG_REPORT(Log::sceKernel, "sceKernelReceiveMsgPipeCB: beginning callback with bad wait id?");
 		break;
 
 	default:
-		ERROR_LOG_REPORT(SCEKERNEL, "__KernelMsgPipeBeginCallback: Unexpected wait value");
+		ERROR_LOG_REPORT(Log::sceKernel, "__KernelMsgPipeBeginCallback: Unexpected wait value");
 	}
 }
 
@@ -614,7 +561,11 @@ static void __KernelMsgPipeEndCallback(SceUID threadID, SceUID prevCallbackId) {
 	MsgPipe *ko = uid == 0 ? NULL : kernelObjects.Get<MsgPipe>(uid, error);
 
 	if (ko == NULL) {
-		ERROR_LOG_REPORT(SCEKERNEL, "__KernelMsgPipeEndCallback: Invalid object");
+		// Deleted during the callback.
+		u32 timeoutPtr = __KernelGetWaitTimeoutPtr(threadID, error);
+		if (timeoutPtr != 0)
+			Memory::WriteOrException_U32(0, timeoutPtr);
+		__KernelResumeThreadFromWait(threadID, SCE_KERNEL_ERROR_WAIT_DELETE);
 		return;
 	}
 
@@ -622,9 +573,9 @@ static void __KernelMsgPipeEndCallback(SceUID threadID, SceUID prevCallbackId) {
 	case MSGPIPE_WAIT_VALUE_SEND:
 		{
 			MsgPipeWaitingThread dummy;
-			auto result = HLEKernel::WaitEndCallback<MsgPipe, WAITTYPE_MSGPIPE, MsgPipeWaitingThread>(threadID, prevCallbackId, waitTimer, __KernelCheckResumeMsgPipeSend, dummy, ko->sendWaitingThreads, ko->pausedSendWaits);
+			auto result = HLEKernel::WaitEndCallback<MsgPipe, WAITTYPE_MSGPIPE, MsgPipeWaitingThread>(threadID, prevCallbackId, __KernelWaitTimeoutEvent(), __KernelCheckResumeMsgPipeSend, dummy, ko->sendWaitingThreads, ko->pausedSendWaits);
 			if (result == HLEKernel::WAIT_CB_RESUMED_WAIT) {
-				DEBUG_LOG(SCEKERNEL, "sceKernelSendMsgPipeCB: Resuming wait from callback");
+				DEBUG_LOG(Log::sceKernel, "sceKernelSendMsgPipeCB: Resuming wait from callback");
 			} else if (result == HLEKernel::WAIT_CB_TIMED_OUT) {
 				// It was re-added to the the waiting threads list, but it timed out.  Let's remove it.
 				ko->RemoveSendWaitingThread(threadID);
@@ -635,9 +586,9 @@ static void __KernelMsgPipeEndCallback(SceUID threadID, SceUID prevCallbackId) {
 	case MSGPIPE_WAIT_VALUE_RECV:
 		{
 			MsgPipeWaitingThread dummy;
-			auto result = HLEKernel::WaitEndCallback<MsgPipe, WAITTYPE_MSGPIPE, MsgPipeWaitingThread>(threadID, prevCallbackId, waitTimer, __KernelCheckResumeMsgPipeReceive, dummy, ko->receiveWaitingThreads, ko->pausedReceiveWaits);
+			auto result = HLEKernel::WaitEndCallback<MsgPipe, WAITTYPE_MSGPIPE, MsgPipeWaitingThread>(threadID, prevCallbackId, __KernelWaitTimeoutEvent(), __KernelCheckResumeMsgPipeReceive, dummy, ko->receiveWaitingThreads, ko->pausedReceiveWaits);
 			if (result == HLEKernel::WAIT_CB_RESUMED_WAIT) {
-				DEBUG_LOG(SCEKERNEL, "sceKernelReceiveMsgPipeCB: Resuming wait from callback");
+				DEBUG_LOG(Log::sceKernel, "sceKernelReceiveMsgPipeCB: Resuming wait from callback");
 			} else if (result == HLEKernel::WAIT_CB_TIMED_OUT) {
 				// It was re-added to the the waiting threads list, but it timed out.  Let's remove it.
 				ko->RemoveReceiveWaitingThread(threadID);
@@ -646,62 +597,52 @@ static void __KernelMsgPipeEndCallback(SceUID threadID, SceUID prevCallbackId) {
 		break;
 
 	default:
-		ERROR_LOG_REPORT(SCEKERNEL, "__KernelMsgPipeEndCallback: Unexpected wait value");
+		ERROR_LOG_REPORT(Log::sceKernel, "__KernelMsgPipeEndCallback: Unexpected wait value");
 	}
 }
 
 void __KernelMsgPipeInit()
 {
-	waitTimer = CoreTiming::RegisterEvent("MsgPipeTimeout", __KernelMsgPipeTimeout);
 
-	__KernelRegisterWaitTypeFuncs(WAITTYPE_MSGPIPE, __KernelMsgPipeBeginCallback, __KernelMsgPipeEndCallback);
+	__KernelRegisterWaitTypeFuncs(WAITTYPE_MSGPIPE, __KernelMsgPipeBeginCallback, __KernelMsgPipeEndCallback, __KernelMsgPipeTimeout);
 }
 
 void __KernelMsgPipeDoState(PointerWrap &p)
 {
-	auto s = p.Section("sceKernelMsgPipe", 1);
+	auto s = p.Section("sceKernelMsgPipe", 1, 2);
 	if (!s)
 		return;
 
-	Do(p, waitTimer);
-	CoreTiming::RestoreRegisterEvent(waitTimer, "MsgPipeTimeout", __KernelMsgPipeTimeout);
+	if (s < 2) {
+		int oldTimeoutEvent = -1;
+		Do(p, oldTimeoutEvent);
+		__KernelRestoreOldWaitTimeoutEvent(oldTimeoutEvent, "MsgPipeTimeout");
+	}
 }
 
-int sceKernelCreateMsgPipe(const char *name, int partition, u32 attr, u32 size, u32 optionsPtr)
-{
+int sceKernelCreateMsgPipe(const char *name, int partition, u32 attr, u32 size, u32 optionsPtr) {
 	if (!name)
-	{
-		WARN_LOG_REPORT(SCEKERNEL, "%08x=sceKernelCreateMsgPipe(): invalid name", SCE_KERNEL_ERROR_NO_MEMORY);
-		return SCE_KERNEL_ERROR_NO_MEMORY;
-	}
-	if (partition < 1 || partition > 9 || partition == 7)
-	{
-		WARN_LOG_REPORT(SCEKERNEL, "%08x=sceKernelCreateMsgPipe(): invalid partition %d", SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, partition);
-		return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
-	}
-	// We only support user right now.
-	if (partition != 2 && partition != 6)
-	{
-		WARN_LOG_REPORT(SCEKERNEL, "%08x=sceKernelCreateMsgPipe(): invalid partition %d", SCE_KERNEL_ERROR_ILLEGAL_PERM, partition);
-		return SCE_KERNEL_ERROR_ILLEGAL_PERM;
-	}
+		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_NO_MEMORY, "invalid name");
+	// Only partitions 1-6 exist. sysmem/partitions and its kernel-mode twin record 7 and up
+	// coming back ILLEGAL_ARGUMENT from both privilege levels; what privilege changes is the
+	// permission check below, not the range.
+	if (partition < 1 || partition > 6)
+		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, "invalid partition %d", partition);
+
+	BlockAllocator *allocator = BlockAllocatorFromID(partition);
+	if (allocator == nullptr)
+		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_PERM, "invalid partition %d", partition);
+
 	if ((attr & ~SCE_KERNEL_MPA_KNOWN) >= 0x100)
-	{
-		WARN_LOG_REPORT(SCEKERNEL, "%08x=sceKernelCreateEventFlag(%s): invalid attr parameter: %08x", SCE_KERNEL_ERROR_ILLEGAL_ATTR, name, attr);
-		return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
-	}
+		return hleLogWarning(Log::sceKernel, SCE_KERNEL_ERROR_ILLEGAL_ATTR, "invalid attr parameter: %08x", attr);
 
 	u32 memBlockPtr = 0;
-	if (size != 0)
-	{
+	if (size != 0) {
 		// We ignore the upalign to 256.
 		u32 allocSize = size;
-		memBlockPtr = userMemory.Alloc(allocSize, (attr & SCE_KERNEL_MPA_HIGHMEM) != 0, "MsgPipe");
+		memBlockPtr = allocator->Alloc(allocSize, (attr & SCE_KERNEL_MPA_HIGHMEM) != 0, StringFromFormat("MsgPipe/%s", name).c_str());
 		if (memBlockPtr == (u32)-1)
-		{
-			ERROR_LOG(SCEKERNEL, "%08x=sceKernelCreateEventFlag(%s): Failed to allocate %i bytes for buffer", SCE_KERNEL_ERROR_NO_MEMORY, name, size);
-			return SCE_KERNEL_ERROR_NO_MEMORY;
-		}
+			return hleLogError(Log::sceKernel, SCE_KERNEL_ERROR_NO_MEMORY, "failed to allocate %i bytes for buffer", size);
 	}
 
 	MsgPipe *m = new MsgPipe();
@@ -718,16 +659,17 @@ int sceKernelCreateMsgPipe(const char *name, int partition, u32 attr, u32 size, 
 
 	m->buffer = memBlockPtr;
 	
-	DEBUG_LOG(SCEKERNEL, "%d=sceKernelCreateMsgPipe(%s, part=%d, attr=%08x, size=%d, opt=%08x)", id, name, partition, attr, size, optionsPtr);
+	DEBUG_LOG(Log::sceKernel, "%d=sceKernelCreateMsgPipe(%s, part=%d, attr=%08x, size=%d, opt=%08x)", id, name, partition, attr, size, optionsPtr);
 
-	if (optionsPtr != 0)
-	{
-		u32 optionsSize = Memory::Read_U32(optionsPtr);
-		if (optionsSize > 4)
-			WARN_LOG_REPORT(SCEKERNEL, "sceKernelCreateMsgPipe(%s) unsupported options parameter, size = %d", name, optionsSize);
+	if (optionsPtr != 0) {
+		if (Memory::IsValid4AlignedAddress(optionsPtr)) {
+			u32 optionsSize = Memory::ReadUnchecked_U32(optionsPtr);
+			if (optionsSize > 4)
+				WARN_LOG_REPORT(Log::sceKernel, "sceKernelCreateMsgPipe(%s) unsupported options parameter, size = %d", name, optionsSize);
+		}
 	}
 
-	return id;
+	return hleNoLog(id);
 }
 
 int sceKernelDeleteMsgPipe(SceUID uid)
@@ -736,10 +678,8 @@ int sceKernelDeleteMsgPipe(SceUID uid)
 
 	u32 error;
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
-	if (!m)
-	{
-		ERROR_LOG(SCEKERNEL, "sceKernelDeleteMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+	if (!m) {
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
 	hleEatCycles(3100);
@@ -751,7 +691,7 @@ int sceKernelDeleteMsgPipe(SceUID uid)
 	for (size_t i = 0; i < m->receiveWaitingThreads.size(); i++)
 		m->receiveWaitingThreads[i].Cancel(uid, SCE_KERNEL_ERROR_WAIT_DELETE);
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelDeleteMsgPipe(%i)", uid);
+	DEBUG_LOG(Log::sceKernel, "sceKernelDeleteMsgPipe(%i)", uid);
 	return kernelObjects.Destroy<MsgPipe>(uid);
 }
 
@@ -759,19 +699,19 @@ static int __KernelValidateSendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize
 {
 	if (sendSize & 0x80000000)
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): illegal size %d", uid, sendSize);
+		ERROR_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): illegal size %d", uid, sendSize);
 		return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	}
 
 	if (sendSize != 0 && !Memory::IsValidAddress(sendBufAddr))
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): bad buffer address %08x (should crash?)", uid, sendBufAddr);
+		ERROR_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): bad buffer address %08x (should crash?)", uid, sendBufAddr);
 		return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	}
 
 	if (waitMode != SCE_KERNEL_MPW_ASAP && waitMode != SCE_KERNEL_MPW_FULL)
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): invalid wait mode %d", uid, waitMode);
+		ERROR_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): invalid wait mode %d", uid, waitMode);
 		return SCE_KERNEL_ERROR_ILLEGAL_MODE;
 	}
 
@@ -779,12 +719,12 @@ static int __KernelValidateSendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize
 	{
 		if (!__KernelIsDispatchEnabled())
 		{
-			WARN_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): dispatch disabled", uid);
+			WARN_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): dispatch disabled", uid);
 			return SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 		}
 		if (__IsInInterrupt())
 		{
-			WARN_LOG(SCEKERNEL, "__KernelSendMsgPipe(%d): in interrupt", uid);
+			WARN_LOG(Log::sceKernel, "__KernelSendMsgPipe(%d): in interrupt", uid);
 			return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 		}
 	}
@@ -792,8 +732,7 @@ static int __KernelValidateSendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize
 	return 0;
 }
 
-static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int waitMode, u32 resultAddr, u32 timeoutPtr, bool cbEnabled, bool poll)
-{
+static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int waitMode, u32 resultAddr, u32 timeoutPtr, bool cbEnabled, bool poll) {
 	hleEatCycles(2400);
 
 	bool needsResched = false;
@@ -804,8 +743,7 @@ static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int wa
 	if (needsResched)
 		hleReSchedule(cbEnabled, "msgpipe data sent");
 
-	if (needsWait)
-	{
+	if (needsWait) {
 		if (__KernelSetMsgPipeTimeout(timeoutPtr))
 			__KernelWaitCurThread(WAITTYPE_MSGPIPE, m->GetUID(), MSGPIPE_WAIT_VALUE_SEND, timeoutPtr, cbEnabled, "msgpipe send waited");
 		else
@@ -814,73 +752,67 @@ static int __KernelSendMsgPipe(MsgPipe *m, u32 sendBufAddr, u32 sendSize, int wa
 	return result;
 }
 
-int sceKernelSendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr)
-{
+int sceKernelSendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr) {
 	u32 error = __KernelValidateSendMsgPipe(uid, sendBufAddr, sendSize, waitMode, resultAddr);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelSendMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelSendMsgPipe(id=%i, addr=%08x, size=%i, mode=%i, result=%08x, timeout=%08x)", uid, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr);
-	return __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr, false, false);
+	int result = __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr, false, false);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
-int sceKernelSendMsgPipeCB(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr)
-{
+int sceKernelSendMsgPipeCB(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr) {
 	u32 error = __KernelValidateSendMsgPipe(uid, sendBufAddr, sendSize, waitMode, resultAddr);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelSendMsgPipeCB(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelSendMsgPipeCB(id=%i, addr=%08x, size=%i, mode=%i, result=%08x, timeout=%08x)", uid, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr);
 	// TODO: Verify callback behavior.
 	hleCheckCurrentCallbacks();
-	return __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr, true, false);
+	int result = __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, timeoutPtr, true, false);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
-int sceKernelTrySendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr)
-{
+int sceKernelTrySendMsgPipe(SceUID uid, u32 sendBufAddr, u32 sendSize, u32 waitMode, u32 resultAddr) {
 	u32 error = __KernelValidateSendMsgPipe(uid, sendBufAddr, sendSize, waitMode, resultAddr, true);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelTrySendMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelTrySendMsgPipe(id=%i, addr=%08x, size=%i, mode=%i, result=%08x)", uid, sendBufAddr, sendSize, waitMode, resultAddr);
-	return __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, 0, false, true);
+	int result = __KernelSendMsgPipe(m, sendBufAddr, sendSize, waitMode, resultAddr, 0, false, true);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
-static int __KernelValidateReceiveMsgPipe(SceUID uid, u32 receiveBufAddr, u32 receiveSize, int waitMode, u32 resultAddr, bool tryMode = false)
+static int __KernelValidateReceiveMsgPipe(SceUID uid, u32 receiveBufAddr, u32 receiveSize, int waitMode, bool tryMode = false)
 {
 	if (receiveSize & 0x80000000)
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): illegal size %d", uid, receiveSize);
+		ERROR_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): illegal size %d", uid, receiveSize);
 		return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	}
 
 	if (receiveSize != 0 && !Memory::IsValidAddress(receiveBufAddr))
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): bad buffer address %08x (should crash?)", uid, receiveBufAddr);
+		ERROR_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): bad buffer address %08x (should crash?)", uid, receiveBufAddr);
 		return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	}
 
 	if (waitMode != SCE_KERNEL_MPW_ASAP && waitMode != SCE_KERNEL_MPW_FULL)
 	{
-		ERROR_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): invalid wait mode %d", uid, waitMode);
+		ERROR_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): invalid wait mode %d", uid, waitMode);
 		return SCE_KERNEL_ERROR_ILLEGAL_MODE;
 	}
 
@@ -888,12 +820,12 @@ static int __KernelValidateReceiveMsgPipe(SceUID uid, u32 receiveBufAddr, u32 re
 	{
 		if (!__KernelIsDispatchEnabled())
 		{
-			WARN_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): dispatch disabled", uid);
+			WARN_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): dispatch disabled", uid);
 			return SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 		}
 		if (__IsInInterrupt())
 		{
-			WARN_LOG(SCEKERNEL, "__KernelReceiveMsgPipe(%d): in interrupt", uid);
+			WARN_LOG(Log::sceKernel, "__KernelReceiveMsgPipe(%d): in interrupt", uid);
 			return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 		}
 	}
@@ -923,52 +855,49 @@ static int __KernelReceiveMsgPipe(MsgPipe *m, u32 receiveBufAddr, u32 receiveSiz
 
 int sceKernelReceiveMsgPipe(SceUID uid, u32 receiveBufAddr, u32 receiveSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr)
 {
-	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode, resultAddr);
+	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelReceiveMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelReceiveMsgPipe(%i, %08x, %i, %i, %08x, %08x)", uid, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr);
-	return __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr, false, false);
+	int result = __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr, false, false);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
 int sceKernelReceiveMsgPipeCB(SceUID uid, u32 receiveBufAddr, u32 receiveSize, u32 waitMode, u32 resultAddr, u32 timeoutPtr)
 {
-	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode, resultAddr);
+	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelReceiveMsgPipeCB(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelReceiveMsgPipeCB(%i, %08x, %i, %i, %08x, %08x)", uid, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr);
 	// TODO: Verify callback behavior.
 	hleCheckCurrentCallbacks();
-	return __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr, true, false);
+	int result = __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, timeoutPtr, true, false);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
 int sceKernelTryReceiveMsgPipe(SceUID uid, u32 receiveBufAddr, u32 receiveSize, u32 waitMode, u32 resultAddr)
 {
-	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode, resultAddr, true);
+	u32 error = __KernelValidateReceiveMsgPipe(uid, receiveBufAddr, receiveSize, waitMode, true);
 	if (error != 0) {
-		return error;
+		return hleLogError(Log::sceKernel, error);
 	}
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
 	if (!m) {
-		ERROR_LOG(SCEKERNEL, "sceKernelTryReceiveMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelTryReceiveMsgPipe(%i, %08x, %i, %i, %08x)", uid, receiveBufAddr, receiveSize, waitMode, resultAddr);
-	return __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, 0, false, true);
+	int result = __KernelReceiveMsgPipe(m, receiveBufAddr, receiveSize, waitMode, resultAddr, 0, false, true);
+	return hleLogDebug(Log::sceKernel, result);
 }
 
 int sceKernelCancelMsgPipe(SceUID uid, u32 numSendThreadsAddr, u32 numReceiveThreadsAddr)
@@ -977,20 +906,18 @@ int sceKernelCancelMsgPipe(SceUID uid, u32 numSendThreadsAddr, u32 numReceiveThr
 
 	u32 error;
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
-	if (!m)
-	{
-		ERROR_LOG(SCEKERNEL, "sceKernelCancelMsgPipe(%i) - ERROR %08x", uid, error);
-		return error;
+	if (!m) {
+		return hleLogError(Log::sceKernel, error, "bad msgpipe id");
 	}
 
 	hleEatCycles(1100);
 	if (!m->sendWaitingThreads.empty() || !m->receiveWaitingThreads.empty())
 		hleEatCycles(4000);
 
-	if (Memory::IsValidAddress(numSendThreadsAddr))
-		Memory::Write_U32((u32) m->sendWaitingThreads.size(), numSendThreadsAddr);
-	if (Memory::IsValidAddress(numReceiveThreadsAddr))
-		Memory::Write_U32((u32) m->receiveWaitingThreads.size(), numReceiveThreadsAddr);
+	if (Memory::IsValid4AlignedAddress(numSendThreadsAddr))
+		Memory::WriteUnchecked_U32((u32) m->sendWaitingThreads.size(), numSendThreadsAddr);
+	if (Memory::IsValid4AlignedAddress(numReceiveThreadsAddr))
+		Memory::WriteUnchecked_U32((u32) m->receiveWaitingThreads.size(), numReceiveThreadsAddr);
 
 	for (size_t i = 0; i < m->sendWaitingThreads.size(); i++)
 		m->sendWaitingThreads[i].Cancel(uid, SCE_KERNEL_ERROR_WAIT_CANCEL);
@@ -1002,23 +929,17 @@ int sceKernelCancelMsgPipe(SceUID uid, u32 numSendThreadsAddr, u32 numReceiveThr
 	// And now the entire buffer is free.
 	m->nmp.freeSize = m->nmp.bufSize;
 
-	DEBUG_LOG(SCEKERNEL, "sceKernelCancelMsgPipe(%i, %i, %i)", uid, numSendThreadsAddr, numReceiveThreadsAddr);
-	return 0;
+	return hleLogDebug(Log::sceKernel, 0);
 }
 
-int sceKernelReferMsgPipeStatus(SceUID uid, u32 statusPtr)
-{
+int sceKernelReferMsgPipeStatus(SceUID uid, u32 statusPtr) {
 	u32 error;
 	MsgPipe *m = kernelObjects.Get<MsgPipe>(uid, error);
-	if (m)
-	{
-		if (!Memory::IsValidAddress(statusPtr))
-		{
-			ERROR_LOG(SCEKERNEL, "sceKernelReferMsgPipeStatus(%i, %08x): invalid address", uid, statusPtr);
-			return -1;
+	if (m) {
+		auto status = PSPPointer<NativeMsgPipe>::Create(statusPtr);
+		if (!status.IsValid()) {
+			return hleLogError(Log::sceKernel, -1, "invalid address");
 		}
-
-		DEBUG_LOG(SCEKERNEL, "sceKernelReferMsgPipeStatus(%i, %08x)", uid, statusPtr);
 
 		// Clean up any that have timed out.
 		m->SortReceiveThreads();
@@ -1026,13 +947,12 @@ int sceKernelReferMsgPipeStatus(SceUID uid, u32 statusPtr)
 
 		m->nmp.numSendWaitThreads = (int) m->sendWaitingThreads.size();
 		m->nmp.numReceiveWaitThreads = (int) m->receiveWaitingThreads.size();
-		if (Memory::Read_U32(statusPtr) != 0)
-			Memory::WriteStruct(statusPtr, &m->nmp);
-		return 0;
-	}
-	else
-	{
-		DEBUG_LOG(SCEKERNEL, "sceKernelReferMsgPipeStatus(%i, %08x): bad message pipe", uid, statusPtr);
-		return error;
+		if (status->size != 0) {
+			*status = m->nmp;
+			status.NotifyWrite("MsgPipeStatus");
+		}
+		return hleLogDebug(Log::sceKernel, 0);
+	} else {
+		return hleLogError(Log::sceKernel, error, "bad message pipe");
 	}
 }

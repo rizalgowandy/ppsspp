@@ -15,7 +15,6 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSAnalyst.h"
@@ -51,52 +50,70 @@ namespace MIPSComp {
 		MIPSGPReg rt = _RT;
 		MIPSGPReg rs = _RS;
 		int o = op >> 26;
+
+		CheckMemoryBreakpoint(rs, offset);
+
 		if (((op >> 29) & 1) == 0 && rt == MIPS_REG_ZERO) {
 			// Don't load anything into $zr
 			return;
 		}
 
-		CheckMemoryBreakpoint(rs, offset);
+		if (js.kernelMode) {
+			// Kernel code may reach hardware registers. ResolveKernelMemory turns the plain memory
+			// accesses back into ordinary ones where it can tell. The rest go to the interpreter.
+			switch (o) {
+			case 32: ir.Write(IROp::LoadKernel8Ext, rt, rs, 0, offset); return;
+			case 33: ir.Write(IROp::LoadKernel16Ext, rt, rs, 0, offset); return;
+			case 35: ir.Write(IROp::LoadKernel32, rt, rs, 0, offset); return;
+			case 36: ir.Write(IROp::LoadKernel8, rt, rs, 0, offset); return;
+			case 37: ir.Write(IROp::LoadKernel16, rt, rs, 0, offset); return;
+			case 40: ir.Write(IROp::StoreKernel8, rt, rs, 0, offset); return;
+			case 41: ir.Write(IROp::StoreKernel16, rt, rs, 0, offset); return;
+			case 43: ir.Write(IROp::StoreKernel32, rt, rs, 0, offset); return;
+			default:
+				DISABLE;
+			}
+		}
 
 		switch (o) {
 			// Load
 		case 35:
-			ir.Write(IROp::Load32, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load32, rt, rs, 0, offset);
 			break;
 		case 37:
-			ir.Write(IROp::Load16, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load16, rt, rs, 0, offset);
 			break;
 		case 33:
-			ir.Write(IROp::Load16Ext, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load16Ext, rt, rs, 0, offset);
 			break;
 		case 36:
-			ir.Write(IROp::Load8, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load8, rt, rs, 0, offset);
 			break;
 		case 32:
-			ir.Write(IROp::Load8Ext, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load8Ext, rt, rs, 0, offset);
 			break;
 			// Store
 		case 43:
-			ir.Write(IROp::Store32, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Store32, rt, rs, 0, offset);
 			break;
 		case 41:
-			ir.Write(IROp::Store16, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Store16, rt, rs, 0, offset);
 			break;
 		case 40:
-			ir.Write(IROp::Store8, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Store8, rt, rs, 0, offset);
 			break;
 
 		case 34: //lwl
-			ir.Write(IROp::Load32Left, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load32Left, rt, rs, 0, offset);
 			break;
 		case 38: //lwr
-			ir.Write(IROp::Load32Right, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Load32Right, rt, rs, 0, offset);
 			break;
 		case 42: //swl
-			ir.Write(IROp::Store32Left, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Store32Left, rt, rs, 0, offset);
 			break;
 		case 46: //swr
-			ir.Write(IROp::Store32Right, rt, rs, ir.AddConstant(offset));
+			ir.Write(IROp::Store32Right, rt, rs, 0, offset);
 			break;
 
 		default:
@@ -105,18 +122,45 @@ namespace MIPSComp {
 		}
 	}
 
+	void IRFrontend::Comp_StoreSync(MIPSOpcode op) {
+		CONDITIONAL_DISABLE(LSU);
+
+		int offset = _IMM16;
+		MIPSGPReg rt = _RT;
+		MIPSGPReg rs = _RS;
+		// Note: still does something even if loading to zero.
+
+		CheckMemoryBreakpoint(rs, offset);
+
+		if (js.kernelMode) {
+			// Send all memory accesses to the interpreter in kernel mode.
+			// TODO: Do something faster - but it hardly matters, currently this is VSH-only.
+			DISABLE;
+			return;
+		}
+
+		switch (op >> 26) {
+		case 48: // ll
+			ir.Write(IROp::Load32Linked, rt, rs, 0, offset);
+			break;
+
+		case 56: // sc
+			ir.Write(IROp::Store32Conditional, rt, rs, 0, offset);
+			break;
+
+		default:
+			INVALIDOP;
+		}
+	}
+
 	void IRFrontend::Comp_Cache(MIPSOpcode op) {
 		CONDITIONAL_DISABLE(LSU);
 
 		int func = (op >> 16) & 0x1F;
 
-		// See Int_Cache for the definitions.
-		switch (func) {
-		case 24: break;
-		case 25: break;
-		case 27: break;
-		case 30: break;
-		default:
+		// See Int_Cache: only icache invalidation does anything, so the data cache ops (which ME
+		// code loops over to flush its cache) compile to nothing.
+		if (func == 8) {
 			// Fall back to the interpreter.
 			DISABLE;
 		}

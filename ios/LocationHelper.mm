@@ -7,16 +7,17 @@
 
 -(id) init {
     NSLog(@"LocationHelper::init");
-    locationManager = [[CLLocationManager alloc] init];
-    [locationManager setDelegate:self];
+    self = [super init];
+    if (self) {
+        locationManager = [[CLLocationManager alloc] init];
+        [locationManager setDelegate:self];
+    }
     return self;
 }
 
 -(void) startLocationUpdates {
     NSLog(@"LocationHelper::startLocationUpdates");
-    if ([locationManager respondsToSelector:@selector(requestWhenInUseAuthorization)]) {
-        [locationManager requestWhenInUseAuthorization];
-    }
+    [locationManager requestWhenInUseAuthorization];
     [locationManager startUpdatingLocation];
 }
 

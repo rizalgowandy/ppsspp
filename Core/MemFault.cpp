@@ -19,7 +19,9 @@
 
 #include <cstdint>
 #include <unordered_set>
+#include <sstream>
 
+#include "Common/StringUtils.h"
 #include "Common/MachineContext.h"
 
 #if PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
@@ -29,27 +31,68 @@
 #include "Core/Util/DisArm64.h"
 #elif PPSSPP_ARCH(ARM)
 #include "ext/disarm.h"
+#elif PPSSPP_ARCH(RISCV64)
+#include "ext/riscv-disas.h"
+#elif PPSSPP_ARCH(LOONGARCH64)
+#include "ext/loongarch-disasm.h"
 #endif
 
 #include "Common/Log.h"
+#include "Core/Config.h"
 #include "Core/Core.h"
+#include "Core/HW/Display.h"
 #include "Core/MemFault.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/Debugger/LineInfo.h"
+#include "Core/Debugger/SymbolMap.h"
+
+// Stack walking stuff
+#include "Core/MIPS/MIPSStackWalk.h"
+#include "Core/MIPS/MIPSDebugInterface.h"
+#include "Core/HLE/sceKernelThread.h"
+#include "Core/HLE/sceKernelModule.h"
 
 namespace Memory {
 
 static int64_t g_numReportedBadAccesses = 0;
+static const int MAX_IGNORED_ACCESSES_PER_FRAME = 1000;
+static int g_numIgnoredAccessesThisFrame = 0;
+static int g_ignoredAccessesVCount = -1;
 const uint8_t *g_lastCrashAddress;
 MemoryExceptionType g_lastMemoryExceptionType;
+static bool inCrashHandler = false;
+volatile bool g_inIRInterpreter = false;
 
 std::unordered_set<const uint8_t *> g_ignoredAddresses;
 
 void MemFault_Init() {
 	g_numReportedBadAccesses = 0;
+	g_numIgnoredAccessesThisFrame = 0;
+	g_ignoredAccessesVCount = -1;
 	g_lastCrashAddress = nullptr;
 	g_lastMemoryExceptionType = MemoryExceptionType::NONE;
 	g_ignoredAddresses.clear();
+}
+
+// An ignored access costs microseconds of host time and no emulated cycles, so a guest looping over a bad
+// pointer can stretch one emulated frame out for seconds, past Android's ANR timeout as the app waits for
+// the emulator to reach a frame end. Past a limit per frame, we stop ignoring them.
+bool IgnoredBadAccessLimitReached() {
+	const int vCount = __DisplayGetVCount();
+	if (vCount != g_ignoredAccessesVCount) {
+		g_ignoredAccessesVCount = vCount;
+		g_numIgnoredAccessesThisFrame = 0;
+	}
+	return g_numIgnoredAccessesThisFrame >= MAX_IGNORED_ACCESSES_PER_FRAME;
+}
+
+void CountIgnoredBadAccess() {
+	g_numIgnoredAccessesThisFrame++;
+}
+
+int MaxIgnoredBadAccessesPerFrame() {
+	return MAX_IGNORED_ACCESSES_PER_FRAME;
 }
 
 bool MemFault_MayBeResumable() {
@@ -81,11 +124,27 @@ static bool DisassembleNativeAt(const uint8_t *codePtr, int instructionSize, std
 		*dest = lines[0];
 		return true;
 	}
+#elif PPSSPP_ARCH(RISCV64)
+	auto lines = DisassembleRV64(codePtr, instructionSize);
+	if (!lines.empty()) {
+		*dest = lines[0];
+		return true;
+	}
+#elif PPSSPP_ARCH(LOONGARCH64)
+	auto lines = DisassembleLA64(codePtr, instructionSize);
+	if (!lines.empty()) {
+		*dest = lines[0];
+		return true;
+	}
 #endif
 	return false;
 }
 
 bool HandleFault(uintptr_t hostAddress, void *ctx) {
+	if (inCrashHandler)
+		return false;
+	inCrashHandler = true;
+
 	SContext *context = (SContext *)ctx;
 	const uint8_t *codePtr = (uint8_t *)(context->CTX_PC);
 
@@ -93,9 +152,13 @@ bool HandleFault(uintptr_t hostAddress, void *ctx) {
 	g_lastCrashAddress = nullptr;
 
 	// TODO: Check that codePtr is within the current JIT space.
-	bool inJitSpace = MIPSComp::jit && MIPSComp::jit->CodeInRange(codePtr);
-	if (!inJitSpace) {
-		// This is a crash in non-jitted code. Not something we want to handle here, ignore.
+	bool inJitSpace = mipsr4k.jit && mipsr4k.jit->CodeInRange(codePtr);
+	// The IR interpreter's own accesses to PSP memory. We can't redirect those to a crash handler, but we can
+	// step over the faulting instruction and stop the core.
+	const bool inIRInterpreter = !inJitSpace && g_inIRInterpreter;
+	if (!inJitSpace && !inIRInterpreter) {
+		// This is a crash in other non-jitted code. Not something we want to handle here, ignore.
+		inCrashHandler = false;
 		return false;
 	}
 
@@ -106,35 +169,33 @@ bool HandleFault(uintptr_t hostAddress, void *ctx) {
 	const uintptr_t addressSpaceSize = 0x100000000ULL;
 #endif
 
-	// Check whether hostAddress is within the PSP memory space, which (likely) means it was a guest executable that did the bad access.
-	if (hostAddress < baseAddress || hostAddress >= baseAddress + addressSpaceSize) {
-		// Host address outside - this was a different kind of crash.
-		return false;
+	// The dispatcher looks a jump target up in the block shadow, which faults where there's no PSP memory.
+	// The JITs also do that lookup inline at a jump to a register.
+	const uintptr_t shadowAddress = (uintptr_t)blockShadow;
+	const bool shadowFault = shadowAddress && hostAddress >= shadowAddress && hostAddress <= shadowAddress + BLOCK_SHADOW_MASK;
+	if (shadowFault) {
+		baseAddress = shadowAddress;
 	}
 
+	// Check whether hostAddress is within the PSP memory space, which (likely) means it was a guest executable that did the bad access.
+	bool invalidHostAddress = hostAddress == (uintptr_t)0xFFFFFFFFFFFFFFFFULL;
+	if (hostAddress < baseAddress || hostAddress >= baseAddress + addressSpaceSize) {
+		// Host address outside - this was a different kind of crash.
+		if (!invalidHostAddress) {
+			inCrashHandler = false;
+			return false;
+		}
+	}
 
-	// OK, a guest executable did a bad access. Take care of it.
+	// OK, a guest executable did a bad access. Let's handle it.
 
-	uint32_t guestAddress = hostAddress - baseAddress;
+	uint32_t guestAddress = invalidHostAddress ? 0xFFFFFFFFUL : (uint32_t)(hostAddress - baseAddress);
 
 	// TODO: Share the struct between the various analyzers, that will allow us to share most of
 	// the implementations here.
 	bool success = false;
 
 	MemoryExceptionType type = MemoryExceptionType::NONE;
-
-	std::string infoString = "";
-
-	bool isAtDispatch = false;
-	if (MIPSComp::jit) {
-		std::string desc;
-		if (MIPSComp::jit->DescribeCodePtr(codePtr, desc)) {
-			infoString += desc + "\n";
-		}
-		if (MIPSComp::jit->IsAtDispatchFetch(codePtr)) {
-			isAtDispatch = true;
-		}
-	}
 
 	int instructionSize = 4;
 #if PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
@@ -158,25 +219,44 @@ bool HandleFault(uintptr_t hostAddress, void *ctx) {
 	// To ignore the access, we need to disassemble the instruction and modify context->CTX_PC
 	ArmLSInstructionInfo info{};
 	success = ArmAnalyzeLoadStore((uint32_t)codePtr, word, &info);
+#elif PPSSPP_ARCH(RISCV64)
+	uint32_t word;
+	memcpy(&word, codePtr, 4);
+	// To ignore the access, we need to disassemble the instruction and modify context->CTX_PC
+	RiscVLSInstructionInfo info{};
+	success = RiscVAnalyzeLoadStore((uint64_t)codePtr, word, &info);
+	instructionSize = info.instructionSize;
+#elif PPSSPP_ARCH(LOONGARCH64)
+	uint32_t word;
+	memcpy(&word, codePtr, 4);
+	// To ignore the access, we need to disassemble the instruction and modify context->CTX_PC
+	LoongArch64LSInstructionInfo info{};
+	success = LoongArch64AnalyzeLoadStore((uint64_t)codePtr, word, &info);
+	if (success)
+		instructionSize = info.instructionSize;
+	// It's quite pointless to ignore bad memory access on LoongArch because we could not handle it correctly.
+	success = false;
 #endif
 
-	std::string disassembly;
-	if (DisassembleNativeAt(codePtr, instructionSize, &disassembly)) {
-		infoString += disassembly + "\n";
-	}
-
-	if (isAtDispatch) {
-		u32 targetAddr = currentMIPS->pc;  // bad approximation
+	if (mipsr4k.jit && (shadowFault || mipsr4k.jit->IsAtDispatchFetch(codePtr))) {
+		// The shadow entry's offset is the target, masked.
+		u32 targetAddr = shadowFault ? guestAddress : currentMIPS->pc;
 		// TODO: Do the other archs and platforms.
 #if PPSSPP_ARCH(AMD64) && PPSSPP_PLATFORM(WINDOWS)
 		// We know which register the address is in, look in Asm.cpp.
-		targetAddr = context->Rax;
+		targetAddr = (uint32_t)context->Rax;
 #endif
 		Core_ExecException(targetAddr, currentMIPS->pc, ExecExceptionType::JUMP);
 		// Redirect execution to a crash handler that will switch to CoreState::CORE_RUNTIME_ERROR immediately.
-		context->CTX_PC = (uintptr_t)MIPSComp::jit->GetCrashHandler();
-		ERROR_LOG(MEMMAP, "Bad execution access detected, halting: %08x (last known pc %08x, host: %p)", targetAddr, currentMIPS->pc, (void *)hostAddress);
-		return true;
+		uintptr_t crashHandler = (uintptr_t)mipsr4k.jit->GetCrashHandler();
+		if (crashHandler != 0) {
+			context->CTX_PC = crashHandler;
+			ERROR_LOG(Log::MemMap, "Bad execution access detected, halting: %08x (last known pc %08x, host: %p)", targetAddr, currentMIPS->pc, (void *)hostAddress);
+			inCrashHandler = false;
+			return true;
+		}
+
+		type = MemoryExceptionType::UNKNOWN;
 	} else if (success) {
 		if (info.isMemoryWrite) {
 			type = MemoryExceptionType::WRITE_WORD;
@@ -187,9 +267,25 @@ bool HandleFault(uintptr_t hostAddress, void *ctx) {
 		type = MemoryExceptionType::UNKNOWN;
 	}
 
+	if (inIRInterpreter && !success) {
+		// Without the instruction's size we can't step over it.
+		inCrashHandler = false;
+		return false;
+	}
+	if (inIRInterpreter && coreState == CORE_RUNTIME_ERROR) {
+		// Already reported, the interpreter just hasn't reached the end of the block yet.
+		context->CTX_PC += info.instructionSize;
+		inCrashHandler = false;
+		return true;
+	}
+
 	g_lastMemoryExceptionType = type;
 
-	if (success && (g_Config.bIgnoreBadMemAccess || g_ignoredAddresses.find(codePtr) != g_ignoredAddresses.end())) {
+	const bool tooManyThisFrame = IgnoredBadAccessLimitReached();
+
+	bool handled = true;
+	if (success && !tooManyThisFrame && (g_Config.bIgnoreBadMemAccess || g_ignoredAddresses.find(codePtr) != g_ignoredAddresses.end())) {
+		CountIgnoredBadAccess();
 		if (!info.isMemoryWrite) {
 			// It was a read. Fill the destination register with 0.
 			// TODO
@@ -198,30 +294,110 @@ bool HandleFault(uintptr_t hostAddress, void *ctx) {
 		context->CTX_PC += info.instructionSize;
 		g_numReportedBadAccesses++;
 		if (g_numReportedBadAccesses < 100) {
-			ERROR_LOG(MEMMAP, "Bad memory access detected and ignored: %08x (%p)", guestAddress, (void *)hostAddress);
+			std::string temp;
+			if (mipsr4k.jit && mipsr4k.jit->DescribeCodePtr(codePtr, temp)) {
+				ERROR_LOG(Log::MemMap, "Bad memory access detected and ignored: %08x (%p) at %s", guestAddress, (void *)hostAddress, temp.c_str());
+			} else {
+				ERROR_LOG(Log::MemMap, "Bad memory access detected and ignored: %08x (%p)", guestAddress, (void *)hostAddress);
+			}
 		}
 	} else {
-		// Either bIgnoreBadMemAccess is off, or we failed recovery analysis.
+		std::string infoString = "";
+		std::string temp;
+		if (mipsr4k.jit && mipsr4k.jit->DescribeCodePtr(codePtr, temp)) {
+			infoString += temp + " ";
+		}
+		temp.clear();
+		if (DisassembleNativeAt(codePtr, instructionSize, &temp)) {
+			infoString += "(" + temp + ") ";
+		}
+
+		// Either bIgnoreBadMemAccess is off, we failed recovery analysis, or there were too many this frame.
+		// We can't ignore this memory access.
+		if (tooManyThisFrame) {
+			infoString += StringFromFormat("(over %d ignored bad accesses in one frame) ", MAX_IGNORED_ACCESSES_PER_FRAME);
+		}
 		uint32_t approximatePC = currentMIPS->pc;
-		Core_MemoryExceptionInfo(guestAddress, approximatePC, type, infoString);
+		// TODO: Determine access size from the disassembled native instruction. We have some partial info already,
+		// just need to clean it up.
+		Core_MemoryException(guestAddress, info.OperandSizeInBytes(), approximatePC, type, infoString, true);
+
+		if (inIRInterpreter) {
+			// Step over the access and stop the core, like the JITs' crash handlers do. The interpreter
+			// leaves at the next block exit, which checks the downcount. Resuming isn't possible, the guest
+			// has already run on past the access.
+			context->CTX_PC += info.instructionSize;
+			coreState = CORE_RUNTIME_ERROR;
+			currentMIPS->downcount = -1;
+			inCrashHandler = false;
+			return true;
+		}
 
 		// There's a small chance we can resume from this type of crash.
 		g_lastCrashAddress = codePtr;
 
 		// Redirect execution to a crash handler that will switch to CoreState::CORE_RUNTIME_ERROR immediately.
-		context->CTX_PC = (uintptr_t)MIPSComp::jit->GetCrashHandler();
-		ERROR_LOG(MEMMAP, "Bad memory access detected! %08x (%p) Stopping emulation. Info:\n%s", guestAddress, (void *)hostAddress, infoString.c_str());
+		uintptr_t crashHandler = 0;
+		if (mipsr4k.jit)
+			crashHandler = (uintptr_t)mipsr4k.jit->GetCrashHandler();
+		if (crashHandler != 0)
+			context->CTX_PC = crashHandler;
+		else
+			handled = false;
+		// ERROR_LOG(Log::MemMap, "Bad memory access detected! %08x (%p) Stopping emulation. Info:\n%s", guestAddress, (void *)hostAddress, infoString.c_str());
 	}
-	return true;
+
+	inCrashHandler = false;
+	return handled;
 }
 
 #else
 
 bool HandleFault(uintptr_t hostAddress, void *ctx) {
-	ERROR_LOG(MEMMAP, "Exception handling not supported");
+	ERROR_LOG(Log::MemMap, "Exception handling not supported");
 	return false;
 }
 
 #endif
 
 }  // namespace Memory
+
+std::vector<MIPSStackWalk::StackFrame> WalkCurrentStack(int threadID, uint32_t startPC) {
+	DebugInterface *cpuDebug = currentDebugMIPS;
+	if (startPC == 0)
+		startPC = cpuDebug->GetPC();
+
+	auto threads = GetThreadsInfo();
+	uint32_t entry = startPC;
+	uint32_t stackTop = 0;
+	for (const DebugThreadInfo &th : threads) {
+		if ((threadID == -1 && th.isCurrent) || th.id == threadID) {
+			entry = th.entrypoint;
+			stackTop = th.initialStack;
+			break;
+		}
+	}
+
+	uint32_t ra = cpuDebug->GetRegValue(0, MIPS_REG_RA);
+	uint32_t sp = cpuDebug->GetRegValue(0, MIPS_REG_SP);
+	return MIPSStackWalk::Walk(startPC, ra, sp, entry, stackTop);
+}
+
+std::string FormatStackTrace(const std::vector<MIPSStackWalk::StackFrame> &frames) {
+	std::stringstream str;
+	for (const auto &frame : frames) {
+		const u32 frameEntry = frame.entry == 0xFFFFFFFF ? 0 : frame.entry;
+		std::string desc = g_symbolMap->GetDescription(frame.entry);
+		// Empty unless the game shipped an unstripped ELF - see Core/Debugger/LineInfo.h. A crash
+		// report is the single place this is worth the most, so it goes first on the line.
+		const std::string source = g_lineInfo.LookupString(frame.pc);
+		const std::string at = source.empty() ? std::string() : " at " + source;
+		char moduleDesc[96];
+		if (DescribeModuleAddress(frame.entry, moduleDesc, sizeof(moduleDesc))) {
+			str << StringFromFormat("%s%s [%s] (%08x+%03x, pc: %08x sp: %08x)\n", desc.c_str(), at.c_str(), moduleDesc, frameEntry, frame.pc - frameEntry, frame.pc, frame.sp);
+		} else {
+			str << StringFromFormat("%s%s (%08x+%03x, pc: %08x sp: %08x)\n", desc.c_str(), at.c_str(), frameEntry, frame.pc - frameEntry, frame.pc, frame.sp);
+		}
+	}
+	return str.str();
+}

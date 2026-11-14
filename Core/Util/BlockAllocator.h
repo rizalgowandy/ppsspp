@@ -21,16 +21,18 @@ class PointerWrap;
 
 #include "Common/CommonTypes.h"
 
+#include "Common/Log.h"
+
 class BlockAllocator
 {
 public:
-	BlockAllocator(int grain = 16);  // 16 byte granularity by default.
+	BlockAllocator(int grain = 16) : grain_(grain) {}  // 16 byte granularity by default.
 	~BlockAllocator();
 
 	void Init(u32 _rangeStart, u32 _rangeSize, bool suballoc);
 	void Shutdown();
 
-	void ListBlocks() const;
+	void ListBlocks(LogLevel level) const;
 
 	// WARNING: size can be modified upwards!
 	u32 Alloc(u32 &size, bool fromTop = false, const char *tag = 0);
@@ -51,6 +53,7 @@ public:
 	u32 GetBlockSizeFromAddress(u32 addr) const;
 	u32 GetLargestFreeBlockSize() const;
 	u32 GetTotalFreeBytes() const;
+	u32 GetRangeSize() const { return rangeSize_; }
 
 	const char *GetBlockTag(u32 addr) const;
 
@@ -59,11 +62,12 @@ public:
 private:
 	void CheckBlocks() const;
 
-	struct Block
-	{
+	struct Block {
 		Block(u32 _start, u32 _size, bool _taken, Block *_prev, Block *_next);
 		void SetAllocated(const char *_tag, bool suballoc);
-		void DoState(PointerWrap &p);
+		// compact = v2 form: no per-block Section, raw tag store (tags are
+		// zero-padded at write time). v1 states load with compact = false.
+		void DoState(PointerWrap &p, bool compact);
 		u32 start;
 		u32 size;
 		bool taken;
@@ -72,13 +76,13 @@ private:
 		Block *next;
 	};
 
-	Block *bottom_;
-	Block *top_;
-	u32 rangeStart_;
-	u32 rangeSize_;
+	Block *bottom_ = nullptr;
+	Block *top_ = nullptr;
+	u32 rangeStart_ = 0;
+	u32 rangeSize_ = 0;
 
 	u32 grain_;
-	bool suballoc_;
+	bool suballoc_ = false;
 
 	void MergeFreeBlocks(Block *fromBlock);
 	Block *GetBlockFromAddress(u32 addr);

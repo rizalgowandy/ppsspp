@@ -5,85 +5,83 @@
 #include "Common/UI/Context.h"
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
+#include "Common/UI/ScrollView.h"
+#include "Common/UI/ScreenManager.h"
 #include "Common/UI/UI.h"
 
 #include "Common/Data/Text/I18n.h"
+#include "Common/File/FileUtil.h"  // For the localtime_r shim on Windows.
 #include "Common/Data/Encoding/Utf8.h"
-#include "Common/System/System.h"
+#include "Common/System/Request.h"
 #include "Core/Config.h"
 #include "Core/System.h"
 #include "Core/HLE/proAdhoc.h"
 #include "UI/ChatScreen.h"
+#include "UI/PopupScreens.h"
 
-void ChatMenu::CreatePopupContents(UI::ViewGroup *parent) {
+void ChatMenu::CreateContents(UI::ViewGroup *parent) {
 	using namespace UI;
-	auto n = GetI18NCategory("Networking");
+	auto n = GetI18NCategory(I18NCat::NETWORKING);
 	LinearLayout *outer = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT,400));
-	scroll_ = outer->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(1.0)));
+	scroll_ = outer->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0)));
 	LinearLayout *bottom = outer->Add(new LinearLayout(ORIENT_HORIZONTAL, new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
-#if PPSSPP_PLATFORM(WINDOWS) || defined(USING_QT_UI) || defined(SDL)
-	chatEdit_ = bottom->Add(new TextEdit("", n->T("Chat message"), n->T("Chat Here"), new LinearLayoutParams(1.0)));
-#if defined(USING_WIN_UI)
-	// freeze the ui when using ctrl + C hotkey need workaround
-	if (g_Config.bBypassOSKWithKeyboard && !g_Config.bFullScreen) {
-		System_InputBoxGetString(n->T("Chat"), n->T("Chat Here"), [](bool result, const std::string &value) {
-			if (result) {
-				sendChat(value);
-			}
-		});
-	}
-#endif
-	chatEdit_->OnEnter.Handle(this, &ChatMenu::OnSubmit);
 
-#elif PPSSPP_PLATFORM(ANDROID)
-	bottom->Add(new Button(n->T("Chat Here"),new LayoutParams(FILL_PARENT, WRAP_CONTENT)))->OnClick.Handle(this, &ChatMenu::OnSubmit);
-	bottom->Add(new Button(n->T("Send")))->OnClick.Handle(this, &ChatMenu::OnSubmit);
-#endif
+	chatButton_ = nullptr;
+	chatEdit_ = nullptr;
+	chatVert_ = nullptr;
+
+	if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_DESKTOP) {
+		// We have direct keyboard input.
+		chatEdit_ = bottom->Add(new TextEdit("", n->T("Chat message"), n->T("Chat Here"), new LinearLayoutParams(1.0, Gravity::G_VCENTER)));
+		chatEdit_->SetPadding(Margins(12, 16));
+		Choice *send = bottom->Add(new Choice(ImageID("I_SEND"), new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT)));
+		send->OnClick.Handle(this, &ChatMenu::OnSubmitMessage);
+		send->SetImageScale(0.8f);
+		chatEdit_->OnEnter.Handle(this, &ChatMenu::OnSubmitMessage);
+	} else {
+		// If we have a native input box, like on Android, or at least we can do a popup text input with our UI...
+		chatButton_ = bottom->Add(new Choice(n->T("Chat message"), new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
+		chatButton_->OnClick.Handle(this, &ChatMenu::OnAskForChatMessage);
+	}
 
 	if (g_Config.bEnableQuickChat) {
 		LinearLayout *quickChat = outer->Add(new LinearLayout(ORIENT_HORIZONTAL, new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
-		quickChat->Add(new Button("1", new LinearLayoutParams(1.0)))->OnClick.Handle(this, &ChatMenu::OnQuickChat1);
-		quickChat->Add(new Button("2", new LinearLayoutParams(1.0)))->OnClick.Handle(this, &ChatMenu::OnQuickChat2);
-		quickChat->Add(new Button("3", new LinearLayoutParams(1.0)))->OnClick.Handle(this, &ChatMenu::OnQuickChat3);
-		quickChat->Add(new Button("4", new LinearLayoutParams(1.0)))->OnClick.Handle(this, &ChatMenu::OnQuickChat4);
-		quickChat->Add(new Button("5", new LinearLayoutParams(1.0)))->OnClick.Handle(this, &ChatMenu::OnQuickChat5);
+		for (int i = 0; i < 5; i++) {
+			std::string name = std::to_string(i + 1);
+			quickChat->Add(new Button(name, new LinearLayoutParams(1.0)))->OnClick.Add([i](UI::EventParams &e) {
+				sendChat(g_Config.sQuickChat[i]);
+			});
+		}
 	}
 	chatVert_ = scroll_->Add(new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT)));
 	chatVert_->SetSpacing(0);
 	parent->Add(outer);
 }
 
-void ChatMenu::CreateViews() {
+void ChatMenu::CreateSubviews(const Bounds &screenBounds) {
 	using namespace UI;
 
-	auto n = GetI18NCategory("Networking");
-	UIContext &dc = *screenManager()->getUIContext();
-
-	AnchorLayout *anchor = new AnchorLayout(new LayoutParams(FILL_PARENT, FILL_PARENT));
-	anchor->Overflow(false);
-	root_ = anchor;
-
-	float yres = screenManager()->getUIContext()->GetBounds().h;
+	float width = 550.0f;
 
 	switch (g_Config.iChatScreenPosition) {
 	// the chat screen size is still static 280x240 need a dynamic size based on device resolution 
 	case 0:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, 280, NONE, NONE, 240, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, 280, NONE, NONE, 240, Centering::Both));
 		break;
 	case 1:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, dc.GetBounds().centerX(), NONE, NONE, 240, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, screenBounds.centerX(), NONE, NONE, 240, Centering::Both));
 		break;
 	case 2:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, NONE, NONE, 280, 240, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, NONE, NONE, 280, 240, Centering::Both));
 		break;
 	case 3:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, 280, 240, NONE, NONE, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, 280, 240, NONE, NONE, Centering::Both));
 		break;
 	case 4:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, dc.GetBounds().centerX(), 240, NONE, NONE, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, screenBounds.centerX(), 240, NONE, NONE, Centering::Both));
 		break;
 	case 5:
-		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(PopupWidth(), FillVertical() ? yres - 30 : WRAP_CONTENT, NONE, 240, 280, NONE, true));
+		box_ = new LinearLayout(ORIENT_VERTICAL, new AnchorLayoutParams(width, WRAP_CONTENT, NONE, 240, 280, NONE, Centering::Both));
 		break;
 	default:
 		box_ = nullptr;
@@ -91,102 +89,95 @@ void ChatMenu::CreateViews() {
 	}
 
 	if (box_) {
-		root_->Add(box_);
+		Add(box_);
 		box_->SetBG(UI::Drawable(0x99303030));
 		box_->SetHasDropShadow(false);
 
-		View *title = new PopupHeader(n->T("Chat"));
+		auto n = GetI18NCategory(I18NCat::NETWORKING);
+		View *title = new PopupHeader(std::string(n->T("Chat")) + ": " + g_Config.sNickName);
 		box_->Add(title);
 
-		CreatePopupContents(box_);
-#if PPSSPP_PLATFORM(WINDOWS) || defined(USING_QT_UI) || defined(SDL)
-		UI::EnableFocusMovement(true);
-		root_->SetDefaultFocusView(box_);
-		box_->SubviewFocused(chatEdit_);
-		root_->SetFocus();
-#else
-		//root_->SetDefaultFocusView(box_);
-		//box_->SubviewFocused(scroll_);
-		//root_->SetFocus();
-#endif
+		CreateContents(box_);
 	}
-	chatScreenVisible = true;
-	newChat = 0;
 
 	UpdateChat();
 }
 
-void ChatMenu::dialogFinished(const Screen *dialog, DialogResult result) {
-	UpdateUIState(UISTATE_INGAME);
-}
-
-UI::EventReturn ChatMenu::OnSubmit(UI::EventParams &e) {
-#if PPSSPP_PLATFORM(WINDOWS) || defined(USING_QT_UI) || defined(SDL)
+void ChatMenu::OnSubmitMessage(UI::EventParams &e) {
 	std::string chat = chatEdit_->GetText();
 	chatEdit_->SetText("");
-	chatEdit_->SetFocus();
+	chatEdit_->SetFocus(UI::FocusFlags::CAUSE_FORCED);
 	sendChat(chat);
-#elif PPSSPP_PLATFORM(ANDROID)
-	auto n = GetI18NCategory("Networking");
-	System_InputBoxGetString(n->T("Chat"), "", [](bool result, const std::string &value) {
-		sendChat(value);
-	});
-#endif
-	return UI::EVENT_DONE;
 }
 
-UI::EventReturn ChatMenu::OnQuickChat1(UI::EventParams &e) {
-	sendChat(g_Config.sQuickChat0);
-	return UI::EVENT_DONE;
-}
+void ChatMenu::OnAskForChatMessage(UI::EventParams &e) {
+	auto n = GetI18NCategory(I18NCat::NETWORKING);
 
-UI::EventReturn ChatMenu::OnQuickChat2(UI::EventParams &e) {
-	sendChat(g_Config.sQuickChat1);
-	return UI::EVENT_DONE;
-}
+	using namespace UI;
 
-UI::EventReturn ChatMenu::OnQuickChat3(UI::EventParams &e) {
-	sendChat(g_Config.sQuickChat2);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ChatMenu::OnQuickChat4(UI::EventParams &e) {
-	sendChat(g_Config.sQuickChat3);
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn ChatMenu::OnQuickChat5(UI::EventParams &e) {
-	sendChat(g_Config.sQuickChat4);
-	return UI::EVENT_DONE;
+	if (System_GetPropertyBool(SYSPROP_HAS_TEXT_INPUT_DIALOG)) {
+		System_InputBoxGetString(token_, n->T("Chat"), "", false, [](std::string_view value, int) {
+			sendChat(value);
+		});
+	} else {
+		// We need to pop up a UI inputbox.
+		messageTemp_.clear();
+		TextEditPopupScreen *popupScreen = new TextEditPopupScreen(&messageTemp_, "", n->T("Chat message"), 256);
+		if (System_GetPropertyBool(SYSPROP_KEYBOARD_IS_SOFT)) {
+			popupScreen->SetAlignTop(true);
+		}
+		popupScreen->OnChange.Add([=](UI::EventParams &e) {
+			sendChat(messageTemp_);
+		});
+		popupScreen->SetPopupOrigin(chatButton_);
+		screenManager_->push(popupScreen);
+	}
 }
 
 void ChatMenu::UpdateChat() {
 	using namespace UI;
 	if (chatVert_ != nullptr) {
 		chatVert_->Clear(); //read Access violation is proadhoc.cpp use NULL_->Clear() pointer?
-		std::vector<std::string> chatLog = getChatLog();
-		for (auto i : chatLog) {
+		std::vector<ChatLogEntry> chatLog = getChatLog();
+		for (const auto &entry : chatLog) {
+			const std::string &i = entry.text;
 			uint32_t namecolor = 0x29B6F6;
 			uint32_t textcolor = 0xFFFFFF;
 			uint32_t infocolor = 0xFDD835;
+			uint32_t timecolor = 0x9E9E9E;
 
-			std::string name = g_Config.sNickName.c_str();
+			std::string name = g_Config.sNickName;
 			std::string displayname = i.substr(0, i.find(':'));
-			std::string chattext = i.substr(displayname.length());
 			
 			if (name.substr(0, 8) == displayname) {
 				namecolor = 0xE53935;
 			}
 
+			std::string timestamp;
+			if (g_Config.bChatTimestamps) {
+				char buf[16];
+				tm localTime;
+				localtime_r(&entry.timestamp, &localTime);
+				if (strftime(buf, sizeof(buf), "%H:%M ", &localTime)) {
+					timestamp = buf;
+				}
+			}
+
 			if (i.length() <= displayname.length() || i[displayname.length()] != ':') {
-				TextView *v = chatVert_->Add(new TextView(i, ALIGN_LEFT | FLAG_WRAP_TEXT, true, new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
+				// Info line - no name to color separately, so the timestamp can just go in the text.
+				TextView *v = chatVert_->Add(new TextView(timestamp + i, ALIGN_LEFT | FLAG_WRAP_TEXT, true, new LayoutParams(FILL_PARENT, WRAP_CONTENT)));
 				v->SetTextColor(0xFF000000 | infocolor);
 			} else {
 				LinearLayout *line = chatVert_->Add(new LinearLayout(ORIENT_HORIZONTAL, new LayoutParams(FILL_PARENT, FILL_PARENT)));
 				line->SetSpacing(0.0f);
+				if (!timestamp.empty()) {
+					TextView *timeView = line->Add(new TextView(timestamp, ALIGN_LEFT, true, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT, 0.0f)));
+					timeView->SetTextColor(0xFF000000 | timecolor);
+				}
 				TextView *nameView = line->Add(new TextView(displayname, ALIGN_LEFT, true, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT, 0.0f)));
 				nameView->SetTextColor(0xFF000000 | namecolor);
 
+				std::string chattext = i.substr(displayname.length());
 				TextView *chatView = line->Add(new TextView(chattext, ALIGN_LEFT | FLAG_WRAP_TEXT, true, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 1.0f)));
 				chatView->SetTextColor(0xFF000000 | textcolor);
 			}
@@ -195,31 +186,39 @@ void ChatMenu::UpdateChat() {
 	}
 }
 
-bool ChatMenu::touch(const TouchInput &touch) {
-	if (!box_ || (touch.flags & TOUCH_DOWN) == 0) {
-		return UIDialogScreen::touch(touch);
-	}
-
-	if (!box_->GetBounds().Contains(touch.x, touch.y)){
-		screenManager()->finishDialog(this, DR_BACK);
-	}
-
-	return UIDialogScreen::touch(touch);
-}
-
-void ChatMenu::update() {
-	PopupScreen::update();
+void ChatMenu::Update() {
+	AnchorLayout::Update();
 	if (scroll_ && toBottom_) {
 		toBottom_ = false;
 		scroll_->ScrollToBottom();
 	}
 
-	if (updateChatScreen) {
+	if (chatChangeID_ != GetChatChangeID()) {
+		chatChangeID_ = GetChatChangeID();
 		UpdateChat();
-		updateChatScreen = false;
 	}
+
+// TODO: This check looks outdated.
+#if PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(UWP)
+	// Could remove the fullscreen check here, it works now.
+	auto n = GetI18NCategory(I18NCat::NETWORKING);
+	if (promptInput_ && g_Config.bBypassOSKWithKeyboard && !g_Config.bFullScreen) {
+		System_InputBoxGetString(token_, n->T("Chat"), n->T("Chat Here"), false, [](std::string_view value, int) {
+			sendChat(value);
+		});
+		promptInput_ = false;
+	}
+#endif
 }
 
-ChatMenu::~ChatMenu() {
-	chatScreenVisible = false;
+bool ChatMenu::SubviewFocused(UI::View *view) {
+	if (!AnchorLayout::SubviewFocused(view))
+		return false;
+
+	promptInput_ = true;
+	return true;
+}
+
+void ChatMenu::Close() {
+	SetVisibility(UI::V_GONE);
 }

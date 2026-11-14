@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.10)
 project(SPIRV-Cross)
 enable_testing()
 
@@ -60,6 +60,9 @@ target_link_libraries(spirv-cross-msl spirv-cross-glsl)
 target_link_libraries(spirv-cross-cpp spirv-cross-glsl)
 target_link_libraries(spirv-cross-hlsl spirv-cross-glsl)
 target_include_directories(spirv-cross-core PUBLIC ${SRCDIR})
+
+# Only built when something links them (spirv-cross-hlsl on Windows).
+set_target_properties(spirv-cross-cpp spirv-cross-msl spirv-cross-hlsl PROPERTIES EXCLUDE_FROM_ALL ON)
 
 set(spirv-compiler-options "")
 set(spirv-compiler-defines "")

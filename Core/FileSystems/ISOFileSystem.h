@@ -18,64 +18,76 @@
 #pragma once
 
 #include <map>
-#include <list>
+#include <memory>
 
 #include "FileSystem.h"
 
 #include "BlockDevices.h"
 
-bool parseLBN(std::string filename, u32 *sectorStart, u32 *readSize);
+bool parseLBN(const std::string &filename, u32 *sectorStart, u32 *readSize);
 
 class ISOFileSystem : public IFileSystem {
 public:
-	ISOFileSystem(IHandleAllocator *_hAlloc, BlockDevice *_blockDevice);
+	ISOFileSystem(IHandleAllocator *_hAlloc, std::shared_ptr<BlockDevice> _blockDevice);
 	~ISOFileSystem();
 
 	void DoState(PointerWrap &p) override;
-	std::vector<PSPFileInfo> GetDirListing(std::string path) override;
+	std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) override;
 	int      OpenFile(std::string filename, FileAccess access, const char *devicename = nullptr) override;
 	void     CloseFile(u32 handle) override;
 	size_t   ReadFile(u32 handle, u8 *pointer, s64 size) override;
 	size_t   ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) override;
 	size_t   SeekFile(u32 handle, s32 position, FileMove type) override;
 	PSPFileInfo GetFileInfo(std::string filename) override;
+	PSPFileInfo GetFileInfoByHandle(u32 handle) override;
 	bool     OwnsHandle(u32 handle) override;
 	int      Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 outlen, int &usec) override;
 	PSPDevType DevType(u32 handle) override;
-	FileSystemFlags Flags() override;
-	u64      FreeSpace(const std::string &path) override { return 0; }
+	FileSystemFlags Flags() const override;
+	u64      FreeDiskSpace(const std::string &path) override { return 0; }
 
 	size_t WriteFile(u32 handle, const u8 *pointer, s64 size) override;
 	size_t WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec) override;
 
-	bool GetHostPath(const std::string &inpath, std::string &outpath) override {return false;}
 	bool MkDir(const std::string &dirname) override {return false;}
 	bool RmDir(const std::string &dirname) override { return false; }
 	int  RenameFile(const std::string &from, const std::string &to) override { return -1; }
 	bool RemoveFile(const std::string &filename) override { return false; }
 
+	bool ComputeRecursiveDirSizeIfFast(const std::string &path, int64_t *size) override { return false; }
+	void Describe(char *buf, size_t size) const override { snprintf(buf, size, "ISO"); }  // TODO: Ask the fileLoader about the origins
+
+	std::shared_ptr<BlockDevice> GetBlockDevice() override { return blockDevice; }
+
+	const std::string &Error() const { return errorString_; }
 private:
 	struct TreeEntry {
-		TreeEntry() : flags(0), valid(false) {}
 		~TreeEntry();
 
+		// Recursive function that reconstructs the path by looking at the parent pointers.
+		std::string BuildPath();
+
 		std::string name;
-		u32 flags;
-		u32 startingPosition;
-		s64 size;
-		bool isDirectory;
+		u32 flags = 0;
+		u32 startingPosition = 0;
+		s64 size = 0;
+		bool isDirectory = false;
+		// The date/time from the ISO9660 directory record, as Unix UTC seconds (0 if there
+		// wasn't a usable one). ISO9660 only has the one timestamp per file, so it gets
+		// reported as all three of atime/ctime/mtime.
+		s64 recordTime = 0;
 
-		u32 startsector;
-		u32 dirsize;
+		u32 startsector = 0;
+		u32 dirsize = 0;
 
-		TreeEntry *parent;
+		TreeEntry *parent = nullptr;
 
-		bool valid;
+		bool valid = false;
 		std::vector<TreeEntry *> children;
 	};
 
 	struct OpenFileEntry {
-		TreeEntry *file;
+		const TreeEntry *file;
 		unsigned int seekPos;  // TODO: Make 64-bit?
 		bool isRawSector;   // "/sce_lbn" mode
 		bool isBlockSectorMode;  // "umd:" mode: all sizes and offsets are in 2048 byte chunks
@@ -83,18 +95,19 @@ private:
 		u32 openSize;
 	};
 
-	typedef std::map<u32,OpenFileEntry> EntryMap;
+	typedef std::map<u32, OpenFileEntry> EntryMap;
 	EntryMap entries;
-	IHandleAllocator *hAlloc;
-	TreeEntry *treeroot;
-	BlockDevice *blockDevice;
-	u32 lastReadBlock_;
+	IHandleAllocator *hAlloc = nullptr;
+	TreeEntry *treeroot = nullptr;
+	std::shared_ptr<BlockDevice> blockDevice;
+	mutable u32 lastReadBlock_ = 0;
 
-	TreeEntry entireISO;
+	TreeEntry entireISO{};
+	std::string errorString_;
 
-	void ReadDirectory(TreeEntry *root);
-	TreeEntry *GetFromPath(const std::string &path, bool catchError = true);
-	std::string EntryFullPath(TreeEntry *e);
+	void ReadDirectory(TreeEntry *root) const;
+	const TreeEntry *GetFromPath(std::string_view path, bool catchError = true);
+	std::string EntryFullPath(const TreeEntry *e);
 };
 
 // On the "umd0:" device, any file you open is the entire ISO.
@@ -102,14 +115,18 @@ private:
 // the filenames to "", to achieve this.
 class ISOBlockSystem : public IFileSystem {
 public:
-	ISOBlockSystem(ISOFileSystem *isoFileSystem) : isoFileSystem_(isoFileSystem) {}
+	ISOBlockSystem(std::shared_ptr<IFileSystem> isoFileSystem) : isoFileSystem_(std::move(isoFileSystem)) {}
 
 	void DoState(PointerWrap &p) override {
 		// This is a bit iffy, as block device savestates already are iffy (loads/saves multiple times for multiple mounts..)
 		isoFileSystem_->DoState(p);
 	}
 
-	std::vector<PSPFileInfo> GetDirListing(std::string path) override { return std::vector<PSPFileInfo>(); }
+	std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) override {
+		if (exists)
+			*exists = true;
+		return std::vector<PSPFileInfo>();
+	}
 	int      OpenFile(std::string filename, FileAccess access, const char *devicename = nullptr) override {
 		return isoFileSystem_->OpenFile("", access, devicename);
 	}
@@ -128,6 +145,9 @@ public:
 	PSPFileInfo GetFileInfo(std::string filename) override {
 		return isoFileSystem_->GetFileInfo("");
 	}
+	PSPFileInfo GetFileInfoByHandle(u32 handle) override {
+		return isoFileSystem_->GetFileInfoByHandle(handle);
+	}
 	bool     OwnsHandle(u32 handle) override {
 		return isoFileSystem_->OwnsHandle(handle);
 	}
@@ -137,8 +157,8 @@ public:
 	PSPDevType DevType(u32 handle) override {
 		return isoFileSystem_->DevType(handle);
 	}
-	FileSystemFlags Flags() override { return isoFileSystem_->Flags(); }
-	u64      FreeSpace(const std::string &path) override { return isoFileSystem_->FreeSpace(path); }
+	FileSystemFlags Flags() const override { return isoFileSystem_->Flags(); }
+	u64      FreeDiskSpace(const std::string &path) override { return isoFileSystem_->FreeDiskSpace(path); }
 
 	size_t WriteFile(u32 handle, const u8 *pointer, s64 size) override {
 		return isoFileSystem_->WriteFile(handle, pointer, size);
@@ -146,12 +166,16 @@ public:
 	size_t WriteFile(u32 handle, const u8 *pointer, s64 size, int &usec) override {
 		return isoFileSystem_->WriteFile(handle, pointer, size, usec);
 	}
-	bool GetHostPath(const std::string &inpath, std::string &outpath) override { return false; }
 	bool MkDir(const std::string &dirname) override { return false; }
 	bool RmDir(const std::string &dirname) override { return false; }
 	int  RenameFile(const std::string &from, const std::string &to) override { return -1; }
 	bool RemoveFile(const std::string &filename) override { return false; }
 
+	bool ComputeRecursiveDirSizeIfFast(const std::string &path, int64_t *size) override { return false; }
+
+	void Describe(char *buf, size_t size) const override { snprintf(buf, size, "ISOBlock"); }
+	std::shared_ptr<BlockDevice> GetBlockDevice() override { return isoFileSystem_->GetBlockDevice(); }
+
 private:
-	ISOFileSystem *isoFileSystem_;
+	std::shared_ptr<IFileSystem> isoFileSystem_;
 };

@@ -16,14 +16,14 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
-#ifndef USING_QT_UI
 #include <png.h>
 #include <zlib.h>
-#endif
 #include "Common/Data/Encoding/Base64.h"
 #include "Common/StringUtils.h"
 #include "Core/Debugger/WebSocket/GPUBufferSubscriber.h"
 #include "Core/Debugger/WebSocket/WebSocketUtils.h"
+#include "Core/HLE/sceDisplay.h"
+#include "Core/MemMap.h"
 #include "Core/MIPS/MIPSDebugInterface.h"
 #include "Core/Screenshot.h"
 #include "GPU/Debugger/Stepping.h"
@@ -41,11 +41,7 @@ DebuggerSubscriber *WebSocketGPUBufferInit(DebuggerEventHandlerMap &map) {
 }
 
 // Note: Calls req.Respond().  Other data can be added afterward.
-static bool StreamBufferToDataURI(DebuggerRequest &req, const GPUDebugBuffer &buf, bool includeAlpha, int stackWidth) {
-#ifdef USING_QT_UI
-	req.Fail("Not supported on Qt yet, pull requests accepted");
-	return false;
-#else
+static bool StreamBufferToDataURI(DebuggerRequest &req, const GPUDebugBuffer &buf, bool isFramebuffer, bool includeAlpha, int stackWidth) {
 	u8 *flipbuffer = nullptr;
 	u32 w = (u32)-1;
 	u32 h = (u32)-1;
@@ -57,8 +53,12 @@ static bool StreamBufferToDataURI(DebuggerRequest &req, const GPUDebugBuffer &bu
 
 	if (stackWidth > 0) {
 		u32 totalPixels = w * h;
-		w = stackWidth;
-		while ((totalPixels % w) != 0)
+		// stackWidth is client-supplied and otherwise unbounded; since totalPixels
+		// is the real (small) buffer size, clamping to it bounds this loop to at
+		// most totalPixels iterations instead of up to ~2 billion for a huge value.
+		// Keep it at least 1 to avoid a divide by zero below.
+		w = std::max<u32>(1, std::min((u32)stackWidth, totalPixels));
+		while (w > 1 && (totalPixels % w) != 0)
 			--w;
 		h = totalPixels / w;
 	}
@@ -83,6 +83,9 @@ static bool StreamBufferToDataURI(DebuggerRequest &req, const GPUDebugBuffer &bu
 	auto &json = req.Respond();
 	json.writeInt("width", w);
 	json.writeInt("height", h);
+	if (isFramebuffer) {
+		json.writeBool("isFramebuffer", isFramebuffer);
+	}
 
 	// Start a value...
 	json.writeRaw("uri", "");
@@ -154,7 +157,6 @@ static bool StreamBufferToDataURI(DebuggerRequest &req, const GPUDebugBuffer &bu
 	// End the string.
 	req.ws->AddFragment(false, "\"");
 	return true;
-#endif
 }
 
 static std::string DescribeFormat(GPUDebugBufferFormat fmt) {
@@ -178,9 +180,6 @@ static std::string DescribeFormat(GPUDebugBufferFormat fmt) {
 	case GPU_DBG_FORMAT_24BIT_8X: return "D24_X8";
 	case GPU_DBG_FORMAT_24X_8BIT: return "X24_S8";
 
-	case GPU_DBG_FORMAT_FLOAT_DIV_256: return "D32F_DIV_256";
-	case GPU_DBG_FORMAT_24BIT_8X_DIV_256: return "D32F_X8_DIV_256";
-
 	case GPU_DBG_FORMAT_888_RGB: return "R8G8B8_UNORM";
 
 	case GPU_DBG_FORMAT_INVALID:
@@ -191,14 +190,17 @@ static std::string DescribeFormat(GPUDebugBufferFormat fmt) {
 }
 
 // Note: Calls req.Respond().  Other data can be added afterward.
-static bool StreamBufferToBase64(DebuggerRequest &req, const GPUDebugBuffer &buf) {
-	size_t length = buf.GetStride() * buf.GetHeight();
+static bool StreamBufferToBase64(DebuggerRequest &req, const GPUDebugBuffer &buf, bool isFramebuffer) {
+	size_t length = buf.GetStride() * buf.GetHeight() * buf.PixelSize();
 
 	auto &json = req.Respond();
 	json.writeInt("width", buf.GetStride());
 	json.writeInt("height", buf.GetHeight());
 	json.writeBool("flipped", buf.GetFlipped());
 	json.writeString("format", DescribeFormat(buf.GetFormat()));
+	if (isFramebuffer) {
+		json.writeBool("isFramebuffer", isFramebuffer);
+	}
 
 	// Start a value without any actual data yet...
 	json.writeRaw("base64", "");
@@ -217,11 +219,11 @@ static bool StreamBufferToBase64(DebuggerRequest &req, const GPUDebugBuffer &buf
 	return true;
 }
 
-static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const GPUDebugBuffer *&)> func) {
+static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const GPUDebugBuffer *&, bool *isFramebuffer)> func) {
 	if (!currentDebugMIPS->isAlive()) {
 		return req.Fail("CPU not started");
 	}
-	if (coreState != CORE_STEPPING && !GPUStepping::IsStepping()) {
+	if (coreState != CORE_STEPPING_CPU && !GPUStepping::IsStepping()) {
 		return req.Fail("Neither CPU or GPU is stepping");
 	}
 
@@ -238,29 +240,34 @@ static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const G
 		return req.Fail("Parameter 'type' must be either 'uri' or 'base64'");
 
 	const GPUDebugBuffer *buf = nullptr;
-	if (!func(buf)) {
+	bool isFramebuffer = false;
+	if (!func(buf, &isFramebuffer)) {
 		return req.Fail("Could not download output");
 	}
-	_assert_(buf != nullptr);
+	if (!buf) {
+		return req.Fail("No output available");
+	}
 
 	if (type == "base64") {
-		StreamBufferToBase64(req, *buf);
+		StreamBufferToBase64(req, *buf, isFramebuffer);
 	} else if (type == "uri") {
-		StreamBufferToDataURI(req, *buf, includeAlpha, stackWidth);
+		StreamBufferToDataURI(req, *buf, isFramebuffer, includeAlpha, stackWidth);
 	} else {
-		_assert_(false);
+		return req.Fail("Unexpected output type");
 	}
 }
 
-// Retrieve a screenshot (gpu.buffer.screenshot)
+// Retrieve a screenshot (gpu.buffer.screenshot). While the game has the display off, it's black.
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: boolean to include the alpha channel for 'uri' type (not normally useful for screenshots.)
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of screenshot.
 //  - height: numeric height of screenshot.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -268,22 +275,41 @@ static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const G
 //  - height: numeric height of screenshot.
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'R8G8B8A8_UNORM' or 'B8G8R8A8_UNORM'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
-	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf) {
-		return GPUStepping::GPU_GetOutputFramebuffer(buf);
+	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		*isFramebuffer = false;
+		if (GPUStepping::GPU_GetOutputFramebuffer(buf)) {
+			return true;
+		}
+		// Without a backbuffer (headless Vulkan), the displayed PSP framebuffer is the closest thing.
+		PSPPointer<u8> displayAddr;
+		__DisplayGetFramebuf(&displayAddr, nullptr, nullptr, 0);
+		if (!Memory::IsValidAddress(displayAddr.ptr)) {
+			// The game has turned the display off (sceDisplaySetFrameBuf with 0), so the screen is black.
+			static GPUDebugBuffer black;
+			black.Allocate(480, 272, GE_FORMAT_8888);
+			memset(black.GetData(), 0, 480 * 272 * 4);
+			buf = &black;
+			return true;
+		}
+		*isFramebuffer = true;
+		return GPUStepping::GPU_GetCurrentFramebuffer(buf, GPU_DBG_FRAMEBUF_DISPLAY);
 	});
 }
 
 // Retrieve current color render buffer (gpu.buffer.renderColor)
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: boolean to include the alpha channel for 'uri' type.
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of render buffer (may include stride.)
 //  - height: numeric height of render buffer.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -291,9 +317,11 @@ void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
 //  - height: numeric height of render buffer.
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'R8G8B8A8_UNORM' or 'B8G8R8A8_UNORM'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferRenderColor(DebuggerRequest &req) {
-	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf) {
+	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		*isFramebuffer = false;
 		return GPUStepping::GPU_GetCurrentFramebuffer(buf, GPU_DBG_FRAMEBUF_RENDER);
 	});
 }
@@ -301,12 +329,14 @@ void WebSocketGPUBufferRenderColor(DebuggerRequest &req) {
 // Retrieve current depth render buffer (gpu.buffer.renderDepth)
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: true to use alpha to encode depth, otherwise red for 'uri' type.
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of render buffer (may include stride.)
 //  - height: numeric height of render buffer.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -314,9 +344,11 @@ void WebSocketGPUBufferRenderColor(DebuggerRequest &req) {
 //  - height: numeric height of render buffer.
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'D16', 'D24_X8' or 'D32F'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferRenderDepth(DebuggerRequest &req) {
-	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf) {
+	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		*isFramebuffer = false;
 		return GPUStepping::GPU_GetCurrentDepthbuffer(buf);
 	});
 }
@@ -324,12 +356,14 @@ void WebSocketGPUBufferRenderDepth(DebuggerRequest &req) {
 // Retrieve current stencil render buffer (gpu.buffer.renderStencil)
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: true to use alpha to encode stencil, otherwise red for 'uri' type.
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of render buffer (may include stride.)
 //  - height: numeric height of render buffer.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -337,9 +371,11 @@ void WebSocketGPUBufferRenderDepth(DebuggerRequest &req) {
 //  - height: numeric height of render buffer.
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'X24_S8' or 'S8'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferRenderStencil(DebuggerRequest &req) {
-	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf) {
+	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		*isFramebuffer = false;
 		return GPUStepping::GPU_GetCurrentStencilbuffer(buf);
 	});
 }
@@ -347,13 +383,15 @@ void WebSocketGPUBufferRenderStencil(DebuggerRequest &req) {
 // Retrieve current texture (gpu.buffer.texture)
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: boolean to include the alpha channel for 'uri' type.
-//  - level: texture mip level, default 0.
+//  - level: optional texture mip level, default 0.
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of the texture (often wider than visual.)
 //  - height: numeric height of the texture (often wider than visual.)
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -361,27 +399,34 @@ void WebSocketGPUBufferRenderStencil(DebuggerRequest &req) {
 //  - height: numeric height of the texture (often wider than visual.)
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'R8G8B8A8_UNORM' or 'B8G8R8A8_UNORM'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferTexture(DebuggerRequest &req) {
 	u32 level = 0;
 	if (!req.ParamU32("level", &level, false, DebuggerParamType::OPTIONAL))
 		return;
+	// Sanity check the level, to avoid overflow hacks. Also it just can't be very high,
+	// we currently support 12 levels for replacement (the PSP only supports 8).
+	if (level > 12) {
+		return req.Fail("Invalid level");
+	}
 
-	GenericStreamBuffer(req, [level](const GPUDebugBuffer *&buf) {
-		return GPUStepping::GPU_GetCurrentTexture(buf, level);
+	GenericStreamBuffer(req, [level](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		return GPUStepping::GPU_GetCurrentTexture(buf, level, isFramebuffer);
 	});
 }
 
 // Retrieve current CLUT (gpu.buffer.clut)
 //
 // Parameters:
-//  - type: either 'uri' or 'base64'.
+//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
 //  - alpha: boolean to include the alpha channel for 'uri' type.
-//  - stackWidth: forced width for 'uri' type (increases height.)
+//  - stackWidth: optional, forced width for 'uri' type (increases height.)
 //
 // Response (same event name) for 'uri' type:
 //  - width: numeric width of CLUT.
 //  - height: numeric height of CLUT.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - uri: data: URI of PNG image for display.
 //
 // Response (same event name) for 'base64' type:
@@ -389,9 +434,12 @@ void WebSocketGPUBufferTexture(DebuggerRequest &req) {
 //  - height: always 1.
 //  - flipped: boolean to indicate whether buffer is vertically flipped.
 //  - format: string indicating format, such as 'R8G8B8A8_UNORM' or 'B8G8R8A8_UNORM'.
+//  - isFramebuffer: optional, present and true if this came from a hardware framebuffer.
 //  - base64: base64 encode of binary data.
 void WebSocketGPUBufferClut(DebuggerRequest &req) {
-	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf) {
+	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
+		// TODO: Or maybe it could be?
+		*isFramebuffer = false;
 		return GPUStepping::GPU_GetCurrentClut(buf);
 	});
 }

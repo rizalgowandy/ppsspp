@@ -1,54 +1,87 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
+#include <thread>
+#include <vector>
 
 #include "Common/Net/HTTPHeaders.h"
 #include "Common/Net/Resolve.h"
-#include "Common/Thread/Executor.h"
+
+class NewThreadExecutor {
+public:
+	~NewThreadExecutor();
+	// Returns false, without running func, when MAX_WORKERS threads are already busy.
+	bool Run(std::function<void()> func);
+
+	static constexpr size_t MAX_WORKERS = 64;
+
+private:
+	// Reap threads that have finished. Only called from the thread that calls Run().
+	void Prune();
+
+	struct Worker {
+		std::thread thread;
+		// Set by the worker as its last act, read by whoever calls Run() next.
+		// It does look a bit fragile with the atomic inside a shared_ptr, but the way
+		// this is used, it should be fine. The atomic is only used to signal that the thread
+		// is done, and the shared_ptr is only used to keep the atomic alive until
+		// the thread is joined.
+		std::shared_ptr<std::atomic<bool>> done;
+	};
+	std::vector<Worker> workers_;
+};
 
 namespace net {
+
 class InputSink;
 class OutputSink;
-};
+
+}  // namespace net
 
 namespace http {
 
-class Request {
- public:
-  Request(int fd);
-  ~Request();
+class ServerRequest {
+public:
+	ServerRequest(int fd);
+	~ServerRequest();
 
-  const char *resource() const {
-    return header_.resource;
-  }
+	std::string_view resource() const {
+		return header_.resource;
+	}
 
-  RequestHeader::Method Method() const {
-	  return header_.method;
-  }
+	RequestHeader::Method Method() const {
+		return header_.method;
+	}
 
-  bool GetParamValue(const char *param_name, std::string *value) const {
-    return header_.GetParamValue(param_name, value);
-  }
-  // Use lowercase.
-  bool GetHeader(const char *name, std::string *value) const {
-	  return header_.GetOther(name, value);
-  }
+	const RequestHeader &Header() const {
+		return header_;
+	}
 
-  net::InputSink *In() const { return in_; }
-  net::OutputSink *Out() const { return out_; }
+	bool GetParamValue(const char *param_name, std::string *value) const {
+		return header_.GetParamValue(param_name, value);
+	}
+	// Use lowercase.
+	bool GetHeader(const char *name, std::string *value) const {
+		return header_.GetOther(name, value);
+	}
 
-  // TODO: Remove, in favor of PartialWrite and friends.
-  int fd() const { return fd_; }
+	net::InputSink *In() const { return in_; }
+	net::OutputSink *Out() const { return out_; }
 
-  void WritePartial() const;
-  void Write();
-  void Close();
+	// TODO: Remove, in favor of PartialWrite and friends.
+	int fd() const { return fd_; }
 
-  bool IsOK() const { return fd_ > 0; }
+	void WritePartial() const;
+	void Write();
+	void Close();
 
-  // If size is negative, no Content-Length: line is written.
-  void WriteHttpResponseHeader(const char *ver, int status, int64_t size = -1, const char *mimeType = nullptr, const char *otherHeaders = nullptr) const;
+	bool IsOK() const { return fd_ > 0; }
+
+	// If size is negative, no Content-Length: line is written.
+	void WriteHttpResponseHeader(const char *ver, int status, int64_t size = -1, const char *mimeType = nullptr, const char *otherHeaders = nullptr) const;
 
 private:
 	net::InputSink *in_;
@@ -61,11 +94,11 @@ private:
 class Server {
 public:
 	// Takes ownership.
-	Server(threading::Executor *executor);
+	Server(NewThreadExecutor *executor);
 	virtual ~Server();
 
-	typedef std::function<void(const Request &)> UrlHandlerFunc;
-	typedef std::map<std::string, UrlHandlerFunc> UrlHandlerMap;
+	typedef std::function<void(const ServerRequest &)> UrlHandlerFunc;
+	typedef std::map<std::string, UrlHandlerFunc, std::less<>> UrlHandlerMap;
 
 	// Runs forever, serving request. If you want to do something else than serve pages,
 	// better put this on a thread. Returns false if failed to start serving, never
@@ -74,7 +107,7 @@ public:
 	// May run for (significantly) longer than timeout, but won't wait longer than that
 	// for a new connection to handle.
 	bool RunSlice(double timeout);
-	bool Listen(int port, net::DNSType type = net::DNSType::ANY);
+	bool Listen(int port, const char *reason, net::DNSType type = net::DNSType::ANY);
 	void Stop();
 
 	void RegisterHandler(const char *url_path, UrlHandlerFunc handler);
@@ -83,32 +116,39 @@ public:
 	// If you want to customize things at a lower level than just a simple path handler,
 	// then inherit and override this. Implementations should forward to HandleRequestDefault
 	// if they don't recognize the url.
-	virtual void HandleRequest(const Request &request);
+	virtual void HandleRequest(const ServerRequest &request);
 
-	int Port() {
+	int ListenerSocket() const {
+		return listenerSock_;
+	}
+	int Port() const {
 		return port_;
+	}
+	const std::string &LocalAddress() const {
+		return localAddress_;
 	}
 
 private:
-	bool Listen6(int port, bool ipv6_only);
-	bool Listen4(int port);
+	bool Listen6(int port, bool ipv6_only, const char *reason);
+	bool Listen4(int port, const char *reason);
 
 	void HandleConnection(int conn_fd);
 
 	// Things like default 404, etc.
-	void HandleRequestDefault(const Request &request);
+	void HandleRequestDefault(const ServerRequest &request);
 
 	// Neat built-in handlers that are tied to the server.
-	void HandleListing(const Request &request);
-	void Handle404(const Request &request);
+	void HandleListing(const ServerRequest &request);
+	void Handle404(const ServerRequest &request);
 
-	int listener_;
-	int port_;
+	int listenerSock_;
+	int port_ = 0;
+	std::string localAddress_;
 
 	UrlHandlerMap handlers_;
 	UrlHandlerFunc fallback_;
 
-	threading::Executor *executor_;
+	NewThreadExecutor *executor_;
 };
 
 }  // namespace http

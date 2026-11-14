@@ -17,8 +17,10 @@
 
 #pragma once
 
-#include "GPU/GPUInterface.h"
+#include "GPU/GPUDefinitions.h"
 #include "Core/MemMap.h"
+
+class MIPSState;
 
 #define SCE_GE_LIST_COMPLETED  0
 #define SCE_GE_LIST_QUEUED     1
@@ -28,7 +30,6 @@
 
 typedef int SceUID;
 typedef u32_le SceSize_le;
-// typedef void (*PspGeCallback)(int id, void *arg);
 
 struct PspGeCallbackData
 {
@@ -47,22 +48,18 @@ struct PspGeListArgs
 };
 
 void Register_sceGe_user();
+void Register_sceGe_driver();
 
 void __GeInit();
 void __GeDoState(PointerWrap &p);
 void __GeShutdown();
 bool __GeTriggerSync(GPUSyncType waitType, int id, u64 atTicks);
 bool __GeTriggerInterrupt(int listid, u32 pc, u64 atTicks);
+// Forgets the GE interrupts that have been raised but not taken, as resetting the GE does.
+void __GeCancelRaisedInterrupts(bool interruptRunning);
 void __GeWaitCurrentThread(GPUSyncType type, SceUID waitId, const char *reason);
 bool __GeTriggerWait(GPUSyncType type, SceUID waitId);
 
-
 // Export functions for use by Util/PPGe
-u32 sceGeRestoreContext(u32 ctxAddr);
-u32 sceGeSaveContext(u32 ctxAddr);
-int sceGeBreak(u32 mode);
-int sceGeContinue();
-int sceGeListSync(u32 displayListID, u32 mode);
-
-u32 sceGeListEnQueue(u32 listAddress, u32 stallAddress, int callbackId, u32 optParamAddr);
-u32 sceGeListEnQueueHead(u32 listAddress, u32 stallAddress, int callbackId, u32 optParamAddr);
+u32 sceGeListEnQueue(MIPSState *mips, u32 listAddress, u32 stallAddress, int callbackId, u32 optParamAddr);
+u32 sceGeListEnQueueHead(MIPSState *mips, u32 listAddress, u32 stallAddress, int callbackId, u32 optParamAddr);

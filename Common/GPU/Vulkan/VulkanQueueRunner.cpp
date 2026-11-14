@@ -1,14 +1,19 @@
 #include <unordered_map>
 
+#include "Common/Data/Convert/SmallDataConvert.h"
 #include "Common/GPU/DataFormat.h"
+#include "Common/GPU/Vulkan/VulkanQueueRunner.h"
+#include "Common/GPU/Vulkan/VulkanRenderManager.h"
 #include "Common/Log.h"
+#include "Common/Profiler/Profiler.h"
 #include "Common/TimeUtil.h"
-#include "VulkanQueueRunner.h"
-#include "VulkanRenderManager.h"
+#include "Common/VR/PPSSPPVR.h"
 
-// Debug help: adb logcat -s DEBUG PPSSPPNativeActivity PPSSPP NativeGLView NativeRenderer NativeSurfaceView PowerSaveModeReceiver InputDeviceState
+using namespace PPSSPP_VK;
 
-static void MergeRenderAreaRectInto(VkRect2D *dest, VkRect2D &src) {
+// Debug help: adb logcat -s DEBUG AndroidRuntime PPSSPPNativeActivity PPSSPP NativeSurfaceView PowerSaveModeReceiver InputDeviceState PpssppActivity CameraHelper PPSSPPSizeManager
+
+static void MergeRenderAreaRectInto(VkRect2D *dest, const VkRect2D &src) {
 	if (dest->offset.x > src.offset.x) {
 		dest->extent.width += (dest->offset.x - src.offset.x);
 		dest->offset.x = src.offset.x;
@@ -17,264 +22,208 @@ static void MergeRenderAreaRectInto(VkRect2D *dest, VkRect2D &src) {
 		dest->extent.height += (dest->offset.y - src.offset.y);
 		dest->offset.y = src.offset.y;
 	}
-	if (dest->extent.width < src.extent.width) {
-		dest->extent.width = src.extent.width;
+	if (dest->offset.x + dest->extent.width < src.offset.x + src.extent.width) {
+		dest->extent.width = src.offset.x + src.extent.width - dest->offset.x;
 	}
-	if (dest->extent.height < src.extent.height) {
-		dest->extent.height = src.extent.height;
+	if (dest->offset.y + dest->extent.height < src.offset.y + src.extent.height) {
+		dest->extent.height = src.offset.y + src.extent.height - dest->offset.y;
 	}
 }
 
-void VulkanQueueRunner::CreateDeviceObjects() {
-	INFO_LOG(G3D, "VulkanQueueRunner::CreateDeviceObjects");
-	InitBackbufferRenderPass();
+// We need to take the "max" of the features used in the two render passes.
+RenderPassType MergeRPTypes(RenderPassType a, RenderPassType b) {
+	// Either both are backbuffer type, or neither are.
+	// These can't merge with other renderpasses
+	if (a == RenderPassType::BACKBUFFER || b == RenderPassType::BACKBUFFER) {
+		_dbg_assert_(a == b);
+		return a;
+	}
 
-	framebufferRenderPass_ = GetRenderPass(VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR, VKRRenderPassAction::CLEAR);
+	_dbg_assert_((a & RenderPassType::MULTIVIEW) == (b & RenderPassType::MULTIVIEW));
+
+	// The rest we can just OR together to get the maximum feature set.
+	return (RenderPassType)((u32)a | (u32)b);
+}
+
+void VulkanQueueRunner::CreateDeviceObjects() {
+	DEBUG_LOG(Log::G3D, "VulkanQueueRunner::CreateDeviceObjects");
+
+	RPKey key{
+		VKRRenderPassLoadAction::CLEAR, VKRRenderPassLoadAction::CLEAR, VKRRenderPassLoadAction::CLEAR,
+		VKRRenderPassStoreAction::STORE, VKRRenderPassStoreAction::DONT_CARE, VKRRenderPassStoreAction::DONT_CARE,
+	};
+	compatibleRenderPass_ = GetRenderPass(key);
 
 #if 0
 	// Just to check whether it makes sense to split some of these. drawidx is way bigger than the others...
 	// We should probably just move to variable-size data in a raw buffer anyway...
 	VkRenderData rd;
-	INFO_LOG(G3D, "sizeof(pipeline): %d", (int)sizeof(rd.pipeline));
-	INFO_LOG(G3D, "sizeof(draw): %d", (int)sizeof(rd.draw));
-	INFO_LOG(G3D, "sizeof(drawidx): %d", (int)sizeof(rd.drawIndexed));
-	INFO_LOG(G3D, "sizeof(clear): %d", (int)sizeof(rd.clear));
-	INFO_LOG(G3D, "sizeof(viewport): %d", (int)sizeof(rd.viewport));
-	INFO_LOG(G3D, "sizeof(scissor): %d", (int)sizeof(rd.scissor));
-	INFO_LOG(G3D, "sizeof(blendColor): %d", (int)sizeof(rd.blendColor));
-	INFO_LOG(G3D, "sizeof(push): %d", (int)sizeof(rd.push));
+	INFO_LOG(Log::G3D, "sizeof(pipeline): %d", (int)sizeof(rd.pipeline));
+	INFO_LOG(Log::G3D, "sizeof(draw): %d", (int)sizeof(rd.draw));
+	INFO_LOG(Log::G3D, "sizeof(drawidx): %d", (int)sizeof(rd.drawIndexed));
+	INFO_LOG(Log::G3D, "sizeof(clear): %d", (int)sizeof(rd.clear));
+	INFO_LOG(Log::G3D, "sizeof(viewport): %d", (int)sizeof(rd.viewport));
+	INFO_LOG(Log::G3D, "sizeof(scissor): %d", (int)sizeof(rd.scissor));
+	INFO_LOG(Log::G3D, "sizeof(blendColor): %d", (int)sizeof(rd.blendColor));
+	INFO_LOG(Log::G3D, "sizeof(push): %d", (int)sizeof(rd.push));
 #endif
 }
 
-void VulkanQueueRunner::ResizeReadbackBuffer(VkDeviceSize requiredSize) {
-	if (readbackBuffer_ && requiredSize <= readbackBufferSize_) {
-		return;
-	}
-	if (readbackMemory_) {
-		vulkan_->Delete().QueueDeleteDeviceMemory(readbackMemory_);
-	}
-	if (readbackBuffer_) {
-		vulkan_->Delete().QueueDeleteBuffer(readbackBuffer_);
+void VulkanQueueRunner::DestroyDeviceObjects() {
+	DEBUG_LOG(Log::G3D, "VulkanQueueRunner::DestroyDeviceObjects");
+
+	syncReadback_.Destroy(vulkan_);
+
+	renderPasses_.IterateMut([&](const RPKey &rpkey, VKRRenderPass *rp) {
+		_dbg_assert_(rp);
+		rp->Destroy(vulkan_);
+		delete rp;
+	});
+	renderPasses_.Clear();
+}
+
+VkFramebuffer VulkanQueueRunner::CreateBackbufferFramebuffer(VkImageView colorView, VkImageView depthView, int width, int height) {
+	VkImageView attachments[2] = { colorView, depthView };
+
+	VkFramebufferCreateInfo fb_info = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+	fb_info.renderPass = GetCompatibleRenderPass()->Get(vulkan_, RenderPassType::BACKBUFFER, VK_SAMPLE_COUNT_1_BIT);
+	fb_info.attachmentCount = 2;
+	fb_info.pAttachments = attachments;
+	fb_info.width = width;
+	fb_info.height = height;
+	fb_info.layers = 1;
+
+	VkFramebuffer framebuffer = VK_NULL_HANDLE;
+	VkResult res = vkCreateFramebuffer(vulkan_->GetDevice(), &fb_info, nullptr, &framebuffer);
+	_dbg_assert_(res == VK_SUCCESS);
+	return res == VK_SUCCESS ? framebuffer : VK_NULL_HANDLE;
+}
+
+bool VulkanQueueRunner::InitBackbufferFramebuffers(int width, int height, FrameDataShared &frameDataShared) {
+	// We share the same depth buffer but have multiple color buffers.
+	framebuffers_.resize(frameDataShared.swapchainImageCount_);
+
+	for (uint32_t i = 0; i < frameDataShared.swapchainImageCount_; i++) {
+		framebuffers_[i] = CreateBackbufferFramebuffer(frameDataShared.swapchainImages_[i].view, depth_.view, width, height);
+		if (framebuffers_[i] == VK_NULL_HANDLE) {
+			framebuffers_.clear();
+			return false;
+		}
 	}
 
-	readbackBufferSize_ = requiredSize;
+	return true;
+}
+
+bool VulkanQueueRunner::InitDepthStencilBuffer(VkCommandBuffer cmd, VulkanBarrierBatch *barriers) {
+	depth_.format = vulkan_->GetDeviceInfo().preferredDepthStencilFormat;
+	return CreateDepthStencilImage(vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight(), vulkan_->GetBackbufferLayers(), &depth_.image, &depth_.alloc, &depth_.view, barriers, "BackbufferDepth");
+}
+
+bool VulkanQueueRunner::CreateDepthStencilImage(int width, int height, int layers, VkImage *image, VmaAllocation *alloc, VkImageView *view, VulkanBarrierBatch *barriers, const char *tag) {
+	const VkFormat depth_format = vulkan_->GetDeviceInfo().preferredDepthStencilFormat;
+	int aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+	VkImageCreateInfo image_info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+	image_info.imageType = VK_IMAGE_TYPE_2D;
+	image_info.format = depth_format;
+	image_info.extent.width = width;
+	image_info.extent.height = height;
+	image_info.extent.depth = 1;
+	image_info.mipLevels = 1;
+	image_info.arrayLayers = layers;
+	image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+	image_info.queueFamilyIndexCount = 0;
+	image_info.pQueueFamilyIndices = nullptr;
+	image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+	image_info.flags = 0;
+
+	VmaAllocationCreateInfo allocCreateInfo{};
+	VmaAllocationInfo allocInfo{};
+
+	allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+	VkResult res = vmaCreateImage(vulkan_->Allocator(), &image_info, &allocCreateInfo, image, alloc, &allocInfo);
+	_dbg_assert_(res == VK_SUCCESS);
+	if (res != VK_SUCCESS)
+		return false;
+
+	vulkan_->SetDebugName(*image, VK_OBJECT_TYPE_IMAGE, tag);
+
+	VkImageMemoryBarrier *barrier = barriers->Add(*image,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, 0);
+	barrier->subresourceRange.aspectMask = aspectMask;
+	barrier->subresourceRange.layerCount = layers;
+	barrier->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier->newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	barrier->srcAccessMask = 0;
+	barrier->dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	_dbg_assert_(depth_format != VK_FORMAT_UNDEFINED);
+
+	VkImageViewCreateInfo depth_view_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+	depth_view_info.image = *image;
+	depth_view_info.format = depth_format;
+	depth_view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+	depth_view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+	depth_view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+	depth_view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+	depth_view_info.subresourceRange.aspectMask = aspectMask;
+	depth_view_info.subresourceRange.baseMipLevel = 0;
+	depth_view_info.subresourceRange.levelCount = 1;
+	depth_view_info.subresourceRange.baseArrayLayer = 0;
+	depth_view_info.subresourceRange.layerCount = layers;
+	depth_view_info.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+	depth_view_info.flags = 0;
 
 	VkDevice device = vulkan_->GetDevice();
 
-	VkBufferCreateInfo buf{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-	buf.size = readbackBufferSize_;
-	buf.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	res = vkCreateImageView(device, &depth_view_info, NULL, view);
+	vulkan_->SetDebugName(*view, VK_OBJECT_TYPE_IMAGE_VIEW, tag);
+	_dbg_assert_(res == VK_SUCCESS);
+	if (res != VK_SUCCESS)
+		return false;
 
-	VkResult res = vkCreateBuffer(device, &buf, nullptr, &readbackBuffer_);
-	_assert_(res == VK_SUCCESS);
-
-	VkMemoryRequirements reqs{};
-	vkGetBufferMemoryRequirements(device, readbackBuffer_, &reqs);
-
-	VkMemoryAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-	allocInfo.allocationSize = reqs.size;
-
-	// For speedy readbacks, we want the CPU cache to be enabled. However on most hardware we then have to
-	// sacrifice coherency, which means manual flushing. But try to find such memory first! If no cached
-	// memory type is available we fall back to just coherent.
-	const VkFlags desiredTypes[] = {
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-	};
-	VkFlags successTypeReqs = 0;
-	for (VkFlags typeReqs : desiredTypes) {
-		if (vulkan_->MemoryTypeFromProperties(reqs.memoryTypeBits, typeReqs, &allocInfo.memoryTypeIndex)) {
-			successTypeReqs = typeReqs;
-			break;
-		}
-	}
-	_assert_(successTypeReqs != 0);
-	readbackBufferIsCoherent_ = (successTypeReqs & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-
-	res = vkAllocateMemory(device, &allocInfo, nullptr, &readbackMemory_);
-	if (res != VK_SUCCESS) {
-		readbackMemory_ = VK_NULL_HANDLE;
-		vkDestroyBuffer(device, readbackBuffer_, nullptr);
-		readbackBuffer_ = VK_NULL_HANDLE;
-		return;
-	}
-	uint32_t offset = 0;
-	vkBindBufferMemory(device, readbackBuffer_, readbackMemory_, offset);
+	return true;
 }
 
-void VulkanQueueRunner::DestroyDeviceObjects() {
-	INFO_LOG(G3D, "VulkanQueueRunner::DestroyDeviceObjects");
-	if (readbackMemory_) {
-		vulkan_->Delete().QueueDeleteDeviceMemory(readbackMemory_);
+void VulkanQueueRunner::DestroyBackBuffers() {
+	if (depth_.view) {
+		vulkan_->Delete().QueueDeleteImageView(depth_.view);
 	}
-	if (readbackBuffer_) {
-		vulkan_->Delete().QueueDeleteBuffer(readbackBuffer_);
+	if (depth_.image) {
+		_dbg_assert_(depth_.alloc);
+		vulkan_->Delete().QueueDeleteImageAllocation(depth_.image, depth_.alloc);
 	}
-	readbackBufferSize_ = 0;
+	depth_ = {};
+	for (uint32_t i = 0; i < framebuffers_.size(); i++) {
+		_dbg_assert_(framebuffers_[i] != VK_NULL_HANDLE);
+		vulkan_->Delete().QueueDeleteFramebuffer(framebuffers_[i]);
+	}
+	framebuffers_.clear();
 
-	renderPasses_.Iterate([&](const RPKey &rpkey, VkRenderPass rp) {
-		_assert_(rp != VK_NULL_HANDLE);
-		vulkan_->Delete().QueueDeleteRenderPass(rp);
-	});
-	renderPasses_.Clear();
-
-	_assert_(backbufferRenderPass_ != VK_NULL_HANDLE);
-	vulkan_->Delete().QueueDeleteRenderPass(backbufferRenderPass_);
-	backbufferRenderPass_ = VK_NULL_HANDLE;
+	INFO_LOG(Log::G3D, "Backbuffers destroyed");
 }
 
-void VulkanQueueRunner::InitBackbufferRenderPass() {
-	VkAttachmentDescription attachments[2];
-	attachments[0].format = vulkan_->GetSwapchainFormat();
-	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // We don't want to preserve the backbuffer between frames so we really don't care.
-	attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;  // We only render once to the backbuffer per frame so we can do this here.
-	attachments[0].flags = 0;
+// Self-dependency: https://github.com/gpuweb/gpuweb/issues/442#issuecomment-547604827
+// Also see https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/vkspec.html#synchronization-pipeline-barriers-subpass-self-dependencies
+VKRRenderPass *VulkanQueueRunner::GetRenderPass(const RPKey &key) {
+	// Called from the main thread (EndCurRenderStep, CreateGraphicsPipeline) and from the render thread
+	// (PerformBindFramebufferAsRenderTarget). The render thread really does insert new keys, not just hit
+	// existing ones - PreprocessSteps rewrites the load actions to CLEAR when it merges a clear-only pass
+	// into a later one, after the main thread already looked up the pre-merge key. Insert() can Grow(),
+	// which reallocates the buckets out from under a concurrent Get().
+	std::lock_guard<std::mutex> lock(renderPassesMutex_);
 
-	attachments[1].format = vulkan_->GetDeviceInfo().preferredDepthStencilFormat;  // must use this same format later for the back depth buffer.
-	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-	attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;  // Don't care about storing backbuffer Z - we clear it anyway.
-	attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	attachments[1].flags = 0;
-
-	VkAttachmentReference color_reference{};
-	color_reference.attachment = 0;
-	color_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-	VkAttachmentReference depth_reference{};
-	depth_reference.attachment = 1;
-	depth_reference.layout = attachments[1].finalLayout;
-
-	VkSubpassDescription subpass{};
-	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.flags = 0;
-	subpass.inputAttachmentCount = 0;
-	subpass.pInputAttachments = nullptr;
-	subpass.colorAttachmentCount = 1;
-	subpass.pColorAttachments = &color_reference;
-	subpass.pResolveAttachments = nullptr;
-	subpass.pDepthStencilAttachment = &depth_reference;
-	subpass.preserveAttachmentCount = 0;
-	subpass.pPreserveAttachments = nullptr;
-
-	// For the built-in layout transitions.
-	VkSubpassDependency dep{};
-	dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-	dep.dstSubpass = 0;
-	dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dep.srcAccessMask = 0;
-	dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-	VkRenderPassCreateInfo rp_info{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-	rp_info.attachmentCount = 2;
-	rp_info.pAttachments = attachments;
-	rp_info.subpassCount = 1;
-	rp_info.pSubpasses = &subpass;
-	rp_info.dependencyCount = 1;
-	rp_info.pDependencies = &dep;
-
-	VkResult res = vkCreateRenderPass(vulkan_->GetDevice(), &rp_info, nullptr, &backbufferRenderPass_);
-	_assert_(res == VK_SUCCESS);
-}
-
-VkRenderPass VulkanQueueRunner::GetRenderPass(const RPKey &key) {
-	auto pass = renderPasses_.Get(key);
-	if (pass) {
-		return pass;
+	VKRRenderPass *foundPass;
+	if (renderPasses_.Get(key, &foundPass)) {
+		return foundPass;
 	}
 
-	VkAttachmentDescription attachments[2] = {};
-	attachments[0].format = VK_FORMAT_R8G8B8A8_UNORM;
-	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-	switch (key.colorLoadAction) {
-	case VKRRenderPassAction::CLEAR:
-		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-		break;
-	case VKRRenderPassAction::KEEP:
-		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-		break;
-	case VKRRenderPassAction::DONT_CARE:
-	default:
-		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		break;
-	}
-	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	attachments[0].flags = 0;
-
-	attachments[1].format = vulkan_->GetDeviceInfo().preferredDepthStencilFormat;
-	attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-	switch (key.depthLoadAction) {
-	case VKRRenderPassAction::CLEAR:
-		attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-		break;
-	case VKRRenderPassAction::KEEP:
-		attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-		break;
-	case VKRRenderPassAction::DONT_CARE:
-		attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		break;
-	}
-	switch (key.stencilLoadAction) {
-	case VKRRenderPassAction::CLEAR:
-		attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-		break;
-	case VKRRenderPassAction::KEEP:
-		attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-		break;
-	case VKRRenderPassAction::DONT_CARE:
-		attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		break;
-	}
-	attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-	attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-	attachments[1].flags = 0;
-
-	VkAttachmentReference color_reference{};
-	color_reference.attachment = 0;
-	color_reference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-	VkAttachmentReference depth_reference{};
-	depth_reference.attachment = 1;
-	depth_reference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-	VkSubpassDescription subpass{};
-	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.flags = 0;
-	subpass.inputAttachmentCount = 0;
-	subpass.pInputAttachments = nullptr;
-	subpass.colorAttachmentCount = 1;
-	subpass.pColorAttachments = &color_reference;
-	subpass.pResolveAttachments = nullptr;
-	subpass.pDepthStencilAttachment = &depth_reference;
-	subpass.preserveAttachmentCount = 0;
-	subpass.pPreserveAttachments = nullptr;
-
-	VkRenderPassCreateInfo rp{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-	rp.attachmentCount = 2;
-	rp.pAttachments = attachments;
-	rp.subpassCount = 1;
-	rp.pSubpasses = &subpass;
-
-	VkResult res = vkCreateRenderPass(vulkan_->GetDevice(), &rp, nullptr, &pass);
-	_assert_(res == VK_SUCCESS);
-	_assert_(pass != VK_NULL_HANDLE);
+	VKRRenderPass *pass = new VKRRenderPass(key);
 	renderPasses_.Insert(key, pass);
+	// Safe to hand out the pointer once the lock is dropped - entries are never erased individually,
+	// only all at once in DestroyDeviceObjects.
 	return pass;
 }
 
@@ -282,55 +231,68 @@ void VulkanQueueRunner::PreprocessSteps(std::vector<VKRStep *> &steps) {
 	// Optimizes renderpasses, then sequences them.
 	// Planned optimizations: 
 	//  * Create copies of render target that are rendered to multiple times and textured from in sequence, and push those render passes
-	//    as early as possible in the frame (Wipeout billboards).
+	//    as early as possible in the frame (Wipeout billboards). This will require taking over more of descriptor management so we can
+	//    substitute descriptors, alternatively using texture array layers creatively.
+
+	// Before passes get merged, so it sees them as the game drew them.
+	if (IsVREnabled()) {
+		for (VKRStep *step : steps) {
+			PreprocessVulkanStepVR(step);
+		}
+	}
 
 	for (int j = 0; j < (int)steps.size(); j++) {
+		decltype(steps[j]->render) &render = steps[j]->render;
 		if (steps[j]->stepType == VKRStepType::RENDER &&
-			steps[j]->render.framebuffer) {
-			if (steps[j]->render.finalColorLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
-				steps[j]->render.finalColorLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			render.framebuffer) {
+			if (render.finalColorLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+				render.finalColorLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 			}
-			if (steps[j]->render.finalDepthStencilLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
-				steps[j]->render.finalDepthStencilLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+			if (render.finalDepthStencilLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+				render.finalDepthStencilLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 			}
 		}
 	}
 
 	for (int j = 0; j < (int)steps.size() - 1; j++) {
 		// Push down empty "Clear/Store" renderpasses, and merge them with the first "Load/Store" to the same framebuffer.
+		decltype(steps[j]->render) &render_j = steps[j]->render;
 		if (steps.size() > 1 && steps[j]->stepType == VKRStepType::RENDER &&
-			steps[j]->render.numDraws == 0 &&
-			steps[j]->render.numReads == 0 &&
-			steps[j]->render.color == VKRRenderPassAction::CLEAR &&
-			steps[j]->render.stencil == VKRRenderPassAction::CLEAR &&
-			steps[j]->render.depth == VKRRenderPassAction::CLEAR) {
+			render_j.numDraws == 0 &&
+			render_j.numReads == 0 &&
+			render_j.colorLoad == VKRRenderPassLoadAction::CLEAR &&
+			render_j.stencilLoad == VKRRenderPassLoadAction::CLEAR &&
+			render_j.depthLoad == VKRRenderPassLoadAction::CLEAR) {
 
 			// Drop the clear step, and merge it into the next step that touches the same framebuffer.
 			for (int i = j + 1; i < (int)steps.size(); i++) {
+				decltype(steps[i]->render) &render_i = steps[i]->render;
 				if (steps[i]->stepType == VKRStepType::RENDER &&
-					steps[i]->render.framebuffer == steps[j]->render.framebuffer) {
-					if (steps[i]->render.color != VKRRenderPassAction::CLEAR) {
-						steps[i]->render.color = VKRRenderPassAction::CLEAR;
-						steps[i]->render.clearColor = steps[j]->render.clearColor;
+					render_i.framebuffer == render_j.framebuffer) {
+					if (render_i.colorLoad != VKRRenderPassLoadAction::CLEAR) {
+						render_i.colorLoad = VKRRenderPassLoadAction::CLEAR;
+						render_i.clearColor = render_j.clearColor;
 					}
-					if (steps[i]->render.depth != VKRRenderPassAction::CLEAR) {
-						steps[i]->render.depth = VKRRenderPassAction::CLEAR;
-						steps[i]->render.clearDepth = steps[j]->render.clearDepth;
+					if (render_i.depthLoad != VKRRenderPassLoadAction::CLEAR) {
+						render_i.depthLoad = VKRRenderPassLoadAction::CLEAR;
+						render_i.clearDepth = render_j.clearDepth;
 					}
-					if (steps[i]->render.stencil != VKRRenderPassAction::CLEAR) {
-						steps[i]->render.stencil = VKRRenderPassAction::CLEAR;
-						steps[i]->render.clearStencil = steps[j]->render.clearStencil;
+					if (render_i.stencilLoad != VKRRenderPassLoadAction::CLEAR) {
+						render_i.stencilLoad = VKRRenderPassLoadAction::CLEAR;
+						render_i.clearStencil = render_j.clearStencil;
 					}
-					MergeRenderAreaRectInto(&steps[i]->render.renderArea, steps[j]->render.renderArea);
-
+					MergeRenderAreaRectInto(&render_i.renderArea, render_j.renderArea);
+					render_i.renderPassType = MergeRPTypes(render_i.renderPassType, render_j.renderPassType);
+					render_i.numDraws += render_j.numDraws;
+					render_i.numReads += render_j.numReads;
 					// Cheaply skip the first step.
 					steps[j]->stepType = VKRStepType::RENDER_SKIP;
 					break;
-				} else if (steps[i]->stepType == VKRStepType::COPY &&
-					steps[i]->copy.src == steps[j]->render.framebuffer) {
-					// Can't eliminate the clear if a game copies from it before it's
-					// rendered to. However this should be rare.
-					// TODO: This should never happen when we check numReads now.
+				} else if ((steps[i]->stepType == VKRStepType::COPY && (steps[i]->copy.src == render_j.framebuffer || steps[i]->copy.dst == render_j.framebuffer)) ||
+					(steps[i]->stepType == VKRStepType::BLIT && (steps[i]->blit.src == render_j.framebuffer || steps[i]->blit.dst == render_j.framebuffer)) ||
+					(steps[i]->stepType == VKRStepType::READBACK && steps[i]->readback.src == render_j.framebuffer)) {
+					// Can't move the clear past a copy or blit from or into the framebuffer. Into it is common:
+					// resizing a framebuffer clears the new one and copies the old contents in (Asphalt Urban GT 2).
 					break;
 				}
 			}
@@ -340,11 +302,14 @@ void VulkanQueueRunner::PreprocessSteps(std::vector<VKRStep *> &steps) {
 	// Queue hacks.
 	if (hacksEnabled_) {
 		if (hacksEnabled_ & QUEUE_HACK_MGS2_ACID) {
-			// Massive speedup.
+			// Massive speedup due to re-ordering.
 			ApplyMGSHack(steps);
 		}
 		if (hacksEnabled_ & QUEUE_HACK_SONIC) {
 			ApplySonicHack(steps);
+		}
+		if (hacksEnabled_ & QUEUE_HACK_TILED_DEPAL) {
+			ApplyTiledDepalHack(steps);
 		}
 		if (hacksEnabled_ & QUEUE_HACK_RENDERPASS_MERGE) {
 			ApplyRenderPassMerge(steps);
@@ -352,24 +317,88 @@ void VulkanQueueRunner::PreprocessSteps(std::vector<VKRStep *> &steps) {
 	}
 }
 
-void VulkanQueueRunner::RunSteps(VkCommandBuffer cmd, std::vector<VKRStep *> &steps, QueueProfileContext *profile) {
+void VulkanQueueRunner::RunSteps(std::vector<VKRStep *> &steps, int curFrame, FrameData &frameData, FrameDataShared &frameDataShared, bool keepSteps) {
+	QueueProfileContext *profile = frameData.profile.enabled ? &frameData.profile : nullptr;
+
 	if (profile)
 		profile->cpuStartTime = time_now_d();
 
 	bool emitLabels = vulkan_->Extensions().EXT_debug_utils;
+
+	VkCommandBuffer cmd = frameData.hasPresentCommands ? frameData.presentCmd : frameData.mainCmd;
+
 	for (size_t i = 0; i < steps.size(); i++) {
 		const VKRStep &step = *steps[i];
-
+		// A pass to a swapchain closes its label and opens another in presentCmd, if there's an image to render to.
+		bool labelOpen = emitLabels;
 		if (emitLabels) {
 			VkDebugUtilsLabelEXT labelInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
-			labelInfo.pLabelName = step.tag;
+			char temp[128];
+			if (step.stepType == VKRStepType::RENDER && step.render.framebuffer) {
+				snprintf(temp, sizeof(temp), "%s: %s", step.tag, step.render.framebuffer->Tag());
+				labelInfo.pLabelName = temp;
+			} else {
+				labelInfo.pLabelName = step.tag;
+			}
 			vkCmdBeginDebugUtilsLabelEXT(cmd, &labelInfo);
 		}
 
 		switch (step.stepType) {
 		case VKRStepType::RENDER:
-			PerformRenderPass(step, cmd);
+		{
+			bool perform = true;
+			if (!step.render.framebuffer) {
+				if (emitLabels) {
+					vkCmdEndDebugUtilsLabelEXT(cmd);
+					labelOpen = false;
+				}
+				// The first pass to a swapchain moves us over to presentCmd.
+				if (!frameData.hasPresentCommands) {
+					frameData.Submit(vulkan_, FrameSubmitType::Pending, frameDataShared);
+				}
+
+				// If the window is minimized and we don't have a swap chain, don't bother.
+				if (step.render.swapchain || frameDataShared.swapchainImageCount_ > 0) {
+					if (step.render.swapchain) {
+						perform = frameData.AcquireExtraSwapchain(vulkan_, step.render.swapchain);
+					} else if (!frameData.hasAcquired) {
+						// When stepping in the GE debugger, we can end up here multiple times in a "frame".
+						// So only acquire once.
+						frameData.AcquireNextImage(vulkan_);
+						if (frameData.hasAcquired && frameData.curSwapchainImage != (uint32_t)-1) {
+							SetBackbuffer(framebuffers_[frameData.curSwapchainImage], frameDataShared.swapchainImages_[frameData.curSwapchainImage].image);
+						} else {
+							perform = false;
+						}
+					}
+
+					if (!frameData.hasPresentCommands) {
+						// A RENDER step rendering to the backbuffer is normally the last step that happens in a frame,
+						// unless taking a screenshot, in which case there might be a READBACK_IMAGE after it.
+						// This is why we have to switch cmd to presentCmd, in this case.
+						VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+						begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+						vkBeginCommandBuffer(frameData.presentCmd, &begin);
+						frameData.hasPresentCommands = true;
+					}
+					cmd = frameData.presentCmd;
+					if (emitLabels) {
+						VkDebugUtilsLabelEXT labelInfo{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+						labelInfo.pLabelName = "present";
+						vkCmdBeginDebugUtilsLabelEXT(cmd, &labelInfo);
+						labelOpen = true;
+					}
+				} else {
+					perform = false;
+				}
+			}
+			if (perform) {
+				PerformRenderPass(step, cmd, curFrame, frameData.profile);
+			} else if (!step.render.swapchain) {
+				frameData.skipSwap = true;
+			}
 			break;
+		}
 		case VKRStepType::COPY:
 			PerformCopy(step, cmd);
 			break;
@@ -377,29 +406,35 @@ void VulkanQueueRunner::RunSteps(VkCommandBuffer cmd, std::vector<VKRStep *> &st
 			PerformBlit(step, cmd);
 			break;
 		case VKRStepType::READBACK:
-			PerformReadback(step, cmd);
+			PerformReadback(step, cmd, frameData);
 			break;
 		case VKRStepType::READBACK_IMAGE:
 			PerformReadbackImage(step, cmd);
 			break;
 		case VKRStepType::RENDER_SKIP:
 			break;
+		default:
+			UNREACHABLE();
+			break;
 		}
 
-		if (profile && profile->timestampDescriptions.size() + 1 < MAX_TIMESTAMP_QUERIES) {
+		if (profile && profile->timestampsEnabled && profile->timestampDescriptions.size() + 1 < MAX_TIMESTAMP_QUERIES) {
 			vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile->queryPool, (uint32_t)profile->timestampDescriptions.size());
-			profile->timestampDescriptions.push_back(StepToString(step));
+			profile->timestampDescriptions.push_back(StepToString(vulkan_, step));
 		}
 
-		if (emitLabels) {
+		if (labelOpen) {
 			vkCmdEndDebugUtilsLabelEXT(cmd);
 		}
 	}
 
 	// Deleting all in one go should be easier on the instruction cache than deleting
 	// them as we go - and easier to debug because we can look backwards in the frame.
-	for (size_t i = 0; i < steps.size(); i++) {
-		delete steps[i];
+	if (!keepSteps) {
+		for (auto step : steps) {
+			delete step;
+		}
+		steps.clear();
 	}
 
 	if (profile)
@@ -411,23 +446,27 @@ void VulkanQueueRunner::ApplyMGSHack(std::vector<VKRStep *> &steps) {
 
 	// We want to turn a sequence of copy,render(1),copy,render(1),copy,render(1) to copy,copy,copy,render(n).
 
+	// TODO: Where does this first part trigger? The below depal part triggers reliably in Acid2.
+
 	for (int i = 0; i < (int)steps.size() - 3; i++) {
 		int last = -1;
+		const decltype(steps[i + 1]->render) &render_i_plus_1 = steps[i + 1]->render;
 		if (!(steps[i]->stepType == VKRStepType::COPY &&
 			steps[i + 1]->stepType == VKRStepType::RENDER &&
 			steps[i + 2]->stepType == VKRStepType::COPY &&
-			steps[i + 1]->render.numDraws == 1 &&
+			render_i_plus_1.numDraws == 1 &&
 			steps[i]->copy.dst == steps[i + 2]->copy.dst))
 			continue;
 		// Looks promising! Let's start by finding the last one.
 		for (int j = i; j < (int)steps.size(); j++) {
+			const decltype(steps[j]->render) &render_j = steps[j]->render;
 			switch (steps[j]->stepType) {
 			case VKRStepType::RENDER:
-				if (steps[j]->render.numDraws > 1)
+				if (render_j.numDraws > 1)
 					last = j - 1;
 				// should really also check descriptor sets...
 				if (steps[j]->commands.size()) {
-					VkRenderData &cmd = steps[j]->commands.back();
+					const VkRenderData &cmd = steps[j]->commands.back();
 					if (cmd.cmd == VKRRenderCommand::DRAW_INDEXED && cmd.draw.count != 6)
 						last = j - 1;
 				}
@@ -460,19 +499,27 @@ void VulkanQueueRunner::ApplyMGSHack(std::vector<VKRStep *> &steps) {
 			for (int j = 0; j < (int)copies.size(); j++) {
 				steps[i + j] = copies[j];
 			}
+
+			const int firstRender = i + (int)copies.size();
+
 			// Write the renders back (so they will be deleted properly).
 			for (int j = 0; j < (int)renders.size(); j++) {
-				steps[i + j + copies.size()] = renders[j];
+				steps[firstRender + j] = renders[j];
 			}
-			_assert_(steps[i + copies.size()]->stepType == VKRStepType::RENDER);
+			_assert_(steps[firstRender]->stepType == VKRStepType::RENDER);
 			// Combine the renders.
 			for (int j = 1; j < (int)renders.size(); j++) {
+				steps[firstRender]->commands.reserve(renders[j]->commands.size());
 				for (int k = 0; k < (int)renders[j]->commands.size(); k++) {
-					steps[i + copies.size()]->commands.push_back(renders[j]->commands[k]);
+					steps[firstRender]->commands.push_back(renders[j]->commands[k]);
 				}
-				steps[i + copies.size() + j]->stepType = VKRStepType::RENDER_SKIP;
+				MergeRenderAreaRectInto(&steps[firstRender]->render.renderArea, renders[j]->render.renderArea);
+				// Easier than removing them from the list, though that might be the better option.
+				steps[firstRender + j]->stepType = VKRStepType::RENDER_SKIP;
+				steps[firstRender + j]->commands.clear();
 			}
 			// We're done.
+			// INFO_LOG(Log::G3D, "MGS HACK part 1: copies: %d  renders: %d", (int)copies.size(), (int)renders.size());
 			break;
 		}
 	}
@@ -481,36 +528,45 @@ void VulkanQueueRunner::ApplyMGSHack(std::vector<VKRStep *> &steps) {
 	// of the game.
 	for (int i = 0; i < (int)steps.size() - 3; i++) {
 		int last = -1;
+		const decltype(steps[i]->render) &render_i = steps[i]->render;
+		const decltype(steps[i + 1]->render) &render_i_plus_1 = steps[i + 1]->render;
+		const decltype(steps[i + 2]->render) &render_i_plus_2 = steps[i + 2]->render;
 		if (!(steps[i]->stepType == VKRStepType::RENDER &&
 			steps[i + 1]->stepType == VKRStepType::RENDER &&
 			steps[i + 2]->stepType == VKRStepType::RENDER &&
-			steps[i]->render.numDraws == 1 &&
-			steps[i + 1]->render.numDraws == 1 &&
-			steps[i + 2]->render.numDraws == 1 &&
-			steps[i]->render.color == VKRRenderPassAction::DONT_CARE &&
-			steps[i + 1]->render.color == VKRRenderPassAction::KEEP &&
-			steps[i + 2]->render.color == VKRRenderPassAction::DONT_CARE))
+			render_i.numDraws == 1 &&
+			render_i_plus_1.numDraws == 1 &&
+			render_i_plus_2.numDraws == 1 &&
+			render_i.colorLoad == VKRRenderPassLoadAction::DONT_CARE &&
+			render_i_plus_1.colorLoad == VKRRenderPassLoadAction::KEEP &&
+			render_i_plus_2.colorLoad == VKRRenderPassLoadAction::DONT_CARE)) {
 			continue;
-		VKRFramebuffer *depalFramebuffer = steps[i]->render.framebuffer;
-		VKRFramebuffer *targetFramebuffer = steps[i + 1]->render.framebuffer;
+		}
+		VKRFramebuffer *depalFramebuffer = render_i.framebuffer;
+		VKRFramebuffer *targetFramebuffer = render_i_plus_1.framebuffer;
 		// OK, found the start of a post-process sequence. Let's scan until we find the end.
 		for (int j = i; j < (int)steps.size() - 3; j++) {
+			const decltype(steps[j]->render) &render_j = steps[j]->render;
 			if (((j - i) & 1) == 0) {
 				// This should be a depal draw.
-				if (steps[j]->render.numDraws != 1)
+				if (render_j.numDraws != 1)
 					break;
-				if (steps[j]->render.color != VKRRenderPassAction::DONT_CARE)
+				if (steps[j]->commands.size() > 5)
 					break;
-				if (steps[j]->render.framebuffer != depalFramebuffer)
+				if (render_j.colorLoad != VKRRenderPassLoadAction::DONT_CARE)
+					break;
+				if (render_j.framebuffer != depalFramebuffer)
 					break;
 				last = j;
 			} else {
 				// This should be a target draw.
-				if (steps[j]->render.numDraws != 1)
+				if (render_j.numDraws != 1)
 					break;
-				if (steps[j]->render.color != VKRRenderPassAction::KEEP)
+				if (steps[j]->commands.size() > 5)
 					break;
-				if (steps[j]->render.framebuffer != targetFramebuffer)
+				if (render_j.colorLoad != VKRRenderPassLoadAction::KEEP)
+					break;
+				if (render_j.framebuffer != targetFramebuffer)
 					break;
 				last = j;
 			}
@@ -519,23 +575,71 @@ void VulkanQueueRunner::ApplyMGSHack(std::vector<VKRStep *> &steps) {
 		if (last == -1)
 			continue;
 
-		// Combine the depal renders.
+		if (last > 479) {
+			// Avoid some problems with the hack (oil slick crash). Some additional commands get added there that
+			// confuses this merging. NOTE: This is not really a solution! See #20306.
+			last = 479;
+		}
+
+		int minScissorX = 10000;
+		int minScissorY = 10000;
+		int maxScissorX = 0;
+		int maxScissorY = 0;
+
+		// Combine the depal renders. Also record scissor bounds.
 		for (int j = i + 2; j <= last + 1; j += 2) {
+			const decltype(steps[j]->render) &render_j = steps[j]->render;
 			for (int k = 0; k < (int)steps[j]->commands.size(); k++) {
 				switch (steps[j]->commands[k].cmd) {
 				case VKRRenderCommand::DRAW:
 				case VKRRenderCommand::DRAW_INDEXED:
 					steps[i]->commands.push_back(steps[j]->commands[k]);
 					break;
+				case VKRRenderCommand::SCISSOR:
+				{
+					// TODO: Merge scissor rectangles.
+					const auto &rc = steps[j]->commands[k].scissor.scissor;
+					if (rc.offset.x < minScissorX) {
+						minScissorX = rc.offset.x;
+					}
+					if (rc.offset.y < minScissorY) {
+						minScissorY = rc.offset.y;
+					}
+					if (rc.offset.x + (int)rc.extent.width > maxScissorX) {
+						maxScissorX = rc.offset.x + rc.extent.width;
+					}
+					if (rc.offset.y + (int)rc.extent.height > maxScissorY) {
+						maxScissorY = rc.offset.y + rc.extent.height;
+					}
+					break;
+				}
 				default:
 					break;
 				}
 			}
+			MergeRenderAreaRectInto(&steps[i]->render.renderArea, render_j.renderArea);
 			steps[j]->stepType = VKRStepType::RENDER_SKIP;
+		}
+
+		// Update the scissor in the first draw.
+		minScissorX = std::max(0, minScissorX);
+		minScissorY = std::max(0, minScissorY);
+		if (maxScissorX > minScissorX && maxScissorY > minScissorY) {
+			for (int k = 0; k < steps[i]->commands.size(); k++) {
+				if (steps[i]->commands[k].cmd == VKRRenderCommand::SCISSOR) {
+					auto &rc = steps[i]->commands[k].scissor.scissor;
+					rc.offset.x = minScissorX;
+					rc.offset.y = minScissorY;
+					rc.extent.width = maxScissorX - minScissorX;
+					rc.extent.height = maxScissorY - minScissorY;
+					break;
+				}
+			}
 		}
 
 		// Combine the target renders.
 		for (int j = i + 3; j <= last; j += 2) {
+			const decltype(steps[j]->render) &render_j = steps[j]->render;
 			for (int k = 0; k < (int)steps[j]->commands.size(); k++) {
 				switch (steps[j]->commands[k].cmd) {
 				case VKRRenderCommand::DRAW:
@@ -546,8 +650,11 @@ void VulkanQueueRunner::ApplyMGSHack(std::vector<VKRStep *> &steps) {
 					break;
 				}
 			}
+			MergeRenderAreaRectInto(&steps[i + 1]->render.renderArea, render_j.renderArea);
 			steps[j]->stepType = VKRStepType::RENDER_SKIP;
 		}
+
+		// INFO_LOG(Log::G3D, "MGS HACK part 2: %d-%d : %d (total steps: %d)", i, last, (last - i), (int)steps.size());
 
 		// We're done - we only expect one of these sequences per frame.
 		break;
@@ -560,35 +667,39 @@ void VulkanQueueRunner::ApplySonicHack(std::vector<VKRStep *> &steps) {
 
 	for (int i = 0; i < (int)steps.size() - 4; i++) {
 		int last = -1;
+		const decltype(steps[i]->render) &render_i = steps[i]->render;
+		const decltype(steps[i + 1]->render) &render_i_plus_1 = steps[i + 1]->render;
+		const decltype(steps[i + 2]->render) &render_i_plus_2 = steps[i + 2]->render;
+		const decltype(steps[i + 3]->render) &render_i_plus_3 = steps[i + 3]->render;
 		if (!(steps[i]->stepType == VKRStepType::RENDER &&
 			steps[i + 1]->stepType == VKRStepType::RENDER &&
 			steps[i + 2]->stepType == VKRStepType::RENDER &&
 			steps[i + 3]->stepType == VKRStepType::RENDER &&
-			steps[i]->render.numDraws == 3 &&
-			steps[i + 1]->render.numDraws == 1 &&
-			steps[i + 2]->render.numDraws == 6 &&
-			steps[i + 3]->render.numDraws == 1 &&
-			steps[i]->render.framebuffer == steps[i + 2]->render.framebuffer &&
-			steps[i + 1]->render.framebuffer == steps[i + 3]->render.framebuffer))
+			render_i.numDraws == 3 &&
+			render_i_plus_1.numDraws == 1 &&
+			render_i_plus_2.numDraws == 6 &&
+			render_i_plus_3.numDraws == 1 &&
+			render_i.framebuffer == render_i_plus_2.framebuffer &&
+			render_i_plus_1.framebuffer == render_i_plus_3.framebuffer))
 			continue;
 		// Looks promising! Let's start by finding the last one.
 		for (int j = i; j < (int)steps.size(); j++) {
-			switch (steps[j]->stepType) {
-			case VKRStepType::RENDER:
+			const decltype(steps[j]->render) &render_j = steps[j]->render;
+			if (steps[j]->stepType == VKRStepType::RENDER) {
 				if ((j - i) & 1) {
-					if (steps[j]->render.framebuffer != steps[i + 1]->render.framebuffer)
+					if (render_j.framebuffer != render_i_plus_1.framebuffer)
 						last = j - 1;
-					if (steps[j]->render.numDraws != 1)
+					if (render_j.numDraws != 1)
 						last = j - 1;
 				} else {
-					if (steps[j]->render.framebuffer != steps[i]->render.framebuffer)
+					if (render_j.framebuffer != render_i.framebuffer)
 						last = j - 1;
-					if (steps[j]->render.numDraws != 3 && steps[j]->render.numDraws != 6)
+					if (render_j.numDraws != 3 && render_j.numDraws != 6)
 						last = j - 1;
 				}
-				break;
-			default:
-				break;
+			} else {
+				// Not a render step, so break.
+				last = j - 1;
 			}
 			if (last != -1)
 				break;
@@ -627,11 +738,145 @@ void VulkanQueueRunner::ApplySonicHack(std::vector<VKRStep *> &steps) {
 				for (int k = 0; k < (int)type2[j]->commands.size(); k++) {
 					steps[i + type1.size()]->commands.push_back(type2[j]->commands[k]);
 				}
-				steps[i + j + type1.size()]->stepType = VKRStepType::RENDER_SKIP;
+				// Technically, should merge render area here, but they're all the same so not needed.
+				steps[i + type1.size() + j]->stepType = VKRStepType::RENDER_SKIP;
 			}
 			// We're done.
 			break;
 		}
+	}
+}
+
+static bool RectsOverlap(const VkRect2D &a, const VkRect2D &b) {
+	return a.offset.x < b.offset.x + (int)b.extent.width && b.offset.x < a.offset.x + (int)a.extent.width &&
+		a.offset.y < b.offset.y + (int)b.extent.height && b.offset.y < a.offset.y + (int)a.extent.height;
+}
+
+// Jackass: The Game color grades its framebuffer in place, a 32x64 tile at a time, one channel per pass:
+// each draw textures from the framebuffer it renders to, through a CLUT. That becomes a depal pass
+// into a temp framebuffer followed by a pass drawing it back, so 75 tiles make 450 render passes.
+//
+// Each pair reads and writes only its own tile, so pairs on different tiles can run in any order.
+// We sort the pairs into waves where no two tiles overlap (here, one per channel), and run each
+// wave as one depal pass and one draw pass. The tile comes from the depal pass's scissor. We can't
+// see where the second pass draws, so this assumes it's the same tile, which is why it's a compat hack.
+void VulkanQueueRunner::ApplyTiledDepalHack(std::vector<VKRStep *> &steps) {
+	auto isSingleDraw = [](const VKRStep *step, VKRRenderPassLoadAction colorLoad) {
+		return step->stepType == VKRStepType::RENDER && step->render.numDraws == 1 && step->render.colorLoad == colorLoad;
+	};
+	auto getScissor = [](const VKRStep *step, VkRect2D *rect) {
+		for (int k = 0; k < (int)step->commands.size(); k++) {
+			if (step->commands[k].cmd == VKRRenderCommand::SCISSOR) {
+				*rect = step->commands[k].scissor.scissor;
+				return true;
+			}
+		}
+		return false;
+	};
+	auto readsFramebuffer = [](const VKRStep *step, const VKRFramebuffer *fb) {
+		for (size_t k = 0; k < step->preTransitions.size(); k++) {
+			if (step->preTransitions[k].fb == fb) {
+				return true;
+			}
+		}
+		return false;
+	};
+	auto mergeInto = [](VKRStep *dest, VKRStep *src) {
+		for (int k = 0; k < (int)src->commands.size(); k++) {
+			dest->commands.push_back(src->commands[k]);
+		}
+		MergeRenderAreaRectInto(&dest->render.renderArea, src->render.renderArea);
+		dest->render.renderPassType = MergeRPTypes(dest->render.renderPassType, src->render.renderPassType);
+		dest->render.numDraws += src->render.numDraws;
+		dest->render.numReads += src->render.numReads;
+		src->stepType = VKRStepType::RENDER_SKIP;
+		src->commands.clear();
+	};
+
+	for (int i = 0; i + 3 < (int)steps.size(); i++) {
+		if (!isSingleDraw(steps[i], VKRRenderPassLoadAction::DONT_CARE) || !isSingleDraw(steps[i + 1], VKRRenderPassLoadAction::KEEP)) {
+			continue;
+		}
+		VKRFramebuffer *depalFramebuffer = steps[i]->render.framebuffer;
+		VKRFramebuffer *targetFramebuffer = steps[i + 1]->render.framebuffer;
+		if (!depalFramebuffer || !targetFramebuffer || depalFramebuffer == targetFramebuffer || !readsFramebuffer(steps[i], targetFramebuffer)) {
+			continue;
+		}
+
+		// Collect the pairs, and assign each one to the wave after the last earlier pair it overlaps.
+		std::vector<VkRect2D> tiles;
+		std::vector<int> waveOf;
+		int numWaves = 0;
+		for (int j = i; j + 1 < (int)steps.size(); j += 2) {
+			const VKRStep *depal = steps[j];
+			const VKRStep *target = steps[j + 1];
+			VkRect2D tile;
+			if (!isSingleDraw(depal, VKRRenderPassLoadAction::DONT_CARE) || depal->render.framebuffer != depalFramebuffer || !readsFramebuffer(depal, targetFramebuffer) ||
+				!isSingleDraw(target, VKRRenderPassLoadAction::KEEP) || target->render.framebuffer != targetFramebuffer ||
+				!getScissor(depal, &tile)) {
+				break;
+			}
+			int wave = 0;
+			for (int k = 0; k < (int)tiles.size(); k++) {
+				if (waveOf[k] >= wave && RectsOverlap(tiles[k], tile)) {
+					wave = waveOf[k] + 1;
+				}
+			}
+			tiles.push_back(tile);
+			waveOf.push_back(wave);
+			numWaves = std::max(numWaves, wave + 1);
+		}
+
+		const int numPairs = (int)tiles.size();
+		if (numWaves >= numPairs) {
+			// Nothing to gain.
+			continue;
+		}
+
+		// The first pair of each wave keeps its steps, and takes the commands of the rest.
+		const int end = i + numPairs * 2;
+		std::vector<VKRStep *> reordered;
+		reordered.reserve(numPairs * 2);
+		for (int w = 0; w < numWaves; w++) {
+			VKRStep *depal = nullptr;
+			VKRStep *target = nullptr;
+			for (int p = 0; p < numPairs; p++) {
+				if (waveOf[p] != w) {
+					continue;
+				}
+				VKRStep *pairDepal = steps[i + p * 2];
+				VKRStep *pairTarget = steps[i + p * 2 + 1];
+				if (!depal) {
+					depal = pairDepal;
+					target = pairTarget;
+					reordered.push_back(depal);
+					reordered.push_back(target);
+					continue;
+				}
+				mergeInto(depal, pairDepal);
+				mergeInto(target, pairTarget);
+			}
+		}
+
+		// Leave the images in the layouts the last pair left them in.
+		const VKRStep *lastDepal = steps[end - 2];
+		const VKRStep *lastTarget = steps[end - 1];
+		VKRStep *newLastDepal = reordered[reordered.size() - 2];
+		VKRStep *newLastTarget = reordered[reordered.size() - 1];
+		newLastDepal->render.finalColorLayout = lastDepal->render.finalColorLayout;
+		newLastDepal->render.finalDepthStencilLayout = lastDepal->render.finalDepthStencilLayout;
+		newLastTarget->render.finalColorLayout = lastTarget->render.finalColorLayout;
+		newLastTarget->render.finalDepthStencilLayout = lastTarget->render.finalDepthStencilLayout;
+
+		// Put the skipped steps after the waves, so each step is still in the list once and gets deleted.
+		for (int j = i; j < end; j++) {
+			if (steps[j]->stepType == VKRStepType::RENDER_SKIP) {
+				reordered.push_back(steps[j]);
+			}
+		}
+		_dbg_assert_((int)reordered.size() == numPairs * 2);
+		std::copy(reordered.begin(), reordered.end(), steps.begin() + i);
+		i = end - 1;
 	}
 }
 
@@ -645,26 +890,27 @@ const char *AspectToString(VkImageAspectFlags aspect) {
 	}
 }
 
-std::string VulkanQueueRunner::StepToString(const VKRStep &step) const {
+std::string VulkanQueueRunner::StepToString(VulkanContext *vulkan, const VKRStep &step) {
 	char buffer[256];
 	switch (step.stepType) {
 	case VKRStepType::RENDER:
 	{
-		int w = step.render.framebuffer ? step.render.framebuffer->width : vulkan_->GetBackbufferWidth();
-		int h = step.render.framebuffer ? step.render.framebuffer->height : vulkan_->GetBackbufferHeight();
+		int w = step.render.framebuffer ? step.render.framebuffer->width : (step.render.swapchain ? (int)step.render.swapchain->extent.width : vulkan->GetBackbufferWidth());
+		int h = step.render.framebuffer ? step.render.framebuffer->height : (step.render.swapchain ? (int)step.render.swapchain->extent.height : vulkan->GetBackbufferHeight());
 		int actual_w = step.render.renderArea.extent.width;
 		int actual_h = step.render.renderArea.extent.height;
-		snprintf(buffer, sizeof(buffer), "RENDER %s (draws: %d, %dx%d/%dx%d, fb: %p, )", step.tag, step.render.numDraws, actual_w, actual_h, w, h, step.render.framebuffer);
+		const char *renderCmd = GetRPTypeName(step.render.renderPassType);
+		snprintf(buffer, sizeof(buffer), "%s %s %s (draws: %d, %dx%d/%dx%d)", renderCmd, step.tag, step.render.framebuffer ? step.render.framebuffer->Tag() : "", step.render.numDraws, actual_w, actual_h, w, h);
 		break;
 	}
 	case VKRStepType::COPY:
-		snprintf(buffer, sizeof(buffer), "COPY '%s' %s -> %s (%dx%d, %s)", step.tag, step.copy.src->tag.c_str(), step.copy.dst->tag.c_str(), step.copy.srcRect.extent.width, step.copy.srcRect.extent.height, AspectToString(step.copy.aspectMask));
+		snprintf(buffer, sizeof(buffer), "COPY '%s' %s -> %s (%dx%d, %s)", step.tag, step.copy.src->Tag(), step.copy.dst->Tag(), step.copy.srcRect.extent.width, step.copy.srcRect.extent.height, AspectToString(step.copy.aspectMask));
 		break;
 	case VKRStepType::BLIT:
-		snprintf(buffer, sizeof(buffer), "BLIT '%s' %s -> %s (%dx%d->%dx%d, %s)", step.tag, step.copy.src->tag.c_str(), step.copy.dst->tag.c_str(), step.blit.srcRect.extent.width, step.blit.srcRect.extent.height, step.blit.dstRect.extent.width, step.blit.dstRect.extent.height, AspectToString(step.blit.aspectMask));
+		snprintf(buffer, sizeof(buffer), "BLIT '%s' %s -> %s (%dx%d->%dx%d, %s)", step.tag, step.copy.src->Tag(), step.copy.dst->Tag(), step.blit.srcRect.extent.width, step.blit.srcRect.extent.height, step.blit.dstRect.extent.width, step.blit.dstRect.extent.height, AspectToString(step.blit.aspectMask));
 		break;
 	case VKRStepType::READBACK:
-		snprintf(buffer, sizeof(buffer), "READBACK '%s' %s (%dx%d, %s)", step.tag, step.readback.src->tag.c_str(), step.readback.srcRect.extent.width, step.readback.srcRect.extent.height, AspectToString(step.readback.aspectMask));
+		snprintf(buffer, sizeof(buffer), "READBACK '%s' %s (%dx%d, %s)", step.tag, step.readback.src ? step.readback.src->Tag() : "(backbuffer)", step.readback.srcRect.extent.width, step.readback.srcRect.extent.height, AspectToString(step.readback.aspectMask));
 		break;
 	case VKRStepType::READBACK_IMAGE:
 		snprintf(buffer, sizeof(buffer), "READBACK_IMAGE '%s' (%dx%d)", step.tag, step.readback_image.srcRect.extent.width, step.readback_image.srcRect.extent.height);
@@ -695,23 +941,29 @@ void VulkanQueueRunner::ApplyRenderPassMerge(std::vector<VKRStep *> &steps) {
 	auto mergeRenderSteps = [](VKRStep *dst, VKRStep *src) {
 		// OK. Now, if it's a render, slurp up all the commands and kill the step.
 		// Also slurp up any pretransitions.
-		dst->preTransitions.insert(dst->preTransitions.end(), src->preTransitions.begin(), src->preTransitions.end());
+		dst->preTransitions.append(src->preTransitions);
 		dst->commands.insert(dst->commands.end(), src->commands.begin(), src->commands.end());
 		MergeRenderAreaRectInto(&dst->render.renderArea, src->render.renderArea);
 		// So we don't consider it for other things, maybe doesn't matter.
 		src->dependencies.clear();
 		src->stepType = VKRStepType::RENDER_SKIP;
+		dst->render.numDraws += src->render.numDraws;
+		dst->render.numReads += src->render.numReads;
+		dst->render.pipelineFlags |= src->render.pipelineFlags;
+		dst->render.renderPassType = MergeRPTypes(dst->render.renderPassType, src->render.renderPassType);
 	};
 	auto renderHasClear = [](const VKRStep *step) {
 		const auto &r = step->render;
-		return r.color == VKRRenderPassAction::CLEAR || r.depth == VKRRenderPassAction::CLEAR || r.stencil == VKRRenderPassAction::CLEAR;
+		return r.colorLoad == VKRRenderPassLoadAction::CLEAR || r.depthLoad == VKRRenderPassLoadAction::CLEAR || r.stencilLoad == VKRRenderPassLoadAction::CLEAR;
 	};
 
 	// Now, let's go through the steps. If we find one that is rendered to more than once,
 	// we'll scan forward and slurp up any rendering that can be merged across.
 	for (int i = 0; i < (int)steps.size(); i++) {
-		if (steps[i]->stepType == VKRStepType::RENDER && counts[steps[i]->render.framebuffer] > 1) {
-			auto fb = steps[i]->render.framebuffer;
+		decltype(steps[i]->render) &render_i = steps[i]->render;
+		// Swapchain passes (no framebuffer) aren't merged, there can be several of them to different swapchains.
+		if (steps[i]->stepType == VKRStepType::RENDER && render_i.framebuffer && counts[render_i.framebuffer] > 1) {
+			auto fb = render_i.framebuffer;
 			TinySet<VKRFramebuffer *, 8> touchedFramebuffers;  // must be the same fast-size as the dependencies TinySet for annoying reasons.
 			for (int j = i + 1; j < (int)steps.size(); j++) {
 				// If any other passes are reading from this framebuffer as-is, we cancel the scan.
@@ -758,6 +1010,7 @@ void VulkanQueueRunner::ApplyRenderPassMerge(std::vector<VKRStep *> &steps) {
 					break;
 				default:
 					// We added a new step?  Might be unsafe.
+					_dbg_assert_(false);
 					goto done_fb;
 				}
 			}
@@ -768,7 +1021,7 @@ void VulkanQueueRunner::ApplyRenderPassMerge(std::vector<VKRStep *> &steps) {
 }
 
 void VulkanQueueRunner::LogSteps(const std::vector<VKRStep *> &steps, bool verbose) {
-	INFO_LOG(G3D, "===================  FRAME  ====================");
+	INFO_LOG(Log::G3D, "===================  FRAME  ====================");
 	for (size_t i = 0; i < steps.size(); i++) {
 		const VKRStep &step = *steps[i];
 		switch (step.stepType) {
@@ -788,20 +1041,20 @@ void VulkanQueueRunner::LogSteps(const std::vector<VKRStep *> &steps, bool verbo
 			LogReadbackImage(step);
 			break;
 		case VKRStepType::RENDER_SKIP:
-			INFO_LOG(G3D, "(skipped render pass)");
+			INFO_LOG(Log::G3D, "(skipped render pass)");
 			break;
 		}
 	}
-	INFO_LOG(G3D, "-------------------  SUBMIT  ------------------");
+	INFO_LOG(Log::G3D, "-------------------  SUBMIT  ------------------");
 }
 
-const char *RenderPassActionName(VKRRenderPassAction a) {
+const char *RenderPassActionName(VKRRenderPassLoadAction a) {
 	switch (a) {
-	case VKRRenderPassAction::CLEAR:
+	case VKRRenderPassLoadAction::CLEAR:
 		return "CLEAR";
-	case VKRRenderPassAction::DONT_CARE:
+	case VKRRenderPassLoadAction::DONT_CARE:
 		return "DONT_CARE";
-	case VKRRenderPassAction::KEEP:
+	case VKRRenderPassLoadAction::KEEP:
 		return "KEEP";
 	}
 	return "?";
@@ -823,49 +1076,52 @@ const char *ImageLayoutToString(VkImageLayout layout) {
 
 void VulkanQueueRunner::LogRenderPass(const VKRStep &pass, bool verbose) {
 	const auto &r = pass.render;
-	const char *framebuf = r.framebuffer ? r.framebuffer->tag.c_str() : "backbuffer";
+	const char *framebuf = r.framebuffer ? r.framebuffer->Tag() : "backbuffer";
 	int w = r.framebuffer ? r.framebuffer->width : vulkan_->GetBackbufferWidth();
 	int h = r.framebuffer ? r.framebuffer->height : vulkan_->GetBackbufferHeight();
 
-	INFO_LOG(G3D, "RENDER %s Begin(%s, draws: %d, %dx%d, %s, %s, %s)", pass.tag, framebuf, r.numDraws, w, h, RenderPassActionName(r.color), RenderPassActionName(r.depth), RenderPassActionName(r.stencil));
+	INFO_LOG(Log::G3D, "RENDER %s Begin(%s, draws: %d, %dx%d, %s, %s, %s)", pass.tag, framebuf, r.numDraws, w, h, RenderPassActionName(r.colorLoad), RenderPassActionName(r.depthLoad), RenderPassActionName(r.stencilLoad));
 	// TODO: Log these in detail.
-	for (int i = 0; i < pass.preTransitions.size(); i++) {
-		INFO_LOG(G3D, "  PRETRANSITION: %s %s -> %s", pass.preTransitions[i].fb->tag.c_str(), AspectToString(pass.preTransitions[i].aspect), ImageLayoutToString(pass.preTransitions[i].targetLayout));
+	for (int i = 0; i < (int)pass.preTransitions.size(); i++) {
+		const TransitionRequest &preTransition = pass.preTransitions[i];
+		INFO_LOG(Log::G3D, "  PRETRANSITION: %s %s -> %s", preTransition.fb->Tag(), AspectToString(preTransition.aspect), ImageLayoutToString(preTransition.targetLayout));
 	}
 
 	if (verbose) {
 		for (auto &cmd : pass.commands) {
 			switch (cmd.cmd) {
 			case VKRRenderCommand::REMOVED:
-				INFO_LOG(G3D, "  (Removed)");
+				INFO_LOG(Log::G3D, "  (Removed)");
 				break;
-
-			case VKRRenderCommand::BIND_PIPELINE:
-				INFO_LOG(G3D, "  BindPipeline(%x)", (int)(intptr_t)cmd.pipeline.pipeline);
+			case VKRRenderCommand::BIND_GRAPHICS_PIPELINE:
+				INFO_LOG(Log::G3D, "  BindGraphicsPipeline(%x)", (int)(intptr_t)cmd.graphics_pipeline.pipeline);
 				break;
 			case VKRRenderCommand::BLEND:
-				INFO_LOG(G3D, "  BlendColor(%08x)", cmd.blendColor.color);
+				INFO_LOG(Log::G3D, "  BlendColor(%f, %f, %f, %f)", cmd.blendColor.color[0], cmd.blendColor.color[1], cmd.blendColor.color[2], cmd.blendColor.color[3]);
 				break;
 			case VKRRenderCommand::CLEAR:
-				INFO_LOG(G3D, "  Clear");
+				INFO_LOG(Log::G3D, "  Clear");
 				break;
 			case VKRRenderCommand::DRAW:
-				INFO_LOG(G3D, "  Draw(%d)", cmd.draw.count);
+				INFO_LOG(Log::G3D, "  Draw(%d)", cmd.draw.count);
 				break;
 			case VKRRenderCommand::DRAW_INDEXED:
-				INFO_LOG(G3D, "  DrawIndexed(%d)", cmd.drawIndexed.count);
+				INFO_LOG(Log::G3D, "  DrawIndexed(%d)", cmd.drawIndexed.count);
 				break;
 			case VKRRenderCommand::SCISSOR:
-				INFO_LOG(G3D, "  Scissor(%d, %d, %d, %d)", (int)cmd.scissor.scissor.offset.x, (int)cmd.scissor.scissor.offset.y, (int)cmd.scissor.scissor.extent.width, (int)cmd.scissor.scissor.extent.height);
+				INFO_LOG(Log::G3D, "  Scissor(%d, %d, %d, %d)", (int)cmd.scissor.scissor.offset.x, (int)cmd.scissor.scissor.offset.y, (int)cmd.scissor.scissor.extent.width, (int)cmd.scissor.scissor.extent.height);
 				break;
 			case VKRRenderCommand::STENCIL:
-				INFO_LOG(G3D, "  Stencil(ref=%d, compare=%d, write=%d)", cmd.stencil.stencilRef, cmd.stencil.stencilCompareMask, cmd.stencil.stencilWriteMask);
+				INFO_LOG(Log::G3D, "  Stencil(ref=%d, compare=%d, write=%d)", cmd.stencil.stencilRef, cmd.stencil.stencilCompareMask, cmd.stencil.stencilWriteMask);
 				break;
 			case VKRRenderCommand::VIEWPORT:
-				INFO_LOG(G3D, "  Viewport(%f, %f, %f, %f, %f, %f)", cmd.viewport.vp.x, cmd.viewport.vp.y, cmd.viewport.vp.width, cmd.viewport.vp.height, cmd.viewport.vp.minDepth, cmd.viewport.vp.maxDepth);
+				INFO_LOG(Log::G3D, "  Viewport(%f, %f, %f, %f, %f, %f)", cmd.viewport.vp.x, cmd.viewport.vp.y, cmd.viewport.vp.width, cmd.viewport.vp.height, cmd.viewport.vp.minDepth, cmd.viewport.vp.maxDepth);
 				break;
 			case VKRRenderCommand::PUSH_CONSTANTS:
-				INFO_LOG(G3D, "  PushConstants(%d)", cmd.push.size);
+				INFO_LOG(Log::G3D, "  PushConstants(%d)", cmd.push.size);
+				break;
+			case VKRRenderCommand::DEBUG_ANNOTATION:
+				INFO_LOG(Log::G3D, "  DebugAnnotation(%s)", cmd.debugAnnotation.annotation);
 				break;
 
 			case VKRRenderCommand::NUM_RENDER_COMMANDS:
@@ -874,394 +1130,204 @@ void VulkanQueueRunner::LogRenderPass(const VKRStep &pass, bool verbose) {
 		}
 	}
 
-	INFO_LOG(G3D, "  Final: %s %s", ImageLayoutToString(pass.render.finalColorLayout), ImageLayoutToString(pass.render.finalDepthStencilLayout));
-	INFO_LOG(G3D, "RENDER End(%s) - %d commands executed", framebuf, (int)pass.commands.size());
+	INFO_LOG(Log::G3D, "  Final: %s %s", ImageLayoutToString(pass.render.finalColorLayout), ImageLayoutToString(pass.render.finalDepthStencilLayout));
+	INFO_LOG(Log::G3D, "RENDER End(%s) - %d commands executed", framebuf, (int)pass.commands.size());
 }
 
 void VulkanQueueRunner::LogCopy(const VKRStep &step) {
-	INFO_LOG(G3D, "%s", StepToString(step).c_str());
+	INFO_LOG(Log::G3D, "%s", StepToString(vulkan_, step).c_str());
 }
 
 void VulkanQueueRunner::LogBlit(const VKRStep &step) {
-	INFO_LOG(G3D, "%s", StepToString(step).c_str());
+	INFO_LOG(Log::G3D, "%s", StepToString(vulkan_, step).c_str());
 }
 
 void VulkanQueueRunner::LogReadback(const VKRStep &step) {
-	INFO_LOG(G3D, "%s", StepToString(step).c_str());
+	INFO_LOG(Log::G3D, "%s", StepToString(vulkan_, step).c_str());
 }
 
 void VulkanQueueRunner::LogReadbackImage(const VKRStep &step) {
-	INFO_LOG(G3D, "%s", StepToString(step).c_str());
+	INFO_LOG(Log::G3D, "%s", StepToString(vulkan_, step).c_str());
 }
 
-void TransitionToOptimal(VkCommandBuffer cmd, VkImage colorImage, VkImageLayout colorLayout, VkImage depthStencilImage, VkImageLayout depthStencilLayout) {
-	VkPipelineStageFlags srcStageMask = 0;
-	VkPipelineStageFlags dstStageMask = 0;
-	int barrierCount = 0;
-	VkImageMemoryBarrier barrier[2]{};
-
-	if (colorLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
-		barrier[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		barrier[0].pNext = nullptr;
-		switch (colorLayout) {
-		case VK_IMAGE_LAYOUT_UNDEFINED:
-			// No need to specify stage or access.
-			break;
-		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			// Already the right color layout. Unclear that we need to do a lot here..
-			break;
-		case VK_IMAGE_LAYOUT_GENERAL:
-			// We came from the Mali workaround, and are transitioning back to COLOR_ATTACHMENT_OPTIMAL.
-			barrier[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-			barrier[0].srcAccessMask |= VK_ACCESS_SHADER_READ_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			barrier[0].srcAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			barrier[0].srcAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		default:
-			_dbg_assert_msg_(false, "GetRenderPass: Unexpected color layout %d", (int)colorLayout);
-			break;
-		}
-		dstStageMask |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		barrier[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		barrier[0].oldLayout = colorLayout;
-		barrier[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		barrier[0].image = colorImage;
-		barrier[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		barrier[0].subresourceRange.baseMipLevel = 0;
-		barrier[0].subresourceRange.levelCount = 1;
-		barrier[0].subresourceRange.layerCount = 1;
-		barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrierCount++;
-	}
-
-	if (depthStencilImage != VK_NULL_HANDLE && depthStencilLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-		barrier[barrierCount].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		barrier[barrierCount].pNext = nullptr;
-		switch (depthStencilLayout) {
-		case VK_IMAGE_LAYOUT_UNDEFINED:
-			// No need to specify stage or access.
-			break;
-		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-			// Already the right depth layout. Unclear that we need to do a lot here..
-			break;
-		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-			barrier[barrierCount].srcAccessMask |= VK_ACCESS_SHADER_READ_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			barrier[barrierCount].srcAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			barrier[barrierCount].srcAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
-			srcStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		default:
-			_dbg_assert_msg_(false, "GetRenderPass: Unexpected depth layout %d", (int)depthStencilLayout);
-			break;
-		}
-		dstStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		barrier[barrierCount].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-		barrier[barrierCount].oldLayout = depthStencilLayout;
-		barrier[barrierCount].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-		barrier[barrierCount].image = depthStencilImage;
-		barrier[barrierCount].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-		barrier[barrierCount].subresourceRange.baseMipLevel = 0;
-		barrier[barrierCount].subresourceRange.levelCount = 1;
-		barrier[barrierCount].subresourceRange.layerCount = 1;
-		barrier[barrierCount].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier[barrierCount].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-
-		barrierCount++;
-	}
-
-	if (barrierCount) {
-		vkCmdPipelineBarrier(cmd, srcStageMask, dstStageMask, VK_DEPENDENCY_BY_REGION_BIT, 0, nullptr, 0, nullptr, barrierCount, barrier);
-	}
-}
-
-void TransitionFromOptimal(VkCommandBuffer cmd, VkImage colorImage, VkImageLayout colorLayout, VkImage depthStencilImage, VkImageLayout depthStencilLayout) {
-	VkPipelineStageFlags srcStageMask = 0;
-	VkPipelineStageFlags dstStageMask = 0;
-
-	// If layouts aren't optimal, transition them.
-	VkImageMemoryBarrier barrier[2]{};
-
-	int barrierCount = 0;
-	if (colorLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
-		barrier[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		barrier[0].pNext = nullptr;
-		srcStageMask |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		barrier[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		// And the final transition.
-		// Don't need to transition it if VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-		switch (colorLayout) {
-		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-			barrier[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			barrier[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			barrier[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_UNDEFINED:
-		case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-			// Nothing to do.
-			break;
-		default:
-			_dbg_assert_msg_(false, "GetRenderPass: Unexpected final color layout %d", (int)colorLayout);
-			break;
-		}
-		barrier[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		barrier[0].newLayout = colorLayout;
-		barrier[0].image = colorImage;
-		barrier[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		barrier[0].subresourceRange.baseMipLevel = 0;
-		barrier[0].subresourceRange.levelCount = 1;
-		barrier[0].subresourceRange.layerCount = 1;
-		barrier[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrierCount++;
-	}
-
-	if (depthStencilImage && depthStencilLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-		barrier[barrierCount].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		barrier[barrierCount].pNext = nullptr;
-
-		srcStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		barrier[barrierCount].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-		switch (depthStencilLayout) {
-		case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-			barrier[barrierCount].dstAccessMask |= VK_ACCESS_SHADER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-			barrier[barrierCount].dstAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-			barrier[barrierCount].dstAccessMask |= VK_ACCESS_TRANSFER_READ_BIT;
-			dstStageMask |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-			break;
-		case VK_IMAGE_LAYOUT_UNDEFINED:
-		case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-			// Nothing to do.
-			break;
-		default:
-			_dbg_assert_msg_(false, "GetRenderPass: Unexpected final depth layout %d", (int)depthStencilLayout);
-			break;
-		}
-		barrier[barrierCount].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-		barrier[barrierCount].newLayout = depthStencilLayout;
-		barrier[barrierCount].image = depthStencilImage;
-		barrier[barrierCount].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-		barrier[barrierCount].subresourceRange.baseMipLevel = 0;
-		barrier[barrierCount].subresourceRange.levelCount = 1;
-		barrier[barrierCount].subresourceRange.layerCount = 1;
-		barrier[barrierCount].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier[barrierCount].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrierCount++;
-	}
-	if (barrierCount) {
-		vkCmdPipelineBarrier(cmd, srcStageMask, dstStageMask, VK_DEPENDENCY_BY_REGION_BIT, 0, nullptr, 0, nullptr, barrierCount, barrier);
-	}
-}
-
-void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer cmd) {
-	// TODO: If there are multiple, we can transition them together.
-
-	for (const auto &iter : step.preTransitions) {
-		if (iter.aspect == VK_IMAGE_ASPECT_COLOR_BIT && iter.fb->color.layout != iter.targetLayout) {
-			VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-			barrier.oldLayout = iter.fb->color.layout;
-			barrier.subresourceRange.layerCount = 1;
-			barrier.subresourceRange.levelCount = 1;
-			barrier.image = iter.fb->color.image;
-			VkPipelineStageFlags srcStage{};
-			VkPipelineStageFlags dstStage{};
-			switch (barrier.oldLayout) {
-			case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-				srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-				break;
-			case VK_IMAGE_LAYOUT_UNDEFINED:
-				barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-				srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-				break;
-			case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-				break;
-			case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-				srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-				break;
-			default:
-				_assert_msg_(false, "PerformRenderPass: Unexpected oldLayout: %d", (int)barrier.oldLayout);
-				break;
+void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer cmd, const int curFrame, QueueProfileContext &profile) {
+	for (size_t i = 0; i < step.preTransitions.size(); i++) {
+		const TransitionRequest &iter = step.preTransitions[i];
+		if (iter.samples) {
+			if (iter.fb->msaaColor.image != VK_NULL_HANDLE && iter.fb->msaaColor.layout != iter.targetLayout) {
+				recordBarrier_.TransitionColorImageAuto(&iter.fb->msaaColor, iter.targetLayout);
 			}
-			barrier.newLayout = iter.targetLayout;
-			switch (barrier.newLayout) {
-			case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-				dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-				break;
-			default:
-				_assert_msg_(false, "PerformRenderPass: Unexpected newLayout: %d", (int)barrier.newLayout);
-				break;
-			}
-			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-			iter.fb->color.layout = barrier.newLayout;
-		} else if ((iter.aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && iter.fb->depth.layout != iter.targetLayout) {
-			VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-			barrier.oldLayout = iter.fb->depth.layout;
-			barrier.subresourceRange.layerCount = 1;
-			barrier.subresourceRange.levelCount = 1;
-			barrier.image = iter.fb->depth.image;
-			barrier.srcAccessMask = 0;
-			VkPipelineStageFlags srcStage;
-			VkPipelineStageFlags dstStage;
-			switch (barrier.oldLayout) {
-			case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-				srcStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-				break;
-			case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-				srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-				break;
-			case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-				barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-				srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-				break;
-			default:
-				Crash();
-				break;
-			}
-			barrier.newLayout = iter.targetLayout;
-			switch (barrier.newLayout) {
-			case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-				barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-				dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-				break;
-			default:
-				Crash();
-				break;
-			}
-			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-			iter.fb->depth.layout = barrier.newLayout;
+		} else if (iter.aspect == VK_IMAGE_ASPECT_COLOR_BIT && iter.fb->color.layout != iter.targetLayout) {
+			recordBarrier_.TransitionColorImageAuto(
+				&iter.fb->color,
+				iter.targetLayout
+			);
+		} else if (iter.fb->depth.image != VK_NULL_HANDLE && (iter.aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && iter.fb->depth.layout != iter.targetLayout) {
+			recordBarrier_.TransitionDepthStencilImageAuto(
+				&iter.fb->depth,
+				iter.targetLayout
+			);
 		}
 	}
 
 	// Don't execute empty renderpasses that keep the contents.
-	if (step.commands.empty() && step.render.color == VKRRenderPassAction::KEEP && step.render.depth == VKRRenderPassAction::KEEP && step.render.stencil == VKRRenderPassAction::KEEP) {
+	if (step.commands.empty() && step.render.colorLoad == VKRRenderPassLoadAction::KEEP && step.render.depthLoad == VKRRenderPassLoadAction::KEEP && step.render.stencilLoad == VKRRenderPassLoadAction::KEEP) {
+		// Flush the pending barrier
+		recordBarrier_.Flush(cmd);
 		// Nothing to do.
-
 		// TODO: Though - a later step might have used this step's finalColorLayout etc to get things in a layout it expects.
 		// Should we just do a barrier? Or just let the later step deal with not having things in its preferred layout, like now?
-
 		return;
 	}
 
 	// Write-after-write hazards. Fixed flicker in God of War on ARM (before we added another fix that removed these).
+	// NOTE: These are commented out because the normal barriers no longer check for equality, effectively generating these
+	// barriers automatically. This is safe, but sometimes I think can be improved on.
+	/*
 	if (step.render.framebuffer) {
 		int n = 0;
 		int stage = 0;
-		VkImageMemoryBarrier barriers[2]{};
-		if (step.render.framebuffer->color.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
-			barriers[n].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-			barriers[n].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-			barriers[n].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-			barriers[n].subresourceRange.layerCount = 1;
-			barriers[n].subresourceRange.levelCount = 1;
-			barriers[n].image = step.render.framebuffer->color.image;
-			barriers[n].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-			barriers[n].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-			barriers[n].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			barriers[n].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barriers[n].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			stage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-			n++;
-		}
-		if (step.render.framebuffer->depth.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
-			barriers[n].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-			barriers[n].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-			barriers[n].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-			barriers[n].subresourceRange.layerCount = 1;
-			barriers[n].subresourceRange.levelCount = 1;
-			barriers[n].image = step.render.framebuffer->depth.image;
-			barriers[n].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-			barriers[n].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-			barriers[n].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-			barriers[n].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			barriers[n].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-			stage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-			n++;
-		}
-		if (stage) {
-			vkCmdPipelineBarrier(cmd, stage, stage, 0, 0, nullptr, 0, nullptr, n, barriers);
-			// No need to modify the image layouts here - it's just an execution barrier.
-		}
-	}
 
-	// This reads the layout of the color and depth images, and chooses a render pass using them that
-	// will transition to the desired final layout.
-	PerformBindFramebufferAsRenderTarget(step, cmd);
+		if (step.render.framebuffer->color.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+			recordBarrier_.TransitionImage(
+				step.render.framebuffer->color.image,
+				0,
+				1,
+				step.render.framebuffer->numLayers,
+				VK_IMAGE_ASPECT_COLOR_BIT,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+			);
+		}
+		if (step.render.framebuffer->depth.image != VK_NULL_HANDLE && step.render.framebuffer->depth.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+			recordBarrier_.TransitionImage(
+				step.render.framebuffer->depth.image,
+				0,
+				1,
+				step.render.framebuffer->numLayers,
+				VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+				VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+			);
+		}
+	}*/
+
+	// This chooses a render pass according to the load/store attachment state. We no longer transition
+	// image layouts as part of the passes.
+	//
+	// NOTE: Unconditionally flushes recordBarrier_.
+	VKRRenderPass *renderPass = PerformBindFramebufferAsRenderTarget(step, cmd);
 
 	int curWidth = step.render.framebuffer ? step.render.framebuffer->width : vulkan_->GetBackbufferWidth();
 	int curHeight = step.render.framebuffer ? step.render.framebuffer->height : vulkan_->GetBackbufferHeight();
+	if (step.render.swapchain) {
+		curWidth = step.render.swapchain->extent.width;
+		curHeight = step.render.swapchain->extent.height;
+	}
 
 	VKRFramebuffer *fb = step.render.framebuffer;
+	// Only the main swapchain is rotated to match the display.
+	const bool rotateToDisplay = !fb && !step.render.swapchain;
 
-	auto &commands = step.commands;
+	VKRGraphicsPipeline *lastGraphicsPipeline = nullptr;
+	VKRComputePipeline *lastComputePipeline = nullptr;
+
+	const auto &commands = step.commands;
 
 	// We can do a little bit of state tracking here to eliminate some calls into the driver.
 	// The stencil ones are very commonly mostly redundant so let's eliminate them where possible.
 	// Might also want to consider scissor and viewport.
 	VkPipeline lastPipeline = VK_NULL_HANDLE;
+	FastVec<PendingDescSet> *descSets = nullptr;
+	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+
+	bool pipelineOK = false;
+
 	int lastStencilWriteMask = -1;
 	int lastStencilCompareMask = -1;
 	int lastStencilReference = -1;
 
-	for (const auto &c : commands) {
+	const RenderPassType rpType = step.render.renderPassType;
+
+	for (size_t i = 0; i < commands.size(); i++) {
+		const VkRenderData &c = commands[i];
+#ifdef _DEBUG
+		if (profile.enabled) {
+			if ((size_t)step.stepType < ARRAY_SIZE(profile.commandCounts)) {
+				profile.commandCounts[(size_t)c.cmd]++;
+			}
+		}
+#endif
 		switch (c.cmd) {
 		case VKRRenderCommand::REMOVED:
 			break;
 
-		case VKRRenderCommand::BIND_PIPELINE:
-			if (c.pipeline.pipeline != lastPipeline) {
-				vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c.pipeline.pipeline);
-				lastPipeline = c.pipeline.pipeline;
+		case VKRRenderCommand::BIND_GRAPHICS_PIPELINE:
+		{
+			VKRGraphicsPipeline *graphicsPipeline = c.graphics_pipeline.pipeline;
+			if (graphicsPipeline != lastGraphicsPipeline) {
+				VkSampleCountFlagBits fbSampleCount = fb ? fb->sampleCount : VK_SAMPLE_COUNT_1_BIT;
+
+				if (RenderPassTypeHasMultisample(rpType) && fbSampleCount != graphicsPipeline->SampleCount()) {
+					// should have been invalidated.
+					_assert_msg_(graphicsPipeline->SampleCount() == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM,
+						"expected %d sample count, got %d", fbSampleCount, graphicsPipeline->SampleCount());
+				}
+
+				Promise<VkPipeline> *promise;
+				bool compileHere = false;
+				{
+					std::lock_guard<std::mutex> lock(graphicsPipeline->mutex_);
+					promise = graphicsPipeline->pipeline[(size_t)rpType];
+					if (!promise) {
+						// NOTE: If render steps got merged, it can happen that, as they ended during recording,
+						// they didn't know their final render pass type so they created the wrong pipelines in EndCurRenderStep().
+						// Unfortunately I don't know if we can fix it in any more sensible place than here.
+						// Maybe a middle pass. But let's try to just block and compile here for now, this doesn't
+						// happen all that much.
+						promise = Promise<VkPipeline>::CreateEmpty();
+						graphicsPipeline->pipeline[(size_t)rpType] = promise;
+						compileHere = true;
+					}
+				}
+				// Not under the lock: the main thread takes it for every pipeline a render step used
+				// (EndCurRenderStep), and waiting for the shaders and the compile can take hundreds of ms.
+				// DestroyVariants deletes Promises later, so this one stays valid.
+				if (compileHere) {
+					graphicsPipeline->Create(vulkan_, renderPass->Get(vulkan_, rpType, fbSampleCount), rpType, fbSampleCount, time_now_d(), -1);
+				}
+				PROFILE_THIS_SCOPE("wait_pipeline");
+				VkPipeline pipeline = promise->BlockUntilReady();
+
+				if (pipeline != VK_NULL_HANDLE) {
+					vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+					descSets = &c.graphics_pipeline.pipelineLayout->frameData[curFrame].descSets_;
+					pipelineLayout = c.graphics_pipeline.pipelineLayout->pipelineLayout;
+					_dbg_assert_(pipelineLayout != VK_NULL_HANDLE);
+					lastGraphicsPipeline = graphicsPipeline;
+					pipelineOK = true;
+				} else {
+					pipelineOK = false;
+				}
+
 				// Reset dynamic state so it gets refreshed with the new pipeline.
 				lastStencilWriteMask = -1;
 				lastStencilCompareMask = -1;
 				lastStencilReference = -1;
 			}
 			break;
+		}
 
 		case VKRRenderCommand::VIEWPORT:
-			if (fb != nullptr) {
+			if (!rotateToDisplay) {
 				vkCmdSetViewport(cmd, 0, 1, &c.viewport.vp);
 			} else {
 				const VkViewport &vp = c.viewport.vp;
@@ -1280,7 +1346,7 @@ void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer c
 
 		case VKRRenderCommand::SCISSOR:
 		{
-			if (fb != nullptr) {
+			if (!rotateToDisplay) {
 				vkCmdSetScissor(cmd, 0, 1, &c.scissor.scissor);
 			} else {
 				// Rendering to backbuffer. Might need to rotate.
@@ -1296,15 +1362,13 @@ void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer c
 		}
 
 		case VKRRenderCommand::BLEND:
-		{
-			float bc[4];
-			Uint8x4ToFloat4(bc, c.blendColor.color);
-			vkCmdSetBlendConstants(cmd, bc);
+			vkCmdSetBlendConstants(cmd, c.blendColor.color);
 			break;
-		}
 
 		case VKRRenderCommand::PUSH_CONSTANTS:
-			vkCmdPushConstants(cmd, c.push.pipelineLayout, c.push.stages, c.push.offset, c.push.size, c.push.data);
+			if (pipelineOK) {
+				vkCmdPushConstants(cmd, pipelineLayout, c.push.stages, c.push.offset, c.push.size, c.push.data);
+			}
 			break;
 
 		case VKRRenderCommand::STENCIL:
@@ -1323,18 +1387,32 @@ void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer c
 			break;
 
 		case VKRRenderCommand::DRAW_INDEXED:
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c.drawIndexed.pipelineLayout, 0, 1, &c.drawIndexed.ds, c.drawIndexed.numUboOffsets, c.drawIndexed.uboOffsets);
-			vkCmdBindIndexBuffer(cmd, c.drawIndexed.ibuffer, c.drawIndexed.ioffset, c.drawIndexed.indexType);
-			vkCmdBindVertexBuffers(cmd, 0, 1, &c.drawIndexed.vbuffer, &c.drawIndexed.voffset);
-			vkCmdDrawIndexed(cmd, c.drawIndexed.count, c.drawIndexed.instances, 0, 0, 0);
+			if (pipelineOK) {
+				_dbg_assert_(c.drawIndexed.descSetIndex < descSets->size());
+				VkDescriptorSet set = (*descSets)[c.drawIndexed.descSetIndex].set;
+				_dbg_assert_(set != VK_NULL_HANDLE);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &set, c.drawIndexed.numUboOffsets, c.drawIndexed.uboOffsets);
+				vkCmdBindIndexBuffer(cmd, c.drawIndexed.ibuffer, c.drawIndexed.ioffset, VK_INDEX_TYPE_UINT16);
+				const VkBuffer vbuffers[2] = { c.drawIndexed.vbuffer, c.drawIndexed.vbuffer1 };
+				const VkDeviceSize voffsets[2] = { c.drawIndexed.voffset, c.drawIndexed.voffset1 };
+				vkCmdBindVertexBuffers(cmd, 0, c.drawIndexed.vbuffer1 ? 2 : 1, vbuffers, voffsets);
+				vkCmdDrawIndexed(cmd, c.drawIndexed.count, c.drawIndexed.instances, 0, 0, 0);
+			}
 			break;
 
 		case VKRRenderCommand::DRAW:
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c.draw.pipelineLayout, 0, 1, &c.draw.ds, c.draw.numUboOffsets, c.draw.uboOffsets);
-			if (c.draw.vbuffer) {
-				vkCmdBindVertexBuffers(cmd, 0, 1, &c.draw.vbuffer, &c.draw.voffset);
+			if (pipelineOK) {
+				_dbg_assert_(c.draw.descSetIndex < descSets->size());
+				VkDescriptorSet set = (*descSets)[c.draw.descSetIndex].set;
+				_dbg_assert_(set != VK_NULL_HANDLE);
+				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &set, c.draw.numUboOffsets, c.draw.uboOffsets);
+				if (c.draw.vbuffer) {
+					const VkBuffer vbuffers[2] = { c.draw.vbuffer, c.draw.vbuffer1 };
+					const VkDeviceSize voffsets[2] = { c.draw.voffset, c.draw.voffset1 };
+					vkCmdBindVertexBuffers(cmd, 0, c.draw.vbuffer1 ? 2 : 1, vbuffers, voffsets);
+				}
+				vkCmdDraw(cmd, c.draw.count, 1, c.draw.offset, 0);
 			}
-			vkCmdDraw(cmd, c.draw.count, 1, c.draw.offset, 0);
 			break;
 
 		case VKRRenderCommand::CLEAR:
@@ -1343,7 +1421,7 @@ void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer c
 			int numAttachments = 0;
 			VkClearRect rc{};
 			rc.baseArrayLayer = 0;
-			rc.layerCount = 1;
+			rc.layerCount = 1;  // In multiview mode, 1 means to replicate to all the active layers.
 			rc.rect.extent.width = (uint32_t)curWidth;
 			rc.rect.extent.height = (uint32_t)curHeight;
 			VkClearAttachment attachments[2]{};
@@ -1370,35 +1448,64 @@ void VulkanQueueRunner::PerformRenderPass(const VKRStep &step, VkCommandBuffer c
 			}
 			break;
 		}
+
+		case VKRRenderCommand::DEBUG_ANNOTATION:
+			if (vulkan_->Extensions().EXT_debug_utils) {
+				VkDebugUtilsLabelEXT labelInfo{ VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT };
+				labelInfo.pLabelName = c.debugAnnotation.annotation;
+				vkCmdInsertDebugUtilsLabelEXT(cmd, &labelInfo);
+			}
+			break;
+
 		default:
-			ERROR_LOG(G3D, "Unimpl queue command");
-			;
+			UNREACHABLE();
+			break;
 		}
 	}
 	vkCmdEndRenderPass(cmd);
 
-	if (fb) {
-		// If the desired final layout aren't the optimal layout for rendering, transition.
-		TransitionFromOptimal(cmd, fb->color.image, step.render.finalColorLayout, fb->depth.image, step.render.finalDepthStencilLayout);
+	_dbg_assert_(recordBarrier_.empty());
 
-		fb->color.layout = step.render.finalColorLayout;
-		fb->depth.layout = step.render.finalDepthStencilLayout;
+	if (fb) {
+		// If the desired final layout aren't the optimal layout needed next, early-transition the image.
+		if (step.render.finalColorLayout != fb->color.layout) {
+			recordBarrier_.TransitionColorImageAuto(&fb->color, step.render.finalColorLayout);
+		}
+		if (fb->depth.image && step.render.finalDepthStencilLayout != fb->depth.layout) {
+			recordBarrier_.TransitionDepthStencilImageAuto(&fb->depth, step.render.finalDepthStencilLayout);
+		}
 	}
 }
 
-void VulkanQueueRunner::PerformBindFramebufferAsRenderTarget(const VKRStep &step, VkCommandBuffer cmd) {
-	VkRenderPass renderPass;
+VKRRenderPass *VulkanQueueRunner::PerformBindFramebufferAsRenderTarget(const VKRStep &step, VkCommandBuffer cmd) {
+	VKRRenderPass *renderPass;
 	int numClearVals = 0;
-	VkClearValue clearVal[2]{};
+	VkClearValue clearVal[4]{};
 	VkFramebuffer framebuf;
 	int w;
 	int h;
+
+	bool hasDepth = RenderPassTypeHasDepth(step.render.renderPassType);
+
+	VkSampleCountFlagBits sampleCount;
+
+	// Can be used to separate the final*Layout barrier from the rest for debugging in renderdoc.
+	// recordBarrier_.Flush(cmd);
+
 	if (step.render.framebuffer) {
 		_dbg_assert_(step.render.finalColorLayout != VK_IMAGE_LAYOUT_UNDEFINED);
 		_dbg_assert_(step.render.finalDepthStencilLayout != VK_IMAGE_LAYOUT_UNDEFINED);
 
+		RPKey key{
+			step.render.colorLoad, step.render.depthLoad, step.render.stencilLoad,
+			step.render.colorStore, step.render.depthStore, step.render.stencilStore,
+		};
+		renderPass = GetRenderPass(key);
+
 		VKRFramebuffer *fb = step.render.framebuffer;
-		framebuf = fb->framebuf;
+		framebuf = fb->Get(renderPass, step.render.renderPassType);
+		sampleCount = fb->sampleCount;
+		_dbg_assert_(framebuf != VK_NULL_HANDLE);
 		w = fb->width;
 		h = fb->height;
 
@@ -1407,52 +1514,78 @@ void VulkanQueueRunner::PerformBindFramebufferAsRenderTarget(const VKRStep &step
 		// To avoid this, we transition to GENERAL and back in this case (ARM-approved workaround).
 		// See pull request #10723.
 		bool maliBugWorkaround = step.render.numDraws == 0 &&
-			step.render.color == VKRRenderPassAction::CLEAR &&
+			step.render.colorLoad == VKRRenderPassLoadAction::CLEAR &&
 			vulkan_->GetPhysicalDeviceProperties().properties.driverVersion == 0xaa9c4b29;
 		if (maliBugWorkaround) {
-			TransitionImageLayout2(cmd, step.render.framebuffer->color.image, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT,
+			// A little suboptimal but let's go for maximum safety here.
+			recordBarrier_.TransitionImage(fb->color.image, 0, 1, fb->numLayers, VK_IMAGE_ASPECT_COLOR_BIT,
 				fb->color.layout, VK_IMAGE_LAYOUT_GENERAL,
-				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 			fb->color.layout = VK_IMAGE_LAYOUT_GENERAL;
 		}
 
-		TransitionToOptimal(cmd, fb->color.image, fb->color.layout, fb->depth.image, fb->depth.layout);
+		recordBarrier_.TransitionColorImageAuto(&fb->color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		if (fb->msaaColor.image != VK_NULL_HANDLE) {
+			// Texturing from the samples (BindFramebufferAsTexture) moves this one out of the attachment layout.
+			recordBarrier_.TransitionColorImageAuto(&fb->msaaColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		}
 
-		renderPass = GetRenderPass(step.render.color, step.render.depth, step.render.stencil);
+		// If the render pass doesn't touch depth, we can avoid a layout transition of the depth buffer.
+		if (fb->depth.image && RenderPassTypeHasDepth(step.render.renderPassType)) {
+			recordBarrier_.TransitionDepthStencilImageAuto(&fb->depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+		}
 
 		// The transition from the optimal format happens after EndRenderPass, now that we don't
 		// do it as part of the renderpass itself anymore.
 
-		if (step.render.color == VKRRenderPassAction::CLEAR) {
-			Uint8x4ToFloat4(clearVal[0].color.float32, step.render.clearColor);
-			numClearVals = 1;
+		if (sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+			// We don't initialize values for these.
+			numClearVals = hasDepth ? 2 : 1; // Skip the resolve buffers, don't need to clear those.
 		}
-		if (step.render.depth == VKRRenderPassAction::CLEAR || step.render.stencil == VKRRenderPassAction::CLEAR) {
-			clearVal[1].depthStencil.depth = step.render.clearDepth;
-			clearVal[1].depthStencil.stencil = step.render.clearStencil;
-			numClearVals = 2;
+		if (step.render.colorLoad == VKRRenderPassLoadAction::CLEAR) {
+			Uint8x4ToFloat4(clearVal[numClearVals].color.float32, step.render.clearColor);
 		}
+		numClearVals++;
+		if (hasDepth) {
+			if (step.render.depthLoad == VKRRenderPassLoadAction::CLEAR || step.render.stencilLoad == VKRRenderPassLoadAction::CLEAR) {
+				clearVal[numClearVals].depthStencil.depth = step.render.clearDepth;
+				clearVal[numClearVals].depthStencil.stencil = step.render.clearStencil;
+			}
+			numClearVals++;
+		}
+		_dbg_assert_(numClearVals != 3);
 	} else {
-		framebuf = backbuffer_;
+		RPKey key{
+			VKRRenderPassLoadAction::CLEAR, VKRRenderPassLoadAction::CLEAR, VKRRenderPassLoadAction::CLEAR,
+			VKRRenderPassStoreAction::STORE, VKRRenderPassStoreAction::DONT_CARE, VKRRenderPassStoreAction::DONT_CARE,
+		};
+		renderPass = GetRenderPass(key);
+		if (VKRSwapchain *swapchain = step.render.swapchain) {
+			framebuf = swapchain->framebuffers[swapchain->curImage];
+			w = swapchain->extent.width;
+			h = swapchain->extent.height;
+		} else {
+			framebuf = backbuffer_;
+			// Raw, rotated backbuffer size.
+			w = vulkan_->GetBackbufferWidth();
+			h = vulkan_->GetBackbufferHeight();
+		}
 
-		// Raw, rotated backbuffer size.
-		w = vulkan_->GetBackbufferWidth();
-		h = vulkan_->GetBackbufferHeight();
-		renderPass = GetBackbufferRenderPass();
 		Uint8x4ToFloat4(clearVal[0].color.float32, step.render.clearColor);
-		numClearVals = 2;  // We don't bother with a depth buffer here.
+		numClearVals = hasDepth ? 2 : 1;  // We might do depth-less backbuffer in the future, though doubtful of the value.
 		clearVal[1].depthStencil.depth = 0.0f;
 		clearVal[1].depthStencil.stencil = 0;
+		sampleCount = VK_SAMPLE_COUNT_1_BIT;
 	}
 
 	VkRenderPassBeginInfo rp_begin = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-	rp_begin.renderPass = renderPass;
+	rp_begin.renderPass = renderPass->Get(vulkan_, step.render.renderPassType, sampleCount);
 	rp_begin.framebuffer = framebuf;
 
 	VkRect2D rc = step.render.renderArea;
-	if (!step.render.framebuffer) {
+	if (!step.render.framebuffer && !step.render.swapchain) {
 		// Rendering to backbuffer, must rotate, just like scissors.
 		DisplayRect<int> rotated_rc{ rc.offset.x, rc.offset.y, (int)rc.extent.width, (int)rc.extent.height };
 		RotateRectToDisplay(rotated_rc, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
@@ -1463,84 +1596,208 @@ void VulkanQueueRunner::PerformBindFramebufferAsRenderTarget(const VKRStep &step
 		rc.extent.height = rotated_rc.h;
 	}
 
+	recordBarrier_.Flush(cmd);
+
 	rp_begin.renderArea = rc;
 	rp_begin.clearValueCount = numClearVals;
 	rp_begin.pClearValues = numClearVals ? clearVal : nullptr;
 	vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	return renderPass;
 }
 
 void VulkanQueueRunner::PerformCopy(const VKRStep &step, VkCommandBuffer cmd) {
 	VKRFramebuffer *src = step.copy.src;
 	VKRFramebuffer *dst = step.copy.dst;
 
-	VkImageCopy copy{};
-	copy.srcOffset.x = step.copy.srcRect.offset.x;
-	copy.srcOffset.y = step.copy.srcRect.offset.y;
-	copy.srcOffset.z = 0;
-	copy.srcSubresource.mipLevel = 0;
-	copy.srcSubresource.layerCount = 1;
-	copy.dstOffset.x = step.copy.dstPos.x;
-	copy.dstOffset.y = step.copy.dstPos.y;
-	copy.dstOffset.z = 0;
-	copy.dstSubresource.mipLevel = 0;
-	copy.dstSubresource.layerCount = 1;
-	copy.extent.width = step.copy.srcRect.extent.width;
-	copy.extent.height = step.copy.srcRect.extent.height;
-	copy.extent.depth = 1;
+	int layerCount = std::min(step.copy.src->numLayers, step.copy.dst->numLayers);
+	_dbg_assert_(step.copy.src->numLayers >= step.copy.dst->numLayers);
 
-	VkImageMemoryBarrier srcBarriers[2]{};
-	VkImageMemoryBarrier dstBarriers[2]{};
-	int srcCount = 0;
-	int dstCount = 0;
+	// TODO: If dst covers exactly the whole destination, we can set up a UNDEFINED->TRANSFER_DST_OPTIMAL transition,
+	// which can potentially be more efficient.
 
-	VkPipelineStageFlags srcStage = 0;
-	VkPipelineStageFlags dstStage = 0;
-	// First source barriers.
+	const VkImageLayout srcTransferLayout = src != dst ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+
 	if (step.copy.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
-		if (src->color.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-			SetupTransitionToTransferSrc(src->color, srcBarriers[srcCount++], srcStage, VK_IMAGE_ASPECT_COLOR_BIT);
-		}
-		if (dst->color.layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-			SetupTransitionToTransferDst(dst->color, dstBarriers[dstCount++], dstStage, VK_IMAGE_ASPECT_COLOR_BIT);
+		recordBarrier_.TransitionColorImageAuto(&src->color, srcTransferLayout);
+		if (src != dst) {
+			recordBarrier_.TransitionColorImageAuto(&dst->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 		}
 	}
 
 	// We can't copy only depth or only stencil unfortunately - or can we?.
 	if (step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-		if (src->depth.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-			SetupTransitionToTransferSrc(src->depth, srcBarriers[srcCount++], srcStage, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-		}
-		if (dst->depth.layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-			SetupTransitionToTransferDst(dst->depth, dstBarriers[dstCount++], dstStage, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-			_dbg_assert_(dst->depth.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		_dbg_assert_(src->depth.image != VK_NULL_HANDLE);
+		recordBarrier_.TransitionDepthStencilImageAuto(&src->depth, srcTransferLayout);
+		if (src != dst) {
+			if (dst->depth.layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+				recordBarrier_.TransitionDepthStencilImageAuto(&dst->depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			} else {
+				// Kingdom Hearts: Subsequent copies twice to the same depth buffer without any other use.
+				// Not super sure how that happens, but we need a barrier to pass sync validation.
+				SetupTransferDstWriteAfterWrite(dst->depth, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, &recordBarrier_);
+			}
 		}
 	}
 
-	if (srcCount) {
-		vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, srcCount, srcBarriers);
+	bool multisampled = src->sampleCount != VK_SAMPLE_COUNT_1_BIT && dst->sampleCount != VK_SAMPLE_COUNT_1_BIT;
+	if (multisampled) {
+		// If both the targets are multisampled, copy the msaa targets too.
+		// For that, we need to transition them from their normally permanent VK_*_ATTACHMENT_OPTIMAL layouts, and then back.
+		if (step.copy.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+			recordBarrier_.TransitionColorImageAuto(&src->msaaColor, srcTransferLayout);
+			if (src != dst) {
+				recordBarrier_.TransitionColorImageAuto(&dst->msaaColor, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			}
+		}
+		if (step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+			recordBarrier_.TransitionDepthStencilImageAuto(&src->msaaDepth, srcTransferLayout);
+			if (src != dst) {
+				// Kingdom Hearts: Subsequent copies to the same depth buffer without any other use.
+				// Not super sure how that happens, but we need a barrier to pass sync validation.
+				recordBarrier_.TransitionDepthStencilImageAuto(&dst->msaaDepth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+			}
+		}
 	}
-	if (dstCount) {
-		vkCmdPipelineBarrier(cmd, dstStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, dstCount, dstBarriers);
-	}
+
+	recordBarrier_.Flush(cmd);
+
+	VkImageCopy copy{};
+	copy.srcOffset.x = step.copy.srcRect.offset.x;
+	copy.srcOffset.y = step.copy.srcRect.offset.y;
+	copy.srcOffset.z = 0;
+	copy.srcSubresource.mipLevel = 0;
+	copy.srcSubresource.layerCount = layerCount;
+	copy.dstOffset.x = step.copy.dstPos.x;
+	copy.dstOffset.y = step.copy.dstPos.y;
+	copy.dstOffset.z = 0;
+	copy.dstSubresource.mipLevel = 0;
+	copy.dstSubresource.layerCount = layerCount;
+	copy.extent.width = step.copy.srcRect.extent.width;
+	copy.extent.height = step.copy.srcRect.extent.height;
+	copy.extent.depth = 1;
 
 	if (step.copy.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
 		copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		vkCmdCopyImage(cmd, src->color.image, src->color.layout, dst->color.image, dst->color.layout, 1, &copy);
+
+		if (multisampled) {
+			vkCmdCopyImage(cmd, src->msaaColor.image, src->msaaColor.layout, dst->msaaColor.image, dst->msaaColor.layout, 1, &copy);
+		}
 	}
 	if (step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+		_dbg_assert_(src->depth.image != VK_NULL_HANDLE);
+		_dbg_assert_(dst->depth.image != VK_NULL_HANDLE);
 		copy.srcSubresource.aspectMask = step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 		copy.dstSubresource.aspectMask = step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 		vkCmdCopyImage(cmd, src->depth.image, src->depth.layout, dst->depth.image, dst->depth.layout, 1, &copy);
+
+		if (multisampled) {
+			vkCmdCopyImage(cmd, src->msaaDepth.image, src->msaaDepth.layout, dst->msaaDepth.image, dst->msaaDepth.layout, 1, &copy);
+		}
+	}
+
+	if (multisampled) {
+		// Transition the MSAA surfaces back to optimal.
+		if (step.copy.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+			recordBarrier_.TransitionImage(
+				src->msaaColor.image,
+				0,
+				1,
+				src->msaaColor.numLayers,
+				VK_IMAGE_ASPECT_COLOR_BIT,
+				srcTransferLayout,
+				VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				VK_ACCESS_TRANSFER_READ_BIT,
+				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+			);
+			src->msaaColor.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			if (src != dst) {
+				recordBarrier_.TransitionImage(
+					dst->msaaColor.image,
+					0,
+					1,
+					dst->msaaColor.numLayers,
+					VK_IMAGE_ASPECT_COLOR_BIT,
+					VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+				);
+				dst->msaaColor.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			}
+		}
+		if (step.copy.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+			recordBarrier_.TransitionImage(
+				src->msaaDepth.image,
+				0,
+				1,
+				src->msaaDepth.numLayers,
+				VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+				srcTransferLayout,
+				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_ACCESS_TRANSFER_READ_BIT,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+			);
+			src->msaaDepth.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+			if (src != dst) {
+				recordBarrier_.TransitionImage(
+					dst->msaaDepth.image,
+					0,
+					1,
+					dst->msaaDepth.numLayers,
+					VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+					VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+					VK_ACCESS_TRANSFER_WRITE_BIT,
+					VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+				);
+				dst->msaaDepth.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+			}
+		}
+		// Probably not necessary.
+		recordBarrier_.Flush(cmd);
 	}
 }
 
 void VulkanQueueRunner::PerformBlit(const VKRStep &step, VkCommandBuffer cmd) {
-	VkImageMemoryBarrier srcBarriers[2]{};
-	VkImageMemoryBarrier dstBarriers[2]{};
+	// The barrier code doesn't handle this case. We'd need to transition to GENERAL to do an intra-image copy.
+	_dbg_assert_(step.blit.src != step.blit.dst);
+
+	int layerCount = std::min(step.blit.src->numLayers, step.blit.dst->numLayers);
+	_dbg_assert_(step.blit.src->numLayers >= step.blit.dst->numLayers);
+
+	// Blitting is not allowed for multisample images. You're suppose to use vkCmdResolveImage but it only goes in one direction (multi to single).
+	_dbg_assert_(step.blit.src->sampleCount == VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT);
+	_dbg_assert_(step.blit.dst->sampleCount == VkSampleCountFlagBits::VK_SAMPLE_COUNT_1_BIT);
 
 	VKRFramebuffer *src = step.blit.src;
 	VKRFramebuffer *dst = step.blit.dst;
+
+	// First source barriers.
+	if (step.blit.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+		recordBarrier_.TransitionColorImageAuto(&src->color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		recordBarrier_.TransitionColorImageAuto(&dst->color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	}
+
+	// We can't copy only depth or only stencil unfortunately.
+	if (step.blit.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+		_assert_(src->depth.image != VK_NULL_HANDLE);
+		_assert_(dst->depth.image != VK_NULL_HANDLE);
+		recordBarrier_.TransitionDepthStencilImageAuto(&src->depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		recordBarrier_.TransitionDepthStencilImageAuto(&dst->depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	}
+
+	recordBarrier_.Flush(cmd);
 
 	// If any validation needs to be performed here, it should probably have been done
 	// already when the blit was queued. So don't validate here.
@@ -1552,7 +1809,7 @@ void VulkanQueueRunner::PerformBlit(const VKRStep &step, VkCommandBuffer cmd) {
 	blit.srcOffsets[1].y = step.blit.srcRect.offset.y + step.blit.srcRect.extent.height;
 	blit.srcOffsets[1].z = 1;
 	blit.srcSubresource.mipLevel = 0;
-	blit.srcSubresource.layerCount = 1;
+	blit.srcSubresource.layerCount = layerCount;
 	blit.dstOffsets[0].x = step.blit.dstRect.offset.x;
 	blit.dstOffsets[0].y = step.blit.dstRect.offset.y;
 	blit.dstOffsets[0].z = 0;
@@ -1560,40 +1817,7 @@ void VulkanQueueRunner::PerformBlit(const VKRStep &step, VkCommandBuffer cmd) {
 	blit.dstOffsets[1].y = step.blit.dstRect.offset.y + step.blit.dstRect.extent.height;
 	blit.dstOffsets[1].z = 1;
 	blit.dstSubresource.mipLevel = 0;
-	blit.dstSubresource.layerCount = 1;
-
-	VkPipelineStageFlags srcStage = 0;
-	VkPipelineStageFlags dstStage = 0;
-
-	int srcCount = 0;
-	int dstCount = 0;
-
-	// First source barriers.
-	if (step.blit.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
-		if (src->color.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-			SetupTransitionToTransferSrc(src->color, srcBarriers[srcCount++], srcStage, VK_IMAGE_ASPECT_COLOR_BIT);
-		}
-		if (dst->color.layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-			SetupTransitionToTransferDst(dst->color, dstBarriers[dstCount++], dstStage, VK_IMAGE_ASPECT_COLOR_BIT);
-		}
-	}
-
-	// We can't copy only depth or only stencil unfortunately.
-	if (step.blit.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-		if (src->depth.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-			SetupTransitionToTransferSrc(src->depth, srcBarriers[srcCount++], srcStage, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-		}
-		if (dst->depth.layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-			SetupTransitionToTransferDst(dst->depth, dstBarriers[dstCount++], dstStage, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-		}
-	}
-
-	if (srcCount) {
-		vkCmdPipelineBarrier(cmd, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, srcCount, srcBarriers);
-	}
-	if (dstCount) {
-		vkCmdPipelineBarrier(cmd, dstStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, dstCount, dstBarriers);
-	}
+	blit.dstSubresource.layerCount = layerCount;
 
 	if (step.blit.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
 		blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1618,90 +1842,120 @@ void VulkanQueueRunner::PerformBlit(const VKRStep &step, VkCommandBuffer cmd) {
 	}
 }
 
-void VulkanQueueRunner::SetupTransitionToTransferSrc(VKRImage &img, VkImageMemoryBarrier &barrier, VkPipelineStageFlags &stage, VkImageAspectFlags aspect) {
-	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	barrier.oldLayout = img.layout;
-	barrier.subresourceRange.layerCount = 1;
-	barrier.subresourceRange.levelCount = 1;
-	barrier.image = img.image;
-	barrier.srcAccessMask = 0;
-	switch (img.layout) {
-	case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-		stage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-		stage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		stage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		stage |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		break;
-	default:
-		_dbg_assert_msg_(false, "Transition from this layout to transfer src not supported (%d)", (int)img.layout);
-		break;
-	}
-	barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+void VulkanQueueRunner::SetupTransferDstWriteAfterWrite(VKRImage &img, VkImageAspectFlags aspect, VulkanBarrierBatch *recordBarrier) {
+	VkImageAspectFlags imageAspect = aspect;
+	VkAccessFlags srcAccessMask = 0;
+	VkPipelineStageFlags srcStageMask = 0;
 	if (img.format == VK_FORMAT_D16_UNORM_S8_UINT || img.format == VK_FORMAT_D24_UNORM_S8_UINT || img.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
 		// Barrier must specify both for combined depth/stencil buffers.
-		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+		imageAspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
 	} else {
-		barrier.subresourceRange.aspectMask = aspect;
+		imageAspect = aspect;
 	}
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	img.layout = barrier.newLayout;
+	_dbg_assert_(img.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	recordBarrier->TransitionImage(
+		img.image,
+		0,
+		1,
+		img.numLayers,
+		aspect,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_ACCESS_TRANSFER_WRITE_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT
+	);
 }
 
-void VulkanQueueRunner::SetupTransitionToTransferDst(VKRImage &img, VkImageMemoryBarrier &barrier, VkPipelineStageFlags &stage, VkImageAspectFlags aspect) {
-	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	barrier.oldLayout = img.layout;
-	barrier.subresourceRange.layerCount = 1;
-	barrier.subresourceRange.levelCount = 1;
-	barrier.image = img.image;
-	barrier.srcAccessMask = 0;
-	switch (img.layout) {
-	case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-		stage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-		stage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-		stage |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-		break;
-	case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-		barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		stage |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		break;
-	default:
-		_dbg_assert_msg_(false, "Transition from this layout to transfer dst not supported (%d)", (int)img.layout);
-		break;
+void VulkanQueueRunner::ResizeReadbackBuffer(CachedReadback *readback, VkDeviceSize requiredSize) {
+	if (readback->buffer && requiredSize <= readback->bufferSize) {
+		return;
 	}
-	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	if (img.format == VK_FORMAT_D16_UNORM_S8_UINT || img.format == VK_FORMAT_D24_UNORM_S8_UINT || img.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
-		// Barrier must specify both for combined depth/stencil buffers.
-		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-	} else {
-		barrier.subresourceRange.aspectMask = aspect;
+
+	if (readback->buffer) {
+		vulkan_->Delete().QueueDeleteBufferAllocation(readback->buffer, readback->allocation);
 	}
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	img.layout = barrier.newLayout;
+
+	readback->bufferSize = requiredSize;
+
+	VkDevice device = vulkan_->GetDevice();
+
+	VkBufferCreateInfo buf{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+	buf.size = readback->bufferSize;
+	buf.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+	VmaAllocationCreateInfo allocCreateInfo{};
+	allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+	VmaAllocationInfo allocInfo{};
+
+	VkResult res = vmaCreateBuffer(vulkan_->Allocator(), &buf, &allocCreateInfo, &readback->buffer, &readback->allocation, &allocInfo);
+	_assert_(res == VK_SUCCESS);
+
+	const VkMemoryType &memoryType = vulkan_->GetMemoryProperties().memoryTypes[allocInfo.memoryType];
+	readback->isCoherent = (memoryType.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 }
 
-void VulkanQueueRunner::PerformReadback(const VKRStep &step, VkCommandBuffer cmd) {
-	ResizeReadbackBuffer(sizeof(uint32_t) * step.readback.srcRect.extent.width * step.readback.srcRect.extent.height);
+void VulkanQueueRunner::PerformReadback(const VKRStep &step, VkCommandBuffer cmd, FrameData &frameData) {
+	VkImage image;
+	VkImageLayout copyLayout;
+	// Special case for backbuffer readbacks.
+	if (step.readback.src == nullptr) {
+		// We only take screenshots after the main render pass (anything else would be stupid) so we need to transition out of PRESENT,
+		// and then back into it.
+		// Regarding layers, backbuffer currently only has one layer.
+		recordBarrier_.TransitionImage(backbufferImage_, 0, 1, 1, VK_IMAGE_ASPECT_COLOR_BIT,
+			vulkan_->GetPresentLayout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			0, VK_ACCESS_TRANSFER_READ_BIT,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		copyLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		image = backbufferImage_;
+	} else {
+		VKRImage *srcImage;
+		if (step.readback.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
+			srcImage = &step.readback.src->color;
+			recordBarrier_.TransitionColorImageAuto(srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+		} else if (step.readback.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+			srcImage = &step.readback.src->depth;
+			recordBarrier_.TransitionDepthStencilImageAuto(srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+			_dbg_assert_(srcImage->image != VK_NULL_HANDLE);
+		} else {
+			_dbg_assert_msg_(false, "No image aspect to readback?");
+			return;
+		}
+		image = srcImage->image;
+		copyLayout = srcImage->layout;
+	}
+
+	recordBarrier_.Flush(cmd);
+
+	// TODO: Handle different readback formats!
+	u32 readbackSizeInBytes = sizeof(uint32_t) * step.readback.srcRect.extent.width * step.readback.srcRect.extent.height;
+
+	CachedReadback *cached = nullptr;
+
+	if (step.readback.delayed) {
+		ReadbackKey key{};
+		key.framebuf = step.readback.src;
+		key.x = step.readback.srcRect.offset.x;
+		key.y = step.readback.srcRect.offset.y;
+		key.width = step.readback.srcRect.extent.width;
+		key.height = step.readback.srcRect.extent.height;
+		key.aspectMask = step.readback.aspectMask;
+
+		// See if there's already a buffer we can reuse
+		if (!frameData.readbacks_.Get(key, &cached)) {
+			cached = new CachedReadback();
+			cached->bufferSize = 0;
+			frameData.readbacks_.Insert(key, cached);
+		}
+	} else {
+		cached = &syncReadback_;
+	}
+
+	ResizeReadbackBuffer(cached, readbackSizeInBytes);
 
 	VkBufferImageCopy region{};
 	region.imageOffset = { step.readback.srcRect.offset.x, step.readback.srcRect.offset.y, 0 };
@@ -1712,40 +1966,7 @@ void VulkanQueueRunner::PerformReadback(const VKRStep &step, VkCommandBuffer cmd
 	region.bufferRowLength = step.readback.srcRect.extent.width;
 	region.bufferImageHeight = step.readback.srcRect.extent.height;
 
-	VkImage image;
-	VkImageLayout copyLayout;
-	// Special case for backbuffer readbacks.
-	if (step.readback.src == nullptr) {
-		// We only take screenshots after the main render pass (anything else would be stupid) so we need to transition out of PRESENT,
-		// and then back into it.
-		TransitionImageLayout2(cmd, backbufferImage_, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT,
-			VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0, VK_ACCESS_TRANSFER_READ_BIT);
-		copyLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-		image = backbufferImage_;
-	} else {
-		VKRImage *srcImage;
-		if (step.readback.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
-			srcImage = &step.readback.src->color;
-		} else if (step.readback.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-			srcImage = &step.readback.src->depth;
-		} else {
-			_dbg_assert_msg_(false, "No image aspect to readback?");
-			return;
-		}
-
-		VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-		VkPipelineStageFlags stage = 0;
-		if (srcImage->layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-			SetupTransitionToTransferSrc(*srcImage, barrier, stage, step.readback.aspectMask);
-			vkCmdPipelineBarrier(cmd, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-		}
-		image = srcImage->image;
-		copyLayout = srcImage->layout;
-	}
-
-	vkCmdCopyImageToBuffer(cmd, image, copyLayout, readbackBuffer_, 1, &region);
+	vkCmdCopyImageToBuffer(cmd, image, copyLayout, cached->buffer, 1, &region);
 
 	// NOTE: Can't read the buffer using the CPU here - need to sync first.
 
@@ -1753,26 +1974,23 @@ void VulkanQueueRunner::PerformReadback(const VKRStep &step, VkCommandBuffer cmd
 	if (step.readback.src == nullptr) {
 		// We only take screenshots after the main render pass (anything else would be stupid) so we need to transition out of PRESENT,
 		// and then back into it.
-		TransitionImageLayout2(cmd, backbufferImage_, 0, 1, VK_IMAGE_ASPECT_COLOR_BIT,
-			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-			VK_ACCESS_TRANSFER_READ_BIT, 0);
+		// Regarding layers, backbuffer currently only has one layer.
+		recordBarrier_.TransitionImage(backbufferImage_, 0, 1, 1, VK_IMAGE_ASPECT_COLOR_BIT,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vulkan_->GetPresentLayout(),
+			VK_ACCESS_TRANSFER_READ_BIT, 0,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+		recordBarrier_.Flush(cmd);  // probably not needed
 		copyLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 	}
 }
 
 void VulkanQueueRunner::PerformReadbackImage(const VKRStep &step, VkCommandBuffer cmd) {
 	// TODO: Clean this up - just reusing `SetupTransitionToTransferSrc`.
-	VKRImage srcImage{};
-	srcImage.image = step.readback_image.image;
-	srcImage.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	recordBarrier_.TransitionColorImageAuto(step.readback_image.image, &layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 1, 1);
+	recordBarrier_.Flush(cmd);
 
-	VkImageMemoryBarrier barrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-	VkPipelineStageFlags stage = 0;
-	SetupTransitionToTransferSrc(srcImage, barrier, stage, VK_IMAGE_ASPECT_COLOR_BIT);
-	vkCmdPipelineBarrier(cmd, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-	ResizeReadbackBuffer(sizeof(uint32_t) * step.readback_image.srcRect.extent.width * step.readback_image.srcRect.extent.height);
+	ResizeReadbackBuffer(&syncReadback_, sizeof(uint32_t) * step.readback_image.srcRect.extent.width * step.readback_image.srcRect.extent.height);
 
 	VkBufferImageCopy region{};
 	region.imageOffset = { step.readback_image.srcRect.offset.x, step.readback_image.srcRect.offset.y, 0 };
@@ -1783,39 +2001,56 @@ void VulkanQueueRunner::PerformReadbackImage(const VKRStep &step, VkCommandBuffe
 	region.bufferOffset = 0;
 	region.bufferRowLength = step.readback_image.srcRect.extent.width;
 	region.bufferImageHeight = step.readback_image.srcRect.extent.height;
-	vkCmdCopyImageToBuffer(cmd, step.readback_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readbackBuffer_, 1, &region);
+	vkCmdCopyImageToBuffer(cmd, step.readback_image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, syncReadback_.buffer, 1, &region);
 
 	// Now transfer it back to a texture.
-	TransitionImageLayout2(cmd, step.readback_image.image, 0, 1,
+	recordBarrier_.TransitionImage(step.readback_image.image, 0, 1, 1,  // I don't think we have any multilayer cases for regular textures. Above in PerformReadback, though..
 		VK_IMAGE_ASPECT_COLOR_BIT,
 		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT);
+		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	recordBarrier_.Flush(cmd);  // probably not needed
 
 	// NOTE: Can't read the buffer using the CPU here - need to sync first.
 	// Doing that will also act like a heavyweight barrier ensuring that device writes are visible on the host.
 }
 
-void VulkanQueueRunner::CopyReadbackBuffer(int width, int height, Draw::DataFormat srcFormat, Draw::DataFormat destFormat, int pixelStride, uint8_t *pixels) {
-	if (!readbackMemory_)
-		return;  // Something has gone really wrong.
+bool VulkanQueueRunner::CopyReadbackBuffer(FrameData &frameData, VKRFramebuffer *src, int x, int y, int width, int height, VkImageAspectFlags aspectMask, Draw::DataFormat srcFormat, Draw::DataFormat destFormat, int pixelStride, uint8_t *pixels) {
+	CachedReadback *readback = &syncReadback_;
+
+	// Look up in readback cache.
+	if (src) {
+		ReadbackKey key{};
+		key.framebuf = src;
+		key.x = x;
+		key.y = y;
+		key.width = width;
+		key.height = height;
+		key.aspectMask = aspectMask;
+		CachedReadback *cached;
+		if (frameData.readbacks_.Get(key, &cached)) {
+			readback = cached;
+		} else {
+			// Didn't have a cached image ready yet
+			return false;
+		}
+	}
+
+	if (!readback->buffer)
+		return false;  // Didn't find anything in cache, or something has gone really wrong.
 
 	// Read back to the requested address in ram from buffer.
 	void *mappedData;
 	const size_t srcPixelSize = DataFormatSizeInBytes(srcFormat);
-
-	VkResult res = vkMapMemory(vulkan_->GetDevice(), readbackMemory_, 0, width * height * srcPixelSize, 0, &mappedData);
-	if (!readbackBufferIsCoherent_) {
-		VkMappedMemoryRange range{};
-		range.memory = readbackMemory_;
-		range.offset = 0;
-		range.size = width * height * srcPixelSize;
-		vkInvalidateMappedMemoryRanges(vulkan_->GetDevice(), 1, &range);
-	}
+	VkResult res = vmaMapMemory(vulkan_->Allocator(), readback->allocation, &mappedData);
 
 	if (res != VK_SUCCESS) {
-		ERROR_LOG(G3D, "CopyReadbackBuffer: vkMapMemory failed! result=%d", (int)res);
-		return;
+		ERROR_LOG(Log::G3D, "CopyReadbackBuffer: vkMapMemory failed! result=%d", (int)res);
+		return false;
+	}
+
+	if (!readback->isCoherent) {
+		vmaInvalidateAllocation(vulkan_->Allocator(), readback->allocation, 0, width * height * srcPixelSize);
 	}
 
 	// TODO: Perform these conversions in a compute shader on the GPU.
@@ -1834,10 +2069,35 @@ void VulkanQueueRunner::CopyReadbackBuffer(int width, int height, Draw::DataForm
 		}
 	} else if (destFormat == Draw::DataFormat::D32F) {
 		ConvertToD32F(pixels, (const uint8_t *)mappedData, pixelStride, width, width, height, srcFormat);
+	} else if (destFormat == Draw::DataFormat::D16) {
+		ConvertToD16(pixels, (const uint8_t *)mappedData, pixelStride, width, width, height, srcFormat);
 	} else {
 		// TODO: Maybe a depth conversion or something?
-		ERROR_LOG(G3D, "CopyReadbackBuffer: Unknown format");
+		ERROR_LOG(Log::G3D, "CopyReadbackBuffer: Unknown format");
 		_assert_msg_(false, "CopyReadbackBuffer: Unknown src format %d", (int)srcFormat);
 	}
-	vkUnmapMemory(vulkan_->GetDevice(), readbackMemory_);
+
+	vmaUnmapMemory(vulkan_->Allocator(), readback->allocation);
+	return true;
+}
+
+const char *VKRRenderCommandToString(VKRRenderCommand cmd) {
+	const char * const str[] = {
+		"REMOVED",
+		"BIND_GRAPHICS_PIPELINE",  // async
+		"STENCIL",
+		"BLEND",
+		"VIEWPORT",
+		"SCISSOR",
+		"CLEAR",
+		"DRAW",
+		"DRAW_INDEXED",
+		"PUSH_CONSTANTS",
+		"DEBUG_ANNOTATION",
+	};
+	if ((int)cmd < ARRAY_SIZE(str)) {
+		return str[(int)cmd];
+	} else {
+		return "N/A";
+	}
 }

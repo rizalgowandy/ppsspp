@@ -17,10 +17,26 @@
 
 #pragma once
 
+#include "Common/CommonTypes.h"
+
+#include <cstdlib>
 #include <string>
 
 namespace GPURecord {
 
-bool RunMountedReplay(const std::string &filename);
-
+enum class ReplayResult {
+	Done = 0,
+	Error = 1,
+	Break = 2,
 };
+
+void WriteRunDumpCode(u32 addr);
+// Only draws primitives up to this one (1-based, counting PRIM, BEZIER and SPLINE), like the PSP side's
+// pspautotests/utils/ppdmp-playback --end. 0 draws everything.
+void SetReplayDrawLimit(int lastPrim);
+ReplayResult RunMountedReplay(const std::string &filename);
+
+// Will also cancel a currently running replay.
+void Replay_Unload();
+
+}  // namespace GPURecord

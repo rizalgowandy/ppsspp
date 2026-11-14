@@ -19,66 +19,38 @@
 #pragma once
 
 #include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Log.h"
 #include "Core/MIPS/MIPS.h"
 
-struct JitBlock;
-class JitBlockCache;
-
 namespace MIPSComp {
 
-	enum CompileDelaySlotFlags
-	{
-		// Easy, nothing extra.
-		DELAYSLOT_NICE = 0,
-		// Flush registers after delay slot.
-		DELAYSLOT_FLUSH = 1,
-		// Preserve flags.
-		DELAYSLOT_SAFE = 2,
-		// Flush registers after and preserve flags.
-		DELAYSLOT_SAFE_FLUSH = DELAYSLOT_FLUSH | DELAYSLOT_SAFE,
-	};
-
-	struct JitState
-	{
-		enum PrefixState
-		{
+	struct JitState {
+		enum PrefixState {
 			PREFIX_UNKNOWN = 0x00,
 			PREFIX_KNOWN = 0x01,
 			PREFIX_DIRTY = 0x10,
 			PREFIX_KNOWN_DIRTY = 0x11,
 		};
 
-		enum AfterOp
-		{
-			AFTER_NONE = 0x00,
-			AFTER_CORE_STATE = 0x01,
-			AFTER_REWIND_PC_BAD_STATE = 0x02,
-			AFTER_MEMCHECK_CLEANUP = 0x04,
-		};
-
 		u32 compilerPC;
 		u32 blockStart;
-		u32 lastContinuedPC;
-		u32 initialBlockSize;
-		int nextExit;
 		bool cancel;
 		bool inDelaySlot;
-		// See JitState::AfterOp for values.
-		int afterOp;
+		bool kernelMode;  // Changes what instructions are allowed.
 		int downcountAmount;
 		int numInstructions;
+		// Conditional branches compiled past (IR only).
+		int continuedBranches;
 		bool compiling;	// TODO: get rid of this in favor of using analysis results to determine end of block
 		bool hadBreakpoints;
-		bool preloading = false;
-		JitBlock *curBlock;
 
 		u8 hasSetRounding = 0;
 		u8 lastSetRounding = 0;
-		const u8 *currentRoundingFunc = nullptr;
 
 		// VFPU prefix magic
 		bool startDefaultPrefix = true;
+		bool blockWrotePrefixes = false;
 		u32 prefixS;
 		u32 prefixT;
 		u32 prefixD;
@@ -146,12 +118,12 @@ namespace MIPSComp {
 
 		u8 VfpuWriteMask() const {
 			_assert_(prefixDFlag & JitState::PREFIX_KNOWN);
-			return (prefixD >> 8) & 0xF;
+			return VFPUPrefixWriteMask(prefixD);
 		}
 
 		bool VfpuWriteMask(int i) const {
 			_assert_(prefixDFlag & JitState::PREFIX_KNOWN);
-			return (prefixD >> (8 + i)) & 1;
+			return VFPUPrefixWriteMask(prefixD, i);
 		}
 
 		void LogPrefix() {
@@ -163,25 +135,27 @@ namespace MIPSComp {
 	private:
 		void LogSTPrefix(const char *name, int p, int pflag) {
 			if ((prefixSFlag & PREFIX_KNOWN) == 0) {
-				ERROR_LOG(JIT, "%s: unknown  (%08x %i)", name, p, pflag);
+				ERROR_LOG(Log::JIT, "%s: unknown  (%08x %i)", name, p, pflag);
 			} else if (prefixS != 0xE4) {
-				ERROR_LOG(JIT, "%s: %08x flag: %i", name, p, pflag);
+				ERROR_LOG(Log::JIT, "%s: %08x flag: %i", name, p, pflag);
 			} else {
-				WARN_LOG(JIT, "%s: %08x flag: %i", name, p, pflag);
+				WARN_LOG(Log::JIT, "%s: %08x flag: %i", name, p, pflag);
 			}
 		}
 		void LogDPrefix() {
 			if ((prefixDFlag & PREFIX_KNOWN) == 0) {
-				ERROR_LOG(JIT, "D: unknown (%08x %i)", prefixD, prefixDFlag);
+				ERROR_LOG(Log::JIT, "D: unknown (%08x %i)", prefixD, prefixDFlag);
 			} else if (prefixD != 0) {
-				ERROR_LOG(JIT, "D: (%08x %i)", prefixD, prefixDFlag);
+				ERROR_LOG(Log::JIT, "D: (%08x %i)", prefixD, prefixDFlag);
 			} else {
-				WARN_LOG(JIT, "D: %08x flag: %i", prefixD, prefixDFlag);
+				WARN_LOG(Log::JIT, "D: %08x flag: %i", prefixD, prefixDFlag);
 			}
 		}
 	};
 
-	enum class JitDisable {
+	enum class JitDisable : u32 {
+		DEFAULT = 0,
+
 		ALU = 0x0001,
 		ALU_IMM = 0x0002,
 		ALU_BIT = 0x0004,
@@ -214,13 +188,16 @@ namespace MIPSComp {
 
 		ALL_FLAGS = 0x3FFFFFFF,
 	};
+	ENUM_CLASS_BITOPS(JitDisable);
 
 	struct JitOptions {
 		JitOptions();
 
-		bool Disabled(JitDisable bit);
+		bool Disabled(JitDisable bit) const {
+			return (disableFlags & bit) != 0;
+		}
 
-		uint32_t disableFlags;
+		JitDisable disableFlags;
 
 		// x86
 		bool enableVFPUSIMD;
@@ -231,20 +208,14 @@ namespace MIPSComp {
 		bool useForwardJump;
 		bool cachePointers;
 		// ARM only
-		bool useNEONVFPU;
 		bool downcountInRegister;
-		// ARM64 only
-		bool useASIMDVFPU;
+		// ARM64 and RV64
 		bool useStaticAlloc;
 		bool enablePointerify;
+		// IR Interpreter
+		bool optimizeForInterpreter;
 
 		// Common
 		bool enableBlocklink;
-		bool immBranches;
-		bool continueBranches;
-		bool continueJumps;
-		int continueMaxInstructions;
 	};
-
 }
-

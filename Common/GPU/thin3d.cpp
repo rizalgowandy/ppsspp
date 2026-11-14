@@ -2,10 +2,11 @@
 #include <cstring>
 #include <cstdint>
 
-#include "Common/System/Display.h"
+#include "Common/Data/Convert/ColorConv.h"
 #include "Common/GPU/thin3d.h"
+#include "Common/GPU/ShaderWriter.h"
 #include "Common/Log.h"
-#include "Common/ColorConv.h"
+#include "Common/System/Display.h"
 
 namespace Draw {
 
@@ -33,6 +34,9 @@ size_t DataFormatSizeInBytes(DataFormat fmt) {
 	case DataFormat::R8G8B8A8_SNORM: return 4;
 	case DataFormat::R8G8B8A8_UINT: return 4;
 	case DataFormat::R8G8B8A8_SINT: return 4;
+
+	case DataFormat::R16_UNORM: return 2;
+
 	case DataFormat::R16_FLOAT: return 2;
 	case DataFormat::R16G16_FLOAT: return 4;
 	case DataFormat::R16G16B16A16_FLOAT: return 8;
@@ -43,6 +47,7 @@ size_t DataFormatSizeInBytes(DataFormat fmt) {
 
 	case DataFormat::S8: return 1;
 	case DataFormat::D16: return 2;
+	case DataFormat::D16_S8: return 3;
 	case DataFormat::D24_S8: return 4;
 	case DataFormat::D32F: return 4;
 	// Or maybe 8...
@@ -53,9 +58,32 @@ size_t DataFormatSizeInBytes(DataFormat fmt) {
 	}
 }
 
+const char *DataFormatToString(DataFormat fmt) {
+	switch (fmt) {
+	case DataFormat::R8_UNORM: return "R8_UNORM";
+	case DataFormat::R8G8_UNORM: return "R8G8_UNORM";
+	case DataFormat::R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+	case DataFormat::B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+	case DataFormat::R16_UNORM: return "R16_UNORM";
+	case DataFormat::R16_FLOAT: return "R16_FLOAT";
+	case DataFormat::R32_FLOAT: return "R32_FLOAT";
+
+	case DataFormat::S8: return "S8";
+	case DataFormat::D16: return "D16";
+	case DataFormat::D16_S8: return "D16_S8";
+	case DataFormat::D24_S8: return "D24_S8";
+	case DataFormat::D32F: return "D32F";
+	case DataFormat::D32F_S8: return "D32F_S8";
+
+	default:
+		return "(N/A)";
+	}
+}
+
 bool DataFormatIsDepthStencil(DataFormat fmt) {
 	switch (fmt) {
 	case DataFormat::D16:
+	case DataFormat::D16_S8:
 	case DataFormat::D24_S8:
 	case DataFormat::S8:
 	case DataFormat::D32F:
@@ -66,299 +94,91 @@ bool DataFormatIsDepthStencil(DataFormat fmt) {
 	}
 }
 
+// We don't bother listing the formats that are irrelevant for PPSSPP, like BC6 (HDR format)
+// or weird-shaped ASTC formats. We only support 4x4 block size formats for now.
+// If you pass in a blockSize parameter, it receives byte count that a 4x4 block takes in this format.
+bool DataFormatIsBlockCompressed(DataFormat fmt, int *blockSize) {
+	switch (fmt) {
+	case DataFormat::BC1_RGBA_UNORM_BLOCK:
+	case DataFormat::BC4_UNORM_BLOCK:
+	case DataFormat::ETC2_R8G8B8_UNORM_BLOCK:
+		if (blockSize) *blockSize = 8;  // 64 bits
+		return true;
+	case DataFormat::BC2_UNORM_BLOCK:
+	case DataFormat::BC3_UNORM_BLOCK:
+	case DataFormat::BC5_UNORM_BLOCK:
+	case DataFormat::BC7_UNORM_BLOCK:
+	case DataFormat::ETC2_R8G8B8A1_UNORM_BLOCK:
+	case DataFormat::ETC2_R8G8B8A8_UNORM_BLOCK:
+	case DataFormat::ASTC_4x4_UNORM_BLOCK:
+		if (blockSize) *blockSize = 16;  // 128 bits
+		return true;
+	default:
+		if (blockSize) *blockSize = 0;
+		return false;
+	}
+}
+
+int DataFormatNumChannels(DataFormat fmt) {
+	switch (fmt) {
+	case DataFormat::D16:
+	case DataFormat::D32F:
+	case DataFormat::R8_UNORM:
+	case DataFormat::R16_UNORM:
+	case DataFormat::R16_FLOAT:
+	case DataFormat::R32_FLOAT:
+		return 1;
+	case DataFormat::R8G8B8A8_UNORM:
+	case DataFormat::R8G8B8A8_UNORM_SRGB:
+	case DataFormat::B8G8R8A8_UNORM:
+	case DataFormat::B8G8R8A8_UNORM_SRGB:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+RefCountedObject::~RefCountedObject() {
+	const int rc = refcount_.load();
+	_dbg_assert_msg_(rc == 0xDEDEDE, "Unexpected refcount %d in object of type '%s'", rc, name_);
+}
 
 bool RefCountedObject::Release() {
 	if (refcount_ > 0 && refcount_ < 10000) {
-		refcount_--;
-		if (refcount_ == 0) {
+		if (--refcount_ == 0) {
+			// Make it very obvious if we try to free this again.
+			refcount_ = 0xDEDEDE;
 			delete this;
 			return true;
 		}
-	}
-	else {
-		_dbg_assert_msg_(false, "Refcount (%d) invalid for object %p - corrupt?", refcount_, this);
+	} else {
+		// No point in printing the name here if the object has already been free-d, it'll be corrupt and dangerous to print.
+		_dbg_assert_msg_(false, "Refcount (%d) invalid for object %p - corrupt?", refcount_.load(), this);
 	}
 	return false;
 }
 
 bool RefCountedObject::ReleaseAssertLast() {
-	_dbg_assert_msg_(refcount_ == 1, "RefCountedObject: Expected to be the last reference, but isn't!");
-	if (refcount_ > 0 && refcount_ < 10000) {
-		refcount_--;
-		if (refcount_ == 0) {
-			delete this;
-			return true;
-		}
-	} else {
-		ERROR_LOG(G3D, "Refcount (%d) invalid for object %p - corrupt?", refcount_, this);
-	}
-	return false;
+	bool released = Release();
+	_dbg_assert_msg_(released, "RefCountedObject: Expected to be the last reference, but isn't! (%s)", name_);
+	return released;
 }
 
-
-// ================================== PIXEL/FRAGMENT SHADERS
-
-// The Vulkan ones can be re-used with modern GL later if desired, as they're just GLSL.
-
-static const std::vector<ShaderSource> fsTexCol = {
-	{ShaderLanguage::GLSL_1xx,
-	"#ifdef GL_ES\n"
-	"precision lowp float;\n"
-	"#endif\n"
-	"#if __VERSION__ >= 130\n"
-	"#define varying in\n"
-	"#define texture2D texture\n"
-	"#define gl_FragColor fragColor0\n"
-	"out vec4 fragColor0;\n"
-	"#endif\n"
-	"varying vec4 oColor0;\n"
-	"varying vec2 oTexCoord0;\n"
-	"uniform sampler2D Sampler0;\n"
-	"void main() { gl_FragColor = texture2D(Sampler0, oTexCoord0) * oColor0; }\n"
-	},
-	{ShaderLanguage::HLSL_D3D9,
-	"struct PS_INPUT { float4 color : COLOR0; float2 uv : TEXCOORD0; };\n"
-	"sampler2D Sampler0 : register(s0);\n"
-	"float4 main(PS_INPUT input) : COLOR0 {\n"
-	"  return input.color * tex2D(Sampler0, input.uv);\n"
-	"}\n"
-	},
-	{ShaderLanguage::HLSL_D3D11,
-	"struct PS_INPUT { float4 color : COLOR0; float2 uv : TEXCOORD0; };\n"
-	"SamplerState samp : register(s0);\n"
-	"Texture2D<float4> tex : register(t0);\n"
-	"float4 main(PS_INPUT input) : SV_Target {\n"
-	"  float4 col = input.color * tex.Sample(samp, input.uv);\n"
-	"  return col;\n"
-	"}\n"
-	},
-	{ShaderLanguage::GLSL_VULKAN,
-	"#version 140\n"
-	"#extension GL_ARB_separate_shader_objects : enable\n"
-	"#extension GL_ARB_shading_language_420pack : enable\n"
-	"layout(location = 0) in vec4 oColor0;\n"
-	"layout(location = 1) in vec2 oTexCoord0;\n"
-	"layout(location = 0) out vec4 fragColor0;\n"
-	"layout(set = 0, binding = 1) uniform sampler2D Sampler0;\n"
-	"void main() { fragColor0 = texture(Sampler0, oTexCoord0) * oColor0; }\n"
-	}
-};
-
-static const std::vector<ShaderSource> fsTexColRBSwizzle = {
-	{GLSL_1xx,
-	"#ifdef GL_ES\n"
-	"precision lowp float;\n"
-	"#endif\n"
-	"#if __VERSION__ >= 130\n"
-	"#define varying in\n"
-	"#define texture2D texture\n"
-	"#define gl_FragColor fragColor0\n"
-	"out vec4 fragColor0;\n"
-	"#endif\n"
-	"varying vec4 oColor0;\n"
-	"varying vec2 oTexCoord0;\n"
-	"uniform sampler2D Sampler0;\n"
-	"void main() { gl_FragColor = texture2D(Sampler0, oTexCoord0).zyxw * oColor0; }\n"
-	},
-	{ShaderLanguage::HLSL_D3D9,
-	"struct PS_INPUT { float4 color : COLOR0; float2 uv : TEXCOORD0; };\n"
-	"sampler2D Sampler0 : register(s0);\n"
-	"float4 main(PS_INPUT input) : COLOR0 {\n"
-	"  return input.color * tex2D(Sampler0, input.uv).zyxw;\n"
-	"}\n"
-	},
-	{ShaderLanguage::HLSL_D3D11,
-	"struct PS_INPUT { float4 color : COLOR0; float2 uv : TEXCOORD0; };\n"
-	"SamplerState samp : register(s0);\n"
-	"Texture2D<float4> tex : register(t0);\n"
-	"float4 main(PS_INPUT input) : SV_Target {\n"
-	"  float4 col = input.color * tex.Sample(samp, input.uv).bgra;\n"
-	"  return col;\n"
-	"}\n"
-	},
-	{ShaderLanguage::GLSL_VULKAN,
-	"#version 140\n"
-	"#extension GL_ARB_separate_shader_objects : enable\n"
-	"#extension GL_ARB_shading_language_420pack : enable\n"
-	"layout(location = 0) in vec4 oColor0;\n"
-	"layout(location = 1) in vec2 oTexCoord0;\n"
-	"layout(location = 0) out vec4 fragColor0\n;"
-	"layout(set = 0, binding = 1) uniform sampler2D Sampler0;\n"
-	"void main() { fragColor0 = texture(Sampler0, oTexCoord0).bgra * oColor0; }\n"
-	}
-};
-
-static const std::vector<ShaderSource> fsCol = {
-	{ GLSL_1xx,
-	"#ifdef GL_ES\n"
-	"precision lowp float;\n"
-	"#endif\n"
-	"#if __VERSION__ >= 130\n"
-	"#define varying in\n"
-	"#define gl_FragColor fragColor0\n"
-	"out vec4 fragColor0;\n"
-	"#endif\n"
-	"varying vec4 oColor0;\n"
-	"void main() { gl_FragColor = oColor0; }\n"
-	},
-	{ ShaderLanguage::HLSL_D3D9,
-	"struct PS_INPUT { float4 color : COLOR0; };\n"
-	"float4 main(PS_INPUT input) : COLOR0 {\n"
-	"  return input.color;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::HLSL_D3D11,
-	"struct PS_INPUT { float4 color : COLOR0; };\n"
-	"float4 main(PS_INPUT input) : SV_Target {\n"
-	"  return input.color;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::GLSL_VULKAN,
-	"#version 140\n"
-	"#extension GL_ARB_separate_shader_objects : enable\n"
-	"#extension GL_ARB_shading_language_420pack : enable\n"
-	"layout(location = 0) in vec4 oColor0;\n"
-	"layout(location = 0) out vec4 fragColor0;\n"
-	"void main() { fragColor0 = oColor0; }\n"
-	}
-};
-
-// ================================== VERTEX SHADERS
-
-static const std::vector<ShaderSource> vsCol = {
-	{ GLSL_1xx,
-	"#if __VERSION__ >= 130\n"
-	"#define attribute in\n"
-	"#define varying out\n"
-	"#endif\n"
-	"attribute vec3 Position;\n"
-	"attribute vec4 Color0;\n"
-	"varying vec4 oColor0;\n"
-
-	"uniform mat4 WorldViewProj;\n"
-	"void main() {\n"
-	"  gl_Position = WorldViewProj * vec4(Position, 1.0);\n"
-	"  oColor0 = Color0;\n"
-	"}"
-	},
-	{ ShaderLanguage::HLSL_D3D9,
-	"struct VS_INPUT { float3 Position : POSITION; float4 Color0 : COLOR0; };\n"
-	"struct VS_OUTPUT { float4 Position : POSITION; float4 Color0 : COLOR0; };\n"
-	"float4x4 WorldViewProj : register(c0);\n"
-	"VS_OUTPUT main(VS_INPUT input) {\n"
-	"  VS_OUTPUT output;\n"
-	"  output.Position = mul(float4(input.Position, 1.0), WorldViewProj);\n"
-	"  output.Color0 = input.Color0;\n"
-	"  return output;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::HLSL_D3D11,
-	"struct VS_INPUT { float3 Position : POSITION; float4 Color0 : COLOR0; };\n"
-	"struct VS_OUTPUT { float4 Color0 : COLOR0; float4 Position : SV_Position; };\n"
-	"cbuffer ConstantBuffer : register(b0) {\n"
-	"  matrix WorldViewProj;\n"
-	"};\n"
-	"VS_OUTPUT main(VS_INPUT input) {\n"
-	"  VS_OUTPUT output;\n"
-	"  output.Position = mul(WorldViewProj, float4(input.Position, 1.0));\n"
-	"  output.Color0 = input.Color0;\n"
-	"  return output;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::GLSL_VULKAN,
-	"#version 450\n"
-	"#extension GL_ARB_separate_shader_objects : enable\n"
-	"#extension GL_ARB_shading_language_420pack : enable\n"
-	"layout (std140, set = 0, binding = 0) uniform bufferVals {\n"
-	"    mat4 WorldViewProj;\n"
-	"} myBufferVals;\n"
-	"layout (location = 0) in vec4 pos;\n"
-	"layout (location = 1) in vec4 inColor;\n"
-	"layout (location = 0) out vec4 outColor;\n"
-	"out gl_PerVertex { vec4 gl_Position; };\n"
-	"void main() {\n"
-	"   outColor = inColor;\n"
-	"   gl_Position = myBufferVals.WorldViewProj * pos;\n"
-	"}\n"
-	}
-};
-
 const UniformBufferDesc vsColBufDesc { sizeof(VsColUB), {
-	{ "WorldViewProj", 0, -1, UniformType::MATRIX4X4, 0 }
+	{ "WorldViewProj", 0, -1, UniformType::MATRIX4X4, 0 },
+	{ "TintSaturation", 4, -1, UniformType::FLOAT2, 64 },
 } };
 
-static const std::vector<ShaderSource> vsTexCol = {
-	{ GLSL_1xx,
-	"#if __VERSION__ >= 130\n"
-	"#define attribute in\n"
-	"#define varying out\n"
-	"#endif\n"
-	"attribute vec3 Position;\n"
-	"attribute vec4 Color0;\n"
-	"attribute vec2 TexCoord0;\n"
-	"varying vec4 oColor0;\n"
-	"varying vec2 oTexCoord0;\n"
-	"uniform mat4 WorldViewProj;\n"
-	"void main() {\n"
-	"  gl_Position = WorldViewProj * vec4(Position, 1.0);\n"
-	"  oColor0 = Color0;\n"
-	"  oTexCoord0 = TexCoord0;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::HLSL_D3D9,
-	"struct VS_INPUT { float3 Position : POSITION; float2 Texcoord0 : TEXCOORD0; float4 Color0 : COLOR0; };\n"
-	"struct VS_OUTPUT { float4 Position : POSITION; float2 Texcoord0 : TEXCOORD0; float4 Color0 : COLOR0; };\n"
-	"float4x4 WorldViewProj : register(c0);\n"
-	"VS_OUTPUT main(VS_INPUT input) {\n"
-	"  VS_OUTPUT output;\n"
-	"  output.Position = mul(float4(input.Position, 1.0), WorldViewProj);\n"
-	"  output.Texcoord0 = input.Texcoord0;\n"
-	"  output.Color0 = input.Color0;\n"
-	"  return output;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::HLSL_D3D11,
-	"struct VS_INPUT { float3 Position : POSITION; float2 Texcoord0 : TEXCOORD0; float4 Color0 : COLOR0; };\n"
-	"struct VS_OUTPUT { float4 Color0 : COLOR0; float2 Texcoord0 : TEXCOORD0; float4 Position : SV_Position; };\n"
-	"cbuffer ConstantBuffer : register(b0) {\n"
-	"  matrix WorldViewProj;\n"
-	"};\n"
-	"VS_OUTPUT main(VS_INPUT input) {\n"
-	"  VS_OUTPUT output;\n"
-	"  output.Position = mul(WorldViewProj, float4(input.Position, 1.0));\n"
-	"  output.Texcoord0 = input.Texcoord0;\n"
-	"  output.Color0 = input.Color0;\n"
-	"  return output;\n"
-	"}\n"
-	},
-	{ ShaderLanguage::GLSL_VULKAN,
-	"#version 450\n"
-	"#extension GL_ARB_separate_shader_objects : enable\n"
-	"#extension GL_ARB_shading_language_420pack : enable\n"
-	"layout (std140, set = 0, binding = 0) uniform bufferVals {\n"
-	"    mat4 WorldViewProj;\n"
-	"} myBufferVals;\n"
-	"layout (location = 0) in vec4 pos;\n"
-	"layout (location = 1) in vec4 inColor;\n"
-	"layout (location = 2) in vec2 inTexCoord;\n"
-	"layout (location = 0) out vec4 outColor;\n"
-	"layout (location = 1) out vec2 outTexCoord;\n"
-	"out gl_PerVertex { vec4 gl_Position; };\n"
-	"void main() {\n"
-	"   outColor = inColor;\n"
-	"   outTexCoord = inTexCoord;\n"
-	"   gl_Position = myBufferVals.WorldViewProj * pos;\n"
-	"}\n"
-	}
-};
+static_assert(SEM_TEXCOORD0 == 3, "Semantic shader hardcoded in glsl above.");
 
 const UniformBufferDesc vsTexColBufDesc{ sizeof(VsTexColUB),{
-	{ "WorldViewProj", 0, -1, UniformType::MATRIX4X4, 0 }
+	{ "WorldViewProj", 0, -1, UniformType::MATRIX4X4, 0 },
+	{ "TintSaturation", 4, -1, UniformType::FLOAT2, 64 },
 } };
 
 ShaderModule *CreateShader(DrawContext *draw, ShaderStage stage, const std::vector<ShaderSource> &sources) {
 	uint32_t supported = draw->GetSupportedShaderLanguages();
-	for (auto iter : sources) {
+	for (const auto &iter : sources) {
 		if ((uint32_t)iter.lang & supported) {
 			return draw->CreateShaderModule(stage, iter.lang, (const uint8_t *)iter.src, strlen(iter.src));
 		}
@@ -366,15 +186,127 @@ ShaderModule *CreateShader(DrawContext *draw, ShaderStage stage, const std::vect
 	return nullptr;
 }
 
+static const InputDef g_inputs[] = {
+	{ "vec3", "Position", Draw::SEM_POSITION },
+	{ "vec4", "Color0", Draw::SEM_COLOR0 },
+	{ "vec2", "TexCoord0", Draw::SEM_TEXCOORD0 },
+};
+
+static const VaryingDef g_varyings[] = {
+	{ "vec4", "oColor0", Draw::SEM_COLOR0, 0, "lowp" },
+};
+
+static const VaryingDef g_varyingsTex[] = {
+	{ "vec4", "oColor0", Draw::SEM_COLOR0, 0, "lowp" },
+	{ "vec2", "oTexCoord0", Draw::SEM_TEXCOORD0, 1, "highp" },
+};
+
+static const SamplerDef g_samplers[] = {
+	{ 0, "tex" },
+};
+
+const UniformDef g_uniforms[] = {
+	{ "mat4", "WorldViewProj", 0 },
+	{ "vec2", "TintSaturation", 1 },
+};
+
+static ShaderModule *GenerateVShader(DrawContext *draw, VertexShaderPreset preset, bool tintSupported) {
+	const ShaderLanguageDesc &shaderLanguageDesc = draw->GetShaderLanguageDesc();
+	char code[2048];
+	ShaderWriter vsWriter(code, shaderLanguageDesc, ShaderStage::Vertex);
+
+	const bool texCoords = preset != VS_COLOR_2D;
+	const bool tint = tintSupported && (preset == VS_TEXTURE_COLOR_2D || preset == VS_COLOR_2D);
+
+	if (tint) {
+		vsWriter.C(R"(
+vec3 rgb2hsv(vec3 c) {
+	vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+	vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+	vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+	float d = q.x - min(q.w, q.y);
+	float e = 1.0e-10;
+	return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+vec3 hsv2rgb(vec3 c) {
+	vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+	vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+	return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+)");
+	}
+
+	vsWriter.BeginVSMain(g_inputs, g_uniforms, texCoords ? Slice(g_varyingsTex) : Slice(g_varyings));
+	vsWriter.C("gl_Position = mul(WorldViewProj, vec4(Position, 1.0));\n");
+	if (tint) {
+		vsWriter.C(R"(
+		vec3 hsv = rgb2hsv(Color0.xyz);
+		hsv.x += TintSaturation.x;
+		hsv.y *= TintSaturation.y;
+		oColor0 = vec4(hsv2rgb(hsv), Color0.w);
+)");
+	} else {
+		vsWriter.C("oColor0 = Color0;\n");
+	}
+	if (texCoords) {
+		vsWriter.C("oTexCoord0 = TexCoord0;\n");
+	}
+	vsWriter.EndVSMain(texCoords ? Slice(g_varyingsTex) : Slice(g_varyings));
+	return draw->CreateShaderModule(ShaderStage::Vertex, shaderLanguageDesc.shaderLanguage, (const uint8_t *)code, strlen(code));
+}
+
+static ShaderModule *GenerateFShader(DrawContext *draw, FragmentShaderPreset preset) {
+	const ShaderLanguageDesc &shaderLanguageDesc = draw->GetShaderLanguageDesc();
+	char code[2048];
+	ShaderWriter fsWriter(code, shaderLanguageDesc, ShaderStage::Fragment);
+
+	const bool texturing = preset != FS_COLOR_2D;
+	const bool rbSwizzle = preset == FS_TEXTURE_COLOR_2D_RB_SWIZZLE;
+
+	fsWriter.DeclareSamplers(g_samplers);
+
+	// NOTE (first argument): We do not declare the uniforms here, as they aren't used in any of the preset shaders.
+	// Declaring them currently causes a precision clash with some GLSL compilers, see issue #21904.
+	// So if we need them in the future, that needs to be dealt with.
+	fsWriter.BeginFSMain(Slice<UniformDef>::empty(), texturing ? Slice(g_varyingsTex) : Slice(g_varyings));
+	if (texturing) {
+		fsWriter.C("vec4 col = ");
+		fsWriter.SampleTexture2D("tex", "oTexCoord0");
+		if (rbSwizzle) {
+			fsWriter.C(".zyxw * oColor0;\n");
+		} else {
+			fsWriter.C(" * oColor0;\n");
+		}
+		if (preset == FS_TEXTURE_COLOR_2D_ALPHA_TO_GRAY) {
+			fsWriter.C("col.rgb = splat3(col.a);\n");
+		}
+	} else {
+		fsWriter.C("vec4 col = oColor0;\n");
+	}
+	fsWriter.C("col.rgb *= oColor0.a;\n");  // premultiply alpha
+	fsWriter.EndFSMain("col");
+	return draw->CreateShaderModule(ShaderStage::Fragment, shaderLanguageDesc.shaderLanguage, (const uint8_t *)code, strlen(code));
+}
+
 bool DrawContext::CreatePresets() {
-	vsPresets_[VS_TEXTURE_COLOR_2D] = CreateShader(this, ShaderStage::Vertex, vsTexCol);
-	vsPresets_[VS_COLOR_2D] = CreateShader(this, ShaderStage::Vertex, vsCol);
+	INFO_LOG(Log::G3D, "Creating thin3d preset shaders...");
+	bool tintSupported = !bugs_.Has(Bugs::RASPBERRY_SHADER_COMP_HANG);
 
-	fsPresets_[FS_TEXTURE_COLOR_2D] = CreateShader(this, ShaderStage::Fragment, fsTexCol);
-	fsPresets_[FS_COLOR_2D] = CreateShader(this, ShaderStage::Fragment, fsCol);
-	fsPresets_[FS_TEXTURE_COLOR_2D_RB_SWIZZLE] = CreateShader(this, ShaderStage::Fragment, fsTexColRBSwizzle);
-
-	return vsPresets_[VS_TEXTURE_COLOR_2D] && vsPresets_[VS_COLOR_2D] && fsPresets_[FS_TEXTURE_COLOR_2D] && fsPresets_[FS_COLOR_2D] && fsPresets_[FS_TEXTURE_COLOR_2D_RB_SWIZZLE];
+	for (int i = 0; i < VS_MAX_PRESET; i++) {
+		vsPresets_[i] = GenerateVShader(this, (VertexShaderPreset)i, tintSupported);
+		if (!vsPresets_[i]) {
+			WARN_LOG(Log::G3D, "Failed to create vertex shader preset %d", i);
+			return false;
+		}
+	}
+	for (int i = 0; i < FS_MAX_PRESET; i++) {
+		fsPresets_[i] = GenerateFShader(this, (FragmentShaderPreset)i);
+		if (!fsPresets_[i]) {
+			WARN_LOG(Log::G3D, "Failed to create fragment shader preset %d", i);
+			return false;
+		}
+	}
+	return true;
 }
 
 void DrawContext::DestroyPresets() {
@@ -392,12 +324,6 @@ void DrawContext::DestroyPresets() {
 	}
 }
 
-DrawContext::~DrawContext() {
-	DestroyPresets();
-}
-
-// TODO: Use the functions we have in Common/ColorConv.cpp.
-// Could also make C fake-simd for 64-bit, two 8888 pixels fit in a register :)
 void ConvertFromRGBA8888(uint8_t *dst, const uint8_t *src, uint32_t dstStride, uint32_t srcStride, uint32_t width, uint32_t height, DataFormat format) {
 	// Must skip stride in the cases below.  Some games pack data into the cracks, like MotoGP.
 	const uint32_t *src32 = (const uint32_t *)src;
@@ -415,9 +341,7 @@ void ConvertFromRGBA8888(uint8_t *dst, const uint8_t *src, uint32_t dstStride, u
 		}
 	} else if (format == Draw::DataFormat::R8G8B8_UNORM) {
 		for (uint32_t y = 0; y < height; ++y) {
-			for (uint32_t x = 0; x < width; ++x) {
-				memcpy(dst + x * 3, src32 + x, 3);
-			}
+			ConvertRGBA8888ToRGB888(dst, src32, width);
 			src32 += srcStride;
 			dst += dstStride * 3;
 		}
@@ -449,14 +373,12 @@ void ConvertFromRGBA8888(uint8_t *dst, const uint8_t *src, uint32_t dstStride, u
 		case Draw::DataFormat::R8G8B8A8_UNORM:
 		case Draw::DataFormat::UNDEFINED:
 		default:
-			WARN_LOG(G3D, "Unable to convert from format: %d", (int)format);
+			WARN_LOG(Log::G3D, "Unable to convert from format: %d", (int)format);
 			break;
 		}
 	}
 }
 
-// TODO: Use the functions we have in Common/ColorConv.cpp.
-// Could also make C fake-simd for 64-bit, two 8888 pixels fit in a register :)
 void ConvertFromBGRA8888(uint8_t *dst, const uint8_t *src, uint32_t dstStride, uint32_t srcStride, uint32_t width, uint32_t height, DataFormat format) {
 	// Must skip stride in the cases below.  Some games pack data into the cracks, like MotoGP.
 	const uint32_t *src32 = (const uint32_t *)src;
@@ -481,17 +403,41 @@ void ConvertFromBGRA8888(uint8_t *dst, const uint8_t *src, uint32_t dstStride, u
 		}
 	} else if (format == Draw::DataFormat::R8G8B8_UNORM) {
 		for (uint32_t y = 0; y < height; ++y) {
-			for (uint32_t x = 0; x < width; ++x) {
-				uint32_t c = src32[x];
-				dst[x * 3 + 0] = (c >> 16) & 0xFF;
-				dst[x * 3 + 1] = (c >> 8) & 0xFF;
-				dst[x * 3 + 2] = (c >> 0) & 0xFF;
-			}
+			ConvertBGRA8888ToRGB888(dst, src32, width);
 			src32 += srcStride;
 			dst += dstStride * 3;
 		}
 	} else {
-		WARN_LOG(G3D, "Unable to convert from format to BGRA: %d", (int)format);
+		// But here it shouldn't matter if they do intersect
+		uint16_t *dst16 = (uint16_t *)dst;
+		switch (format) {
+		case Draw::DataFormat::R5G6B5_UNORM_PACK16: // BGR 565
+			for (uint32_t y = 0; y < height; ++y) {
+				ConvertBGRA8888ToRGB565(dst16, src32, width);
+				src32 += srcStride;
+				dst16 += dstStride;
+			}
+			break;
+		case Draw::DataFormat::A1R5G5B5_UNORM_PACK16: // ABGR 1555
+			for (uint32_t y = 0; y < height; ++y) {
+				ConvertBGRA8888ToRGBA5551(dst16, src32, width);
+				src32 += srcStride;
+				dst16 += dstStride;
+			}
+			break;
+		case Draw::DataFormat::A4R4G4B4_UNORM_PACK16: // ABGR 4444
+			for (uint32_t y = 0; y < height; ++y) {
+				ConvertBGRA8888ToRGBA4444(dst16, src32, width);
+				src32 += srcStride;
+				dst16 += dstStride;
+			}
+			break;
+		case Draw::DataFormat::R8G8B8A8_UNORM:
+		case Draw::DataFormat::UNDEFINED:
+		default:
+			WARN_LOG(Log::G3D, "Unable to convert from format to BGRA: %d", (int)format);
+			break;
+		}
 	}
 }
 
@@ -533,5 +479,84 @@ void ConvertToD32F(uint8_t *dst, const uint8_t *src, uint32_t dstStride, uint32_
 	}
 }
 
+// TODO: This is missing the conversion to the quarter-range we use if depth clamp is not available.
+// That conversion doesn't necessarily belong here in thin3d, though.
+void ConvertToD16(uint8_t *dst, const uint8_t *src, uint32_t dstStride, uint32_t srcStride, uint32_t width, uint32_t height, DataFormat format) {
+	if (format == Draw::DataFormat::D32F) {
+		const float *src32 = (const float *)src;
+		uint16_t *dst16 = (uint16_t *)dst;
+		if (src == dst) {
+			return;
+		} else {
+			for (uint32_t y = 0; y < height; ++y) {
+				for (uint32_t x = 0; x < width; ++x) {
+					dst16[x] = (uint16_t)(src32[x] * 65535.0f);
+				}
+				src32 += srcStride;
+				dst16 += dstStride;
+			}
+		}
+	} else if (format == Draw::DataFormat::D16) {
+		_assert_(src != dst);
+		const uint16_t *src16 = (const uint16_t *)src;
+		uint16_t *dst16 = (uint16_t *)dst;
+		for (uint32_t y = 0; y < height; ++y) {
+			memcpy(dst16, src16, width * 2);
+			src16 += srcStride;
+			dst16 += dstStride;
+		}
+	} else if (format == Draw::DataFormat::D24_S8) {
+		_assert_(src != dst);
+		const uint32_t *src32 = (const uint32_t *)src;
+		uint16_t *dst16 = (uint16_t *)dst;
+		for (uint32_t y = 0; y < height; ++y) {
+			for (uint32_t x = 0; x < width; ++x) {
+				dst16[x] = (src32[x] & 0x00FFFFFF) >> 8;
+			}
+			src32 += srcStride;
+			dst16 += dstStride;
+		}
+	} else {
+		assert(false);
+	}
+}
+
+const char *Bugs::GetBugName(uint32_t bug) {
+	switch (bug) {
+	case NO_DEPTH_CANNOT_DISCARD_STENCIL_MALI: return "NO_DEPTH_CANNOT_DISCARD_STENCIL_MALI";
+	case NO_DEPTH_CANNOT_DISCARD_STENCIL_ADRENO: return "NO_DEPTH_CANNOT_DISCARD_STENCIL_ADRENO";
+	case DUAL_SOURCE_BLENDING_BROKEN: return "DUAL_SOURCE_BLENDING_BROKEN";
+	case ANY_MAP_BUFFER_RANGE_SLOW: return "ANY_MAP_BUFFER_RANGE_SLOW";
+	case PVR_GENMIPMAP_HEIGHT_GREATER: return "PVR_GENMIPMAP_HEIGHT_GREATER";
+	case BROKEN_NAN_IN_CONDITIONAL: return "BROKEN_NAN_IN_CONDITIONAL";
+	case COLORWRITEMASK_BROKEN_WITH_DEPTHTEST: return "COLORWRITEMASK_BROKEN_WITH_DEPTHTEST";
+	case BROKEN_FLAT_IN_SHADER: return "BROKEN_FLAT_IN_SHADER";
+	case EQUAL_WZ_CORRUPTS_DEPTH: return "EQUAL_WZ_CORRUPTS_DEPTH";
+	case RASPBERRY_SHADER_COMP_HANG: return "RASPBERRY_SHADER_COMP_HANG";
+	case MALI_CONSTANT_LOAD_BUG: return "MALI_CONSTANT_LOAD_BUG";
+	case SUBPASS_FEEDBACK_BROKEN: return "SUBPASS_FEEDBACK_BROKEN";
+	case ADRENO_RESOURCE_DEADLOCK: return "ADRENO_RESOURCE_DEADLOCK";
+	case PVR_BAD_16BIT_TEXFORMATS: return "PVR_BAD_16BIT_TEXFORMATS";
+	case EMPTY_RENDERPASS_BROKEN_MALI: return "EMPTY_RENDERPASS_BROKEN_MALI";
+	case PVR_UNUSED_DYNAMIC_UBO_OVERRUN: return "PVR_UNUSED_DYNAMIC_UBO_OVERRUN";
+	default: return "(N/A)";
+	}
+}
+
+const char *PresentModeToString(PresentMode presentMode) {
+	// All 8 possible cases, with three flags, for simplicity.
+	switch ((int)presentMode) {
+	case 0: return "NONE";
+	case (int)PresentMode::FIFO: return "FIFO";
+	case (int)PresentMode::IMMEDIATE: return "IMMEDIATE";
+	case (int)PresentMode::MAILBOX: return "MAILBOX";
+	case ((int)PresentMode::FIFO | (int)PresentMode::MAILBOX) : return "FIFO|MAILBOX";
+	case ((int)PresentMode::FIFO | (int)PresentMode::IMMEDIATE) : return "FIFO|IMMEDIATE";
+	case ((int)PresentMode::MAILBOX | (int)PresentMode::IMMEDIATE) : return "MAILBOX|IMMEDIATE";  // Not gonna happen
+	case ((int)PresentMode::FIFO | (int)PresentMode::MAILBOX | (int)PresentMode::IMMEDIATE) : return "FIFO|MAILBOX|IMMEDIATE";
+	default:
+		return "INVALID";
+	}
+}
 
 }  // namespace Draw

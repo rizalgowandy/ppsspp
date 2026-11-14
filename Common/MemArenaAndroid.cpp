@@ -88,7 +88,7 @@ static int legacy_ashmem_create_region(const char *name, size_t size) {
 	return fd;
 
 error:
-	ERROR_LOG(MEMMAP, "NASTY ASHMEM ERROR: ret = %08x", ret);
+	ERROR_LOG(Log::MemMap, "NASTY ASHMEM ERROR: ret = %08x", ret);
 	close(fd);
 	return ret;
 }
@@ -98,38 +98,55 @@ size_t MemArena::roundup(size_t x) {
 	return x;
 }
 
-void MemArena::GrabLowMemSpace(size_t size) {
+bool MemArena::GrabMemSpace(size_t size) {
 	// Use ashmem so we don't have to allocate a file on disk!
 	const char* name = "PPSSPP_RAM";
 
-	// Since version 26 Android provides a new api for accessing SharedMemory.
-	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 26) {
-		fd = ashmem_create_region(name, size);
-	} else {
+	// Since version 26 Android provides a new api for accessing SharedMemory. It's looked up at runtime, so
+	// try it first rather than going by SYSPROP_SYSTEMVERSION, which executables without the app (unit
+	// tests, headless) don't know. Newer versions don't let us open /dev/ashmem ourselves.
+	fd = ashmem_create_region(name, size);
+	if (fd < 0) {
 		fd = legacy_ashmem_create_region(name, size);
 	}
 	// Note that it appears that ashmem is pinned by default, so no need to pin.
 	if (fd < 0) {
-		ERROR_LOG(MEMMAP, "Failed to grab ashmem space of size: %08x  errno: %d", (int)size, (int)(errno));
-		return;
+		ERROR_LOG(Log::MemMap, "Failed to grab ashmem space of size: %08x  errno: %d", (int)size, (int)(errno));
+		return false;
 	}
+	return true;
 }
 
 void MemArena::ReleaseSpace() {
-	close(fd);
+	if (fd >= 0) {
+		close(fd);
+	}
+	fd = -1;
+	if (reserved_mem) {
+		munmap(reserved_mem, reserved_size);
+		reserved_mem = nullptr;
+		reserved_size = 0;
+	}
 }
 
 void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 	void *retval = mmap(base, size, PROT_READ | PROT_WRITE, MAP_SHARED | ((base == 0) ? 0 : MAP_FIXED), fd, offset);
 	if (retval == MAP_FAILED) {
-		NOTICE_LOG(MEMMAP, "mmap on ashmem (fd: %d) failed", (int)fd);
-		return 0;
+		NOTICE_LOG(Log::MemMap, "mmap on ashmem (fd: %d) failed", (int)fd);
+		return nullptr;
 	}
 	return retval;
 }
 
-void MemArena::ReleaseView(void* view, size_t size) {
-	munmap(view, size);
+void MemArena::ReleaseView(s64 offset, void* view, size_t size) {
+	const uintptr_t start = (uintptr_t)view;
+	if (reserved_mem && start >= (uintptr_t)reserved_mem && start + size <= (uintptr_t)reserved_mem + reserved_size) {
+		// Put the reservation back instead of leaving a hole, which another thread could map into before
+		// ReleaseSpace unmaps the whole range.
+		mmap(view, size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED, -1, 0);
+	} else {
+		munmap(view, size);
+	}
 }
 
 u8* MemArena::Find4GBBase() {
@@ -141,23 +158,35 @@ u8* MemArena::Find4GBBase() {
 	const uint64_t EIGHT_GIGS = 0x200000000ULL;
 	void *base = mmap(0, EIGHT_GIGS, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
 	if (base && base != MAP_FAILED) {
-		INFO_LOG(SYSTEM, "base: %p", base);
+		INFO_LOG(Log::System, "base: %p", base);
 		uint64_t aligned_base = ((uint64_t)base + 0xFFFFFFFF) & ~0xFFFFFFFFULL;
-		INFO_LOG(SYSTEM, "aligned_base: %p", (void *)aligned_base);
+		INFO_LOG(Log::System, "aligned_base: %p", (void *)aligned_base);
 		munmap(base, EIGHT_GIGS);
 		return reinterpret_cast<u8 *>(aligned_base);
 	} else {
 		u8 *hardcoded_ptr = reinterpret_cast<u8*>(0x2300000000ULL);
-		INFO_LOG(SYSTEM, "Failed to anonymously map 8GB. Fall back to the hardcoded pointer %p.", hardcoded_ptr);
+		INFO_LOG(Log::System, "Failed to anonymously map 8GB. Fall back to the hardcoded pointer %p.", hardcoded_ptr);
 		// Just grab some random 4GB...
 		// This has been known to fail lately though, see issue #12249.
 		return hardcoded_ptr;
 	}
 #else
 	// Address masking is used in 32-bit mode, so we can get away with less memory.
-	void* base = mmap(0, 0x10000000, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
-	_assert_msg_(base != MAP_FAILED, "Failed to map 256 MB of memory space: %s", strerror(errno));
-	munmap(base, 0x10000000);
+	// Keep the range reserved, and map the views over it. Unmapping it would let the heap and the driver
+	// allocate in the gaps between the views (where stray guest accesses then land), or even where a
+	// view is about to go, which the view's MAP_FIXED would then silently replace.
+	void *base = mmap(0, 0x10000000, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+
+	if (base == MAP_FAILED) {
+		ERROR_LOG(Log::System, "Failed to map 256 MB of memory space: %s", strerror(errno));
+		return nullptr;
+	}
+
+	if (reserved_mem) {
+		munmap(reserved_mem, reserved_size);
+	}
+	reserved_mem = base;
+	reserved_size = 0x10000000;
 	return static_cast<u8*>(base);
 #endif
 }

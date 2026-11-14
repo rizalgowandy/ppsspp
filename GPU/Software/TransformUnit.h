@@ -19,10 +19,14 @@
 
 #include "CommonTypes.h"
 #include "GPU/Common/DrawEngineCommon.h"
-#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GPUCommon.h"
+#include "GPU/Software/SoftGpu.h"
 #include "GPU/Math3D.h"
+#include "GPU/Software/GEMath.h"
 
 using namespace Math3D;
+
+static constexpr int32_t SCREEN_SCALE_FACTOR = 16;
 
 typedef u16 u10; // TODO: erm... :/
 
@@ -31,12 +35,18 @@ typedef Vec3<float> WorldCoords;
 typedef Vec3<float> ViewCoords;
 typedef Vec4<float> ClipCoords; // Range: -w <= x/y/z <= w
 
-struct SplinePatch;
+class BinManager;
+struct TransformState;
 
-struct ScreenCoords
-{
-	ScreenCoords() {}
-	ScreenCoords(int x, int y, u16 z) : x(x), y(y), z(z) {}
+enum class CullType {
+	CW = 0,
+	CCW = 1,
+	OFF = 2,
+};
+
+struct ScreenCoords {
+	ScreenCoords() = default;
+	ScreenCoords(int _x, int _y, u16 _z) : x(_x), y(_y), z(_z) {}
 
 	int x;
 	int y;
@@ -44,112 +54,200 @@ struct ScreenCoords
 
 	Vec2<int> xy() const { return Vec2<int>(x, y); }
 
-	ScreenCoords operator * (const float t) const
-	{
+	ScreenCoords operator * (const float t) const {
 		return ScreenCoords((int)(x * t), (int)(y * t), (u16)(z * t));
 	}
 
-	ScreenCoords operator / (const int t) const
-	{
+	ScreenCoords operator / (const int t) const {
 		return ScreenCoords(x / t, y / t, z / t);
 	}
 
-	ScreenCoords operator + (const ScreenCoords& oth) const
-	{
+	ScreenCoords operator + (const ScreenCoords& oth) const {
 		return ScreenCoords(x + oth.x, y + oth.y, z + oth.z);
 	}
 };
 
-struct DrawingCoords
-{
-	DrawingCoords() {}
-	DrawingCoords(s16 x, s16 y, u16 z) : x(x), y(y), z(z) {}
+struct DrawingCoords {
+	DrawingCoords() = default;
+	DrawingCoords(s16 x, s16 y) : x(x), y(y) {}
 
 	s16 x;
 	s16 y;
-	u16 z;
-
-	Vec2<s16> xy() const { return Vec2<s16>(x, y); }
-
-	DrawingCoords operator * (const float t) const
-	{
-		return DrawingCoords((s16)(x * t), (s16)(y * t), (u16)(z * t));
-	}
-
-	DrawingCoords operator + (const DrawingCoords& oth) const
-	{
-		return DrawingCoords(x + oth.x, y + oth.y, z + oth.z);
-	}
 };
 
-struct VertexData
-{
-	void Lerp(float t, const VertexData& a, const VertexData& b)
-	{
-		// World coords only needed for lighting, so we don't Lerp those
+struct alignas(16) VertexData {
+	Vec3Packedf texturecoords;
+	float clipw;
+	uint32_t color0;
+	uint32_t color1;
+	ScreenCoords screenpos;
+	float fogdepth;
+};
 
-		modelpos = ::Lerp(a.modelpos, b.modelpos, t);
+struct ClipVertexData {
+	void Lerp(float t, const ClipVertexData &a, const ClipVertexData &b) {
 		clippos = ::Lerp(a.clippos, b.clippos, t);
-		screenpos = ::Lerp(a.screenpos, b.screenpos, t);  // TODO: Should use a LerpInt (?)
-		texturecoords = ::Lerp(a.texturecoords, b.texturecoords, t);
-		normal = ::Lerp(a.normal, b.normal, t);
-		fogdepth = ::Lerp(a.fogdepth, b.fogdepth, t);
-
-		u16 t_int = (u16)(t*256);
-		color0 = LerpInt<Vec4<int>,256>(a.color0, b.color0, t_int);
-		color1 = LerpInt<Vec3<int>,256>(a.color1, b.color1, t_int);
+		// Ignore screenpos because Lerp() is only used pre-calculation of screenpos.
+		v.texturecoords = ::Lerp(a.v.texturecoords, b.v.texturecoords, t);
+		// Colors and fog (already 8-bit per vertex) take t rounded to 1/256 (gpu/probe exp136).
+		const int t_int = (int)(t * 256.0f + 0.5f);
+		v.fogdepth = (float)(((int)(a.v.fogdepth * 256.0f) * (256 - t_int) + (int)(b.v.fogdepth * 256.0f) * t_int) >> 8) * (1.0f / 256.0f);
+		v.color0 = LerpInt<Vec4<int>, 256>(Vec4<int>::FromRGBA(a.v.color0), Vec4<int>::FromRGBA(b.v.color0), t_int).ToRGBA();
+		v.color1 = LerpInt<Vec3<int>, 256>(Vec3<int>::FromRGB(a.v.color1), Vec3<int>::FromRGB(b.v.color1), t_int).ToRGB();
 	}
 
-	ModelCoords modelpos;
-	WorldCoords worldpos; // TODO: Storing this is dumb, should transform the light to clip space instead
+	bool OutsideRange() const {
+		return v.screenpos.x == 0x7FFFFFFF;
+	}
+
 	ClipCoords clippos;
-	ScreenCoords screenpos; // TODO: Shouldn't store this ?
-	Vec2<float> texturecoords;
-	Vec3<float> normal;
-	WorldCoords worldnormal;
-	Vec4<int> color0;
-	Vec3<int> color1;
-	float fogdepth;
+	VertexData v;
 };
 
 class VertexReader;
 
+
 class SoftwareDrawEngine;
+class SoftwareVertexReader;
+class StringWriter;
 
 class TransformUnit {
 public:
+	TransformUnit(const TransformUnit &) = delete;
+	TransformUnit &operator=(const TransformUnit &) = delete;
 	TransformUnit();
 	~TransformUnit();
 
-	static WorldCoords ModelToWorldNormal(const ModelCoords& coords);
-	static WorldCoords ModelToWorld(const ModelCoords& coords);
-	static ViewCoords WorldToView(const WorldCoords& coords);
-	static ClipCoords ViewToClip(const ViewCoords& coords);
-	static ScreenCoords ClipToScreen(const ClipCoords& coords);
-	static DrawingCoords ScreenToDrawing(const ScreenCoords& coords);
-	static ScreenCoords DrawingToScreen(const DrawingCoords& coords);
+	static ScreenCoords ClipToScreen(const ClipCoords &coords, bool *outsideRangeFlag);
+	// Where an edge from an inside vertex crosses the near plane, as the GE computes it.
+	static float NearPlaneT(const ClipCoords &in, const ClipCoords &out);
+	static ClipCoords NearPlanePoint(const ClipCoords &in, const ClipCoords &out, float t);
+	static inline DrawingCoords ScreenToDrawing(int x, int y) {
+		DrawingCoords ret;
+		// When offset > coord, this is negative and force-scissors.
+		ret.x = x / SCREEN_SCALE_FACTOR;
+		ret.y = y / SCREEN_SCALE_FACTOR;
+		return ret;
+	}
+	static inline DrawingCoords ScreenToDrawing(const ScreenCoords &coords) {
+		return ScreenToDrawing(coords.x, coords.y);
+	}
+	static ScreenCoords DrawingToScreen(const DrawingCoords &coords, u16 z);
 
-	void SubmitPrimitive(void* vertices, void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine);
+	// runCount: the vertices of this draw and the ones right after it that continue it (SoftGPU::RunVertexCount),
+	// for them to be transformed together, or 0.
+	void SubmitPrimitive(const void* vertices, const void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine, int runCount = 0);
+	// Whether a draw from these vertices continues the run transformed together.
+	bool InRun(const void *vertices, u32 vertexType) const {
+		return runRemaining_ > 0 && vertices == runNext_ && vertexType == runType_;
+	}
+	void NoteBezierPatch(const void *controlPoints, const void *indices, int pointsU, int pointsV, u32 vertType, bool patchFacing, SoftwareDrawEngine *drawEngine);
+	// Normals the curve tessellation computed, which can come out zero at a degenerate corner where the
+	// GE's evidently don't: they don't take the zero-normal sign (NAMCO Museum ULUS10035's spline balls).
+	void SetGeneratedNormals(bool generated) {
+		if (generated != generatedNormals_) {
+			// A run's chunks read it.
+			FinishRun();
+			generatedNormals_ = generated;
+		}
+	}
+	void SubmitImmVertex(const ClipVertexData &vert, SoftwareDrawEngine *drawEngine);
 
-	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
-	VertexData ReadVertex(VertexReader& vreader);
+	void Flush(GPUCommon *common, const char *reason);
+	void FlushIfOverlap(GPUCommon *common, const char *reason, bool modifying, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h);
+	void NotifyClutUpdate(const void *src);
+	void NotifyTexFlush();
 
-	bool outside_range_flag = false;
-	u8 *buf;
+	void GetStats(StringWriter &w);
+
+	void SetDirty(SoftDirty flags);
+	SoftDirty GetDirty();
+
+	struct RunJob;
+
+	// ReadVertex's position stage, done ahead for several vertices at once.
+	struct PreparedPosition {
+		ClipCoords clippos;
+		ScreenCoords screenpos;
+		float fogdepth;
+		bool outside;
+		bool valid;
+	};
+
+private:
+	// What a vertex format without UVs or a normal reads: the last ones read before it.
+	struct VertexCarry {
+		Vec3Packedf tc{};
+		float normal[4]{};
+	};
+	void ReadVertex(const VertexReader &vreader, const TransformState &state, VertexCarry &carry, ClipVertexData &vertex, const PreparedPosition *prepared = nullptr);
+	bool StartRun(const void *vertices, u32 vertexType, int runCount, VertexDecoder &vdecoder, TransformState &state);
+	void TransformRunChunk(int chunk, const VertexDecoder &vdecoder, const u8 *raw, const TransformState &state, const VertexCarry &carry);
+	void RunNeed(int index);
+	void FinishRun();
+
+	// A run of draws whose vertices are transformed together (StartRun), and the next draw's place in it.
+	std::vector<ClipVertexData> runVerts_;
+	int runCount_ = 0;
+	const u8 *runNext_ = nullptr;
+	u32 runType_ = 0;
+	int runPos_ = 0;
+	int runRemaining_ = 0;
+	// Chunks of the run may still be in progress.
+	bool runActive_ = false;
+	RunJob *runJob_ = nullptr;
+	// orderReversed: verts are in the opposite order of how the GE takes the triangle (matters for clipping).
+	void SendTriangle(CullType cullType, const ClipVertexData *verts, int provoking = 2, bool orderReversed = false);
+
+	u8 *decoded_ = nullptr;
+	VertexCarry carry_;
+	// What a zero normal lights as, times (1, 1, 1): see NoteBezierPatch().
+	int zeroNormalSign_ = 1;
+	bool generatedNormals_ = false;
+	BinManager *binner_ = nullptr;
+
+	// Normally max verts per prim is 3, but we temporarily need 4 to detect rectangles from strips.
+	ClipVertexData data_[4];
+	// This is the index of the next vert in data (or higher, may need modulus.)
+	int data_index_ = 0;
+	GEPrimitiveType prev_prim_ = GE_PRIM_POINTS;
+	bool hasDraws_ = false;
+	bool isImmDraw_ = false;
+
+	friend SoftwareVertexReader;
 };
+
+enum class ClipInfoFlags;
 
 class SoftwareDrawEngine : public DrawEngineCommon {
 public:
 	SoftwareDrawEngine();
 	~SoftwareDrawEngine();
 
-	void DispatchFlush() override;
-	void DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertType, int cullMode, int *bytesRead) override;
+	void DeviceLost() override {}
+	void DeviceRestore(Draw::DrawContext *draw) override {}
 
+	void NotifyConfigChanged() override;
+	void Flush() override;
+	void DispatchSubmitPrim(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, bool clockwise, int *bytesRead, ClipInfoFlags clipInfoFlags) override;
+	void DispatchSubmitImm(GEPrimitiveType prim, TransformedVertex *buffer, int vertexCount, int cullMode, bool continuation) override;
+
+	// For TransformUnit, which skins weighted vertices itself (VertexDecoderOptions::callerSkins).
 	VertexDecoder *FindVertexDecoder(u32 vtype);
 
 	TransformUnit transformUnit;
 
-protected:
-	bool UpdateUseHWTessellation(bool enable) override { return false; }
+#if PPSSPP_ARCH(32BIT)
+#undef new
+	void *operator new(size_t s) {
+		return AllocateAlignedMemory(s, 16);
+	}
+	void operator delete(void *p) {
+		FreeAlignedMemory(p);
+	}
+#endif
+
+private:
+	DenseHashMap<u32, VertexDecoder *> transformDecoders_;
+	void ClearTransformDecoders();
 };

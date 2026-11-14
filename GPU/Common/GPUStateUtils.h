@@ -4,6 +4,7 @@
 #include "Common/CommonTypes.h"
 
 #include "GPU/ge_constants.h"
+#include "GPU/GPUState.h"
 
 // TODO: Replace enums and structs with same from thin3d.h, for convenient mapping.
 
@@ -13,10 +14,10 @@ enum StencilValueType {
 	STENCIL_VALUE_ONE,
 	STENCIL_VALUE_KEEP,
 	STENCIL_VALUE_INVERT,
-	STENCIL_VALUE_INCR_4,
-	STENCIL_VALUE_INCR_8,
-	STENCIL_VALUE_DECR_4,
-	STENCIL_VALUE_DECR_8,
+	STENCIL_VALUE_INCR_4BIT,
+	STENCIL_VALUE_INCR_8BIT,
+	STENCIL_VALUE_DECR_4BIT,
+	STENCIL_VALUE_DECR_8BIT,
 };
 
 enum ReplaceAlphaType {
@@ -38,10 +39,13 @@ enum ReplaceBlendType {
 
 	// Full blend equation runs in shader.
 	// We might have to make a copy of the framebuffer target to read from.
-	REPLACE_BLEND_COPY_FBO,
+	REPLACE_BLEND_READ_FRAMEBUFFER,
+
+	// Color blend mode and color gets copied to alpha blend mode.
+	REPLACE_BLEND_BLUE_TO_ALPHA,
 };
 
-enum LogicOpReplaceType {
+enum SimulateLogicOpType {
 	LOGICOPTYPE_NORMAL,
 	LOGICOPTYPE_ONE,
 	LOGICOPTYPE_INVERT,
@@ -52,21 +56,28 @@ bool IsColorTestAgainstZero();
 bool IsColorTestTriviallyTrue();
 bool IsAlphaTestAgainstZero();
 bool NeedsTestDiscard();
+bool IsDepthTestEffectivelyDisabled();
 bool IsStencilTestOutputDisabled();
 
-// If not, we have to emulate it in the shader, similar to blend replace.
-bool IsColorMaskSimple(uint32_t colorMask);
+inline bool CanForceBilinear(const GEState &gstate) {
+	return ((!gstate.isColorTestEnabled() || IsColorTestTriviallyTrue()) && (!gstate.isAlphaTestEnabled() || IsAlphaTestTriviallyTrue()));
+}
 
 StencilValueType ReplaceAlphaWithStencilType();
+int ClearModeChannelMask();
 ReplaceAlphaType ReplaceAlphaWithStencil(ReplaceBlendType replaceBlend);
-ReplaceBlendType ReplaceBlendWithShader(bool allowShaderBlend, GEBufferFormat bufferFormat);
+ReplaceBlendType ReplaceBlendWithShader(GEBufferFormat bufferFormat);
 
-LogicOpReplaceType ReplaceLogicOpType();
+// Fixed color blends (with FIXA as the src factor) that REPLACE_BLEND_PRE_SRC computes like the GE.
+inline bool IsGEExactFixedBlend(GEBlendDstFactor funcB, GEBlendMode eq) {
+	return funcB == GE_DSTBLEND_FIXB && eq == GE_BLENDMODE_MUL_AND_ADD;
+}
 
+// This is for the fallback path if real logic ops are not available.
+SimulateLogicOpType SimulateLogicOpShaderTypeIfNeeded();
 
 // Common representation, should be able to set this directly with any modern API.
 struct ViewportAndScissor {
-	bool scissorEnable;
 	int scissorX;
 	int scissorY;
 	int scissorW;
@@ -75,26 +86,11 @@ struct ViewportAndScissor {
 	float viewportY;
 	float viewportW;
 	float viewportH;
-	float depthRangeMin;
-	float depthRangeMax;
-	bool dirtyProj;
-	bool dirtyDepth;
 };
-void ConvertViewportAndScissor(bool useBufferedRendering, float renderWidth, float renderHeight, int bufferWidth, int bufferHeight, ViewportAndScissor &out);
-float ToScaledDepthFromIntegerScale(float z);
 
-// Use like this: (z - offset) * scale
-struct DepthScaleFactors {
-	float offset;
-	float scale;
-
-	float Apply(float z) const {
-		return (z - offset) * scale;
-	}
-};
-DepthScaleFactors GetDepthScaleFactors();
-
-float DepthSliceFactor();
+// config is only used for non-buffered rendering.
+struct DisplayLayoutConfig;
+void ConvertViewportAndScissor(const DisplayLayoutConfig &config, bool useBufferedRendering, float renderWidth, float renderHeight, int bufferWidth, int bufferHeight, ViewportAndScissor &out);
 
 // These are common to all modern APIs and can be easily converted with a lookup table.
 enum class BlendFactor : uint8_t {
@@ -129,12 +125,18 @@ enum class BlendEq : uint8_t {
 	COUNT
 };
 
+// Computed blend setup, including shader stuff.
 struct GenericBlendState {
-	bool enabled;
-	bool resetFramebufferRead;
 	bool applyFramebufferRead;
 	bool dirtyShaderBlendFixValues;
+
+	// Shader generation state
 	ReplaceAlphaType replaceAlphaWithStencil;
+	ReplaceBlendType replaceBlend;
+	SimulateLogicOpType simulateLogicOpType;
+
+	// Resulting hardware blend state
+	bool blendEnabled;
 
 	BlendFactor srcColor;
 	BlendFactor dstColor;
@@ -146,6 +148,8 @@ struct GenericBlendState {
 
 	bool useBlendColor;
 	u32 blendColor;
+	// The color channels are a GE fixed blend factor, applied as (2c+1)/512 like the GE does.
+	bool blendColorGE;
 
 	void setFactors(BlendFactor srcC, BlendFactor dstC, BlendFactor srcA, BlendFactor dstA) {
 		srcColor = srcC;
@@ -160,24 +164,38 @@ struct GenericBlendState {
 	void setBlendColor(uint32_t color, uint8_t alpha) {
 		blendColor = color | ((uint32_t)alpha << 24);
 		useBlendColor = true;
+		blendColorGE = false;
+	}
+	void setBlendColorGE(uint32_t color, uint8_t alpha) {
+		setBlendColor(color, alpha);
+		blendColorGE = true;
 	}
 	void defaultBlendColor(uint8_t alpha) {
-		blendColor = 0xFFFFFF | ((uint32_t)alpha << 24);
-		useBlendColor = true;
+		setBlendColor(0xFFFFFF, alpha);
 	}
+	void blendColorToFloat4(float out[4]) const;
+
+	void Log();
 };
 
-void ConvertBlendState(GenericBlendState &blendState, bool allowShaderBlend);
 void ApplyStencilReplaceAndLogicOpIgnoreBlend(ReplaceAlphaType replaceAlphaWithStencil, GenericBlendState &blendState);
 
 struct GenericMaskState {
 	bool applyFramebufferRead;
 	uint32_t uniformMask;  // For each bit, opposite to the PSP.
-	bool rgba[4];  // true = draw, false = don't draw this channel
-};
 
-void ConvertMaskState(GenericMaskState &maskState, bool allowFramebufferRead);
-bool IsColorWriteMaskComplex(bool allowFramebufferRead);
+	// The hardware channel masks, 1 bit per color component. From bit 0, order is RGBA like in all APIs!
+	uint8_t channelMask;
+
+	void ConvertToShaderBlend() {
+		// If we have to do it in the shader, we simply pass through all channels but mask only in the shader instead.
+		// Some GPUs have minor penalties for masks that are not all-channels-on or all-channels-off.
+		channelMask = 0xF;
+		applyFramebufferRead = true;
+	}
+
+	void Log();
+};
 
 struct GenericStencilFuncState {
 	bool enabled;
@@ -189,5 +207,79 @@ struct GenericStencilFuncState {
 	GEStencilOp zFail;
 	GEStencilOp zPass;
 };
-
 void ConvertStencilFuncState(GenericStencilFuncState &stencilFuncState);
+
+struct GenericLogicState {
+	// If set, logic op is applied in the shader INSTEAD of in hardware.
+	// In this case, simulateLogicOpType and all that should be off.
+	bool applyFramebufferRead;
+
+	// Hardware
+	bool logicOpEnabled;
+
+	// Hardware and shader generation
+	GELogicOp logicOp;
+
+	void ApplyToBlendState(GenericBlendState &blendState);
+	void ConvertToShaderBlend() {
+		if (logicOp != GE_LOGIC_COPY) {
+			logicOpEnabled = false;
+			applyFramebufferRead = true;
+			// Same logicOp is kept.
+		}
+	}
+};
+
+struct ComputedPipelineState {
+	GenericBlendState blendState;
+	GenericMaskState maskState;
+	GenericLogicState logicState;
+
+	void Convert(bool shaderBitOpsSupported, bool fbReadAllowed);
+
+	bool FramebufferRead() const {
+		// If blending is off, its applyFramebufferRead can be false even after state propagation.
+		// So it's not enough to check just that one.
+		return blendState.applyFramebufferRead || maskState.applyFramebufferRead || logicState.applyFramebufferRead;
+	}
+};
+
+// See issue #15898
+inline bool SpongebobDepthInverseConditions(const GenericStencilFuncState &stencilState) {
+	// Check that the depth/stencil state matches the conditions exactly.
+	// Always with a depth test that's not writing to the depth buffer (only stencil.)
+	if (!gstate.isDepthTestEnabled() || gstate.isDepthWriteEnabled())
+		return false;
+	// Always GREATER_EQUAL, which we flip to LESS.
+	if (gstate.getDepthTestFunction() != GE_COMP_GEQUAL)
+		return false;
+
+	// The whole purpose here is a depth fail that we need to write to alpha.
+	if (stencilState.zFail != GE_STENCILOP_ZERO || stencilState.sFail != GE_STENCILOP_KEEP || stencilState.zPass != GE_STENCILOP_KEEP)
+		return false;
+	if (stencilState.testFunc != GE_COMP_ALWAYS || stencilState.writeMask != 0xFF)
+		return false;
+
+	// Lastly, verify no color is written.  Natural way is a mask, in case another game uses it.
+	// Note that the PSP masks are reversed compared to typical APIs.
+	if (gstate.getColorMask() == 0xFFFFFF00)
+		return true;
+
+	// These games specifically use simple alpha blending with a constant zero alpha.
+	if (!gstate.isAlphaBlendEnabled() || gstate.getBlendFuncA() != GE_SRCBLEND_SRCALPHA || gstate.getBlendFuncB() != GE_DSTBLEND_INVSRCALPHA)
+		return false;
+
+	// Also make sure there's no texture, in case its alpha gets involved.
+	if (gstate.isTextureMapEnabled())
+		return false;
+
+	// Spongebob uses material alpha.
+	if (gstate.getMaterialAmbientA() == 0x00 && gstate.getMaterialUpdate() == 0)
+		return true;
+	// MX vs ATV : Reflex uses vertex colors, should really check them...
+	if (gstate.getMaterialUpdate() == 1)
+		return true;
+
+	// Okay, color is most likely being used if we didn't hit the above.
+	return false;
+}

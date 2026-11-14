@@ -18,33 +18,42 @@
 #pragma once
 
 #include <mutex>
+
 #include "Common/CommonTypes.h"
+#include "Common/File/Path.h"
+#include "Common/StringUtils.h"
 #include "Core/Loaders.h"
-#ifdef _WIN32
+
+#if defined(_WIN32) && !defined(HAVE_LIBRETRO_VFS)
 typedef void *HANDLE;
 #endif
 
+// This one accepts directories as well as files.
+// Later we handle the discrepancy in MountGameISO.
 class LocalFileLoader : public FileLoader {
 public:
-	LocalFileLoader(const std::string &filename);
-	LocalFileLoader(const int fd, const std::string &filename);
-	virtual ~LocalFileLoader();
+	LocalFileLoader(const Path &filename);
+	~LocalFileLoader();
 
-	virtual bool Exists() override;
-	virtual bool IsDirectory() override;
-	virtual s64 FileSize() override;
-	virtual std::string Path() const override;
-	virtual size_t ReadAt(s64 absolutePos, size_t bytes, size_t count, void *data, Flags flags = Flags::NONE) override;
+	bool Exists() override;
+	bool IsDirectory() override { return isDirectory_; }
+	s64 FileSize() override;
+	Path GetPath() const override {
+		return filename_;
+	}
+	size_t ReadAt(s64 absolutePos, size_t bytes, size_t count, void *data, Flags flags = Flags::NONE) override;
 
 private:
-#ifndef _WIN32
+#ifdef HAVE_LIBRETRO_VFS
+	FILE *file_ = nullptr;
+#elif !defined(_WIN32)
 	void DetectSizeFd();
-	int fd_;
+	int fd_ = -1;
 #else
-	HANDLE handle_;
+	HANDLE handle_ = 0;
 #endif
-	u64 filesize_;
-	std::string filename_;
+	u64 filesize_ = 0;
+	Path filename_;
+	bool isDirectory_ = false;
 	std::mutex readLock_;
-	bool isOpenedByFd_;
 };

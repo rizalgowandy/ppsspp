@@ -19,16 +19,34 @@
 #pragma once
 
 #include <cstring>
+#include <cstdint>
 
-class GPUInterface;
-class GPUDebugInterface;
+enum GPUCore : int;
+
+class GPUCommon;
+class GPUCommon;
 class GraphicsContext;
+
+// PSP rasterization has two outputs, color and depth. Stencil is packed
+// into the alpha channel of color (if exists), so possibly RASTER_COLOR
+// should be named RASTER_COLOR_STENCIL but it gets kinda hard to read.
+enum RasterChannel : uint8_t {
+	RASTER_COLOR = 0,
+	RASTER_DEPTH = 1,
+};
 
 enum SkipDrawReasonFlags {
 	SKIPDRAW_SKIPFRAME = 1,
 	SKIPDRAW_NON_DISPLAYED_FB = 2,   // Skip drawing to FBO:s that have not been displayed.
 	SKIPDRAW_BAD_FB_TEXTURE = 4,
 	SKIPDRAW_WINDOW_MINIMIZED = 8, // Don't draw when the host window is minimized.
+};
+
+enum class ShaderDepalMode {
+	OFF = 0,
+	NORMAL = 1,
+	SMOOTHED = 2,
+	CLUT8 = 3,  // Read a color framebuffer as 8-bit CLUT (the depal format bits say which format).
 };
 
 // Global GPU-related utility functions. 
@@ -50,73 +68,115 @@ inline unsigned int toFloat24(float f) {
 	return i >> 8;
 }
 
-struct GPUStatistics {
-	void Reset() {
-		// Never add a vtable :)
-		memset(this, 0, sizeof(*this));
-	}
+// TODO: Not completely sure about the exact mechanics here, or where we need to use this.
+// Useful to experiment with.
+inline float roundToFloat24(float f) {
+	unsigned int i;
+	memcpy(&i, &f, 4);
+	i &= 0xFFFFFF00;
+	i += 0x80;  // TODO: Subtract for negative numbers?
+	float retval;
+	memcpy(&retval, &i, 4);
+	return retval;
+}
 
-	void ResetFrame() {
-		numDrawCalls = 0;
-		numCachedDrawCalls = 0;
-		numVertsSubmitted = 0;
-		numCachedVertsDrawn = 0;
-		numUncachedVertsDrawn = 0;
-		numTrackedVertexArrays = 0;
-		numTextureInvalidations = 0;
-		numTextureInvalidationsByFramebuffer = 0;
-		numTexturesHashed = 0;
-		numTextureSwitches = 0;
-		numTextureDataBytesHashed = 0;
-		numShaderSwitches = 0;
-		numFlushes = 0;
-		numTexturesDecoded = 0;
-		numFramebufferEvaluations = 0;
-		numReadbacks = 0;
-		numUploads = 0;
-		numClears = 0;
-		msProcessingDisplayLists = 0;
-		vertexGPUCycles = 0;
-		otherGPUCycles = 0;
-		memset(gpuCommandsAtCallLevel, 0, sizeof(gpuCommandsAtCallLevel));
-	}
+inline float truncateToFloat24(float f) {
+	unsigned int i;
+	memcpy(&i, &f, 4);
+	i &= 0xFFFFFF00;
+	float retval;
+	memcpy(&retval, &i, 4);
+	return retval;
+}
 
-	// Per frame statistics
+// TODO: Possibly use macros to disable expensive parts of stats tracking in release builds.
+struct GPUStatsPerFrame {
+	int numEnqueue;
+	int numUpdateStall;
+	int numDrawSyncs;
+	int numListSyncs;
+	int numGEInterrupts;
 	int numDrawCalls;
-	int numCachedDrawCalls;
+	int numVertexDecodes;
+	int numCulledDraws;
 	int numFlushes;
+	int numSoftTransformedDraws;
+	int numSoftClippedTriangles;
+	int numBBOXJumps;
 	int numVertsSubmitted;
-	int numCachedVertsDrawn;
-	int numUncachedVertsDrawn;
-	int numTrackedVertexArrays;
+	int numVertsDecoded;
+	int numVertsDrawn;
 	int numTextureInvalidations;
+	int numTexturesChanged;
 	int numTextureInvalidationsByFramebuffer;
 	int numTexturesHashed;
 	int numTextureDataBytesHashed;
-	int numTextureSwitches;
-	int numShaderSwitches;
 	int numTexturesDecoded;
+	int numVideoTextures;
 	int numFramebufferEvaluations;
+	int numFBOsCreated;
+	int numBlockingReadbacks;
 	int numReadbacks;
 	int numUploads;
+	int numCachedUploads;
+	int numDepal;
 	int numClears;
+	int numDepthCopies;
+	int numReinterpretCopies;
+	int numColorCopies;
+	int numCopiesForShaderBlend;
+	int numCopiesForSelfTex;
+	int numBlockTransfers;
+	int numReplacerTrackedTex;
+	int numCachedReplacedTextures;
+	int numClutTextures;
 	double msProcessingDisplayLists;
+	double msPrepareDepth;
+	double msCullDepth;
+	double msRasterizeDepth;
+	double msRasterTimeAvailable;
 	int vertexGPUCycles;
 	int otherGPUCycles;
-	int gpuCommandsAtCallLevel[4];
+	int numDepthRasterPrims;
+	int numDepthRasterEarlySize;
+	int numDepthRasterNoPixels;
+	int numDepthRasterTooSmall;
+	int numDepthRasterZCulled;
+	int numDepthEarlyBoxCulled;
+};
 
+struct GPUStatsTotals {
 	// Flip count. Doesn't really belong here.
 	int numFlips;
+	// Vulkan and Metal pipelines, and OpenGL programs, including those precompiled from the shader cache.
+	int numPipelinesCreated;
+};
+
+// The ToString function lives in GPUCommonHW.cpp.
+struct GPUStatistics {
+	void Reset() {
+		ResetFrame();
+		totals = {};
+	}
+
+	void ResetFrame() {
+		perFrame = {};
+	}
+
+	// Flip count. Doesn't really belong here.
+	GPUStatsPerFrame perFrame;
+	GPUStatsTotals totals;
 };
 
 extern GPUStatistics gpuStats;
-extern GPUInterface *gpu;
-extern GPUDebugInterface *gpuDebug;
+extern GPUCommon *gpu;
+extern GPUCommon *gpu;
 
 namespace Draw {
 	class DrawContext;
 }
 
-bool GPU_Init(GraphicsContext *ctx, Draw::DrawContext *draw);
-bool GPU_IsReady();
+bool GPU_Init(GPUCore gpuCore, GraphicsContext *ctx, Draw::DrawContext *draw);
 void GPU_Shutdown();
+
+const char *RasterChannelToString(RasterChannel channel);

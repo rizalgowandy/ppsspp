@@ -68,7 +68,9 @@ public:
 	void BindTestTexture(int slot);
 
 	void DeviceLost() {
-		Clear(false);
+		// Queue the deletes anyway, the deleter frees the GLRTexture objects and skips the GL calls if needed.
+		Clear(true);
+		render_ = nullptr;
 	}
 	void DeviceRestore(Draw::DrawContext *draw);
 	void Clear(bool deleteThem = true);
@@ -77,7 +79,7 @@ public:
 private:
 
 	GLRTexture *CreateTestTexture(const GEComparison funcs[4], const u8 refs[4], const u8 masks[4], const bool valid[4]);
-	FragmentTestID GenerateTestID() const;
+	static FragmentTestID GenerateTestID() ;
 
 	GLRenderManager *render_;
 	TextureCacheGLES *textureCache_;

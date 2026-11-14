@@ -16,26 +16,101 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <cmath>
 
 #include "Common/Serialize/SerializeFuncs.h"
-#include "Core/Config.h"
 #include "Core/Debugger/MemBlockInfo.h"
 #include "Core/HLE/FunctionWrappers.h"
 #include "Core/HW/SimpleAudioDec.h"
 #include "Core/HW/MediaEngine.h"
 #include "Core/HW/BufferQueue.h"
+#include "Core/HW/Atrac3Standalone.h"
 
 #ifdef USE_FFMPEG
 
 extern "C" {
 #include "libavformat/avformat.h"
-#include "libswresample/swresample.h"
 #include "libavutil/samplefmt.h"
+#include "libavcodec/avcodec.h"
+#include "libavutil/version.h"
+
+#include "Core/FFMPEGCompat.h"
+}
+#include "Core/Config.h"
+
+#else
+
+extern "C" {
+	struct AVCodec;
+	struct AVCodecContext;
+	struct AVFrame;
 }
 
 #endif  // USE_FFMPEG
 
-int SimpleAudio::GetAudioCodecID(int audioType) {
+// AAC decoder candidates:
+// * https://github.com/mstorsjo/fdk-aac/tree/master
+
+// h.264 decoder candidates:
+// * https://github.com/meerkat-cv/h264_decoder
+// * https://github.com/shengbinmeng/ffmpeg-h264-dec
+
+// FFMPEG-based decoder. TODO: Replace with individual codecs.
+// Based on http://ffmpeg.org/doxygen/trunk/doc_2examples_2decoding_encoding_8c-example.html#_a13
+class FFmpegAudioDecoder : public AudioDecoder {
+public:
+	FFmpegAudioDecoder(PSPAudioType audioType, int sampleRateHz = 44100, int channels = 2);
+	~FFmpegAudioDecoder();
+
+	bool Decode(const uint8_t* inbuf, int inbytes, int *inbytesConsumed, int outputChannels, int16_t *outbuf, int *outSamples) override;
+	bool IsOK() const override {
+#ifdef USE_FFMPEG
+		return codec_ != 0;
+#else
+		return 0;
+#endif
+	}
+
+	void SetChannels(int channels) override;
+
+	// These two are only here because of save states.
+	PSPAudioType GetAudioType() const override { return audioType; }
+
+private:
+	bool OpenCodec(int block_align);
+
+	PSPAudioType audioType;
+	int sample_rate_;
+	int channels_;
+
+	AVFrame *frame_ = nullptr;
+	AVCodec *codec_ = nullptr;
+	AVCodecContext  *codecCtx_ = nullptr;
+
+	bool codecOpen_ = false;
+};
+
+AudioDecoder *CreateAudioDecoder(PSPAudioType audioType, int sampleRateHz, int channels, size_t blockAlign, const uint8_t *extraData, size_t extraDataSize) {
+	bool forceFfmpeg = false;
+#ifdef USE_FFMPEG
+	forceFfmpeg = g_Config.bForceFfmpegForAudioDec;
+#endif
+	if (forceFfmpeg) {
+		return new FFmpegAudioDecoder(audioType, sampleRateHz, channels);
+	}
+
+	switch (audioType) {
+	case PSP_CODEC_AT3:
+	 	return CreateAtrac3Audio(channels, blockAlign, extraData, extraDataSize);
+	case PSP_CODEC_AT3PLUS:
+		return CreateAtrac3PlusAudio(channels, blockAlign);
+	default:
+		// Only AAC normally falls back to FFMPEG now.
+		return new FFmpegAudioDecoder(audioType, sampleRateHz, channels);
+	}
+}
+
+static int GetAudioCodecID(int audioType) {
 #ifdef USE_FFMPEG
 	switch (audioType) {
 	case PSP_CODEC_AAC:
@@ -54,14 +129,9 @@ int SimpleAudio::GetAudioCodecID(int audioType) {
 #endif // USE_FFMPEG
 }
 
-SimpleAudio::SimpleAudio(int audioType, int sample_rate, int channels)
-: ctxPtr(0xFFFFFFFF), audioType(audioType), sample_rate_(sample_rate), channels_(channels),
-  outSamples(0), srcPos(0), wanted_resample_freq(44100), frame_(0), codec_(0), codecCtx_(0), swrCtx_(0),
-  codecOpen_(false) {
-	Init();
-}
+FFmpegAudioDecoder::FFmpegAudioDecoder(PSPAudioType audioType, int sampleRateHz, int channels)
+	: audioType(audioType), sample_rate_(sampleRateHz), channels_(channels) {
 
-void SimpleAudio::Init() {
 #ifdef USE_FFMPEG
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58, 18, 100)
 	avcodec_register_all();
@@ -73,34 +143,44 @@ void SimpleAudio::Init() {
 
 	frame_ = av_frame_alloc();
 
-	// Get Audio Codec ctx
+	// Get AUDIO Codec ctx
 	int audioCodecId = GetAudioCodecID(audioType);
 	if (!audioCodecId) {
-		ERROR_LOG(ME, "This version of FFMPEG does not support Audio codec type: %08x. Update your submodule.", audioType);
+		ERROR_LOG(Log::ME, "This version of FFMPEG does not support Audio codec type: %08x. Update your submodule.", audioType);
 		return;
 	}
 	// Find decoder
 	codec_ = avcodec_find_decoder((AVCodecID)audioCodecId);
 	if (!codec_) {
 		// Eh, we shouldn't even have managed to compile. But meh.
-		ERROR_LOG(ME, "This version of FFMPEG does not support AV_CODEC_ctx for audio (%s). Update your submodule.", GetCodecName(audioType));
+		ERROR_LOG(Log::ME, "This version of FFMPEG does not support AV_CODEC_ctx for audio (%s). Update your submodule.", GetCodecName(audioType));
 		return;
 	}
 	// Allocate codec context
 	codecCtx_ = avcodec_alloc_context3(codec_);
 	if (!codecCtx_) {
-		ERROR_LOG(ME, "Failed to allocate a codec context");
+		ERROR_LOG(Log::ME, "Found a decoder for audio codec ID %08x but failed to allocate a codec context. Strange.", audioCodecId);
 		return;
 	}
+#if LIBAVUTIL_VERSION_MAJOR >= 59
+	if (channels_ == 2)
+		codecCtx_->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+	else
+		codecCtx_->ch_layout = AV_CHANNEL_LAYOUT_MONO;
+#else
 	codecCtx_->channels = channels_;
 	codecCtx_->channel_layout = channels_ == 2 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+#endif
 	codecCtx_->sample_rate = sample_rate_;
-	codecOpen_ = false;
 #endif  // USE_FFMPEG
 }
 
-bool SimpleAudio::OpenCodec(int block_align) {
+bool FFmpegAudioDecoder::OpenCodec(int block_align) {
 #ifdef USE_FFMPEG
+	if (!codec_ || !codecCtx_) {
+		ERROR_LOG(Log::ME, "Codec context not allocated for some reason. This is bad.");
+		return false;
+	}
 	// Some versions of FFmpeg require this set.  May be set in SetExtraData(), but optional.
 	// When decoding, we decode by packet, so we know the size.
 	if (codecCtx_->block_align == 0) {
@@ -110,7 +190,7 @@ bool SimpleAudio::OpenCodec(int block_align) {
 	AVDictionary *opts = 0;
 	int retval = avcodec_open2(codecCtx_, codec_, &opts);
 	if (retval < 0) {
-		ERROR_LOG(ME, "Failed to open codec: retval = %i", retval);
+		ERROR_LOG(Log::ME, "Failed to open codec: retval = %i", retval);
 	}
 	av_dict_free(&opts);
 	codecOpen_ = true;
@@ -120,22 +200,7 @@ bool SimpleAudio::OpenCodec(int block_align) {
 #endif  // USE_FFMPEG
 }
 
-void SimpleAudio::SetExtraData(u8 *data, int size, int wav_bytes_per_packet) {
-#ifdef USE_FFMPEG
-	if (codecCtx_) {
-		codecCtx_->extradata = (uint8_t *)av_mallocz(size);
-		codecCtx_->extradata_size = size;
-		codecCtx_->block_align = wav_bytes_per_packet;
-		codecOpen_ = false;
-
-		if (data != nullptr) {
-			memcpy(codecCtx_->extradata, data, size);
-		}
-	}
-#endif
-}
-
-void SimpleAudio::SetChannels(int channels) {
+void FFmpegAudioDecoder::SetChannels(int channels) {
 	if (channels_ == channels) {
 		// Do nothing, already set.
 		return;
@@ -143,18 +208,24 @@ void SimpleAudio::SetChannels(int channels) {
 #ifdef USE_FFMPEG
 
 	if (codecOpen_) {
-		ERROR_LOG(ME, "Codec already open, cannot change channels");
+		ERROR_LOG(Log::ME, "Codec already open, cannot change channels");
 	} else {
 		channels_ = channels;
+#if LIBAVUTIL_VERSION_MAJOR >= 59
+		if (channels_ == 2)
+			codecCtx_->ch_layout = AV_CHANNEL_LAYOUT_STEREO;
+		else
+			codecCtx_->ch_layout = AV_CHANNEL_LAYOUT_MONO;
+#else
 		codecCtx_->channels = channels_;
 		codecCtx_->channel_layout = channels_ == 2 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+#endif
 	}
 #endif
 }
 
-SimpleAudio::~SimpleAudio() {
+FFmpegAudioDecoder::~FFmpegAudioDecoder() {
 #ifdef USE_FFMPEG
-	swr_free(&swrCtx_);
 	av_frame_free(&frame_);
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(55, 52, 0)
 	avcodec_free_context(&codecCtx_);
@@ -169,42 +240,104 @@ SimpleAudio::~SimpleAudio() {
 #endif  // USE_FFMPEG
 }
 
-bool SimpleAudio::IsOK() const {
+// Decodes a single input frame.
 #ifdef USE_FFMPEG
-	return codec_ != 0;
-#else
-	return 0;
-#endif
+static inline int16_t FloatToS16(float f) {
+	return av_clip_int16(lrintf(f * 32768.0f));
 }
 
-bool SimpleAudio::Decode(void *inbuf, int inbytes, uint8_t *outbuf, int *outbytes) {
+// Converts a decoded frame to interleaved stereo s16, rounding and clamping like swresample, which
+// this replaces. Mono goes to both channels at -3 dB, as swresample's mixing matrix has it. Beyond
+// two channels only the first two are kept (PSP audio never has more). Returns the number of
+// samples, or -1 for a sample format not handled here.
+static int ConvertToStereoS16(const AVFrame *frame, int channels, int16_t *out) {
+	const int n = frame->nb_samples;
+	if (channels < 1) {
+		return -1;
+	}
+	const float monoGain = (float)M_SQRT1_2;
+	const int monoGainS16 = 23170;  // M_SQRT1_2 in 1.15 fixed point.
+	switch (frame->format) {
+	case AV_SAMPLE_FMT_FLTP:
+	case AV_SAMPLE_FMT_FLT:
+	{
+		const bool planar = frame->format == AV_SAMPLE_FMT_FLTP;
+		const float *left = (const float *)frame->extended_data[0];
+		const float *right = planar ? (const float *)frame->extended_data[std::min(channels, 2) - 1] : left + 1;
+		const int step = planar ? 1 : channels;
+		for (int i = 0; i < n; i++) {
+			if (channels == 1) {
+				const int16_t s = FloatToS16(left[i] * monoGain);
+				out[i * 2] = s;
+				out[i * 2 + 1] = s;
+			} else {
+				out[i * 2] = FloatToS16(left[i * step]);
+				out[i * 2 + 1] = FloatToS16(right[i * step]);
+			}
+		}
+		return n;
+	}
+	case AV_SAMPLE_FMT_S16P:
+	case AV_SAMPLE_FMT_S16:
+	{
+		const bool planar = frame->format == AV_SAMPLE_FMT_S16P;
+		const int16_t *left = (const int16_t *)frame->extended_data[0];
+		const int16_t *right = planar ? (const int16_t *)frame->extended_data[std::min(channels, 2) - 1] : left + 1;
+		const int step = planar ? 1 : channels;
+		for (int i = 0; i < n; i++) {
+			if (channels == 1) {
+				const int16_t s = (int16_t)((left[i] * monoGainS16 + 16384) >> 15);
+				out[i * 2] = s;
+				out[i * 2 + 1] = s;
+			} else {
+				out[i * 2] = left[i * step];
+				out[i * 2 + 1] = right[i * step];
+			}
+		}
+		return n;
+	}
+	default:
+		return -1;
+	}
+}
+#endif  // USE_FFMPEG
+
+bool FFmpegAudioDecoder::Decode(const uint8_t *inbuf, int inbytes, int *inbytesConsumed, int outputChannels, int16_t *outbuf, int *outSamples) {
 #ifdef USE_FFMPEG
 	if (!codecOpen_) {
 		OpenCodec(inbytes);
+		if (!codecOpen_) {
+			ERROR_LOG(Log::ME, "Codec not open, can't decode.");
+			return false;
+		}
 	}
 
 	AVPacket packet;
 	av_init_packet(&packet);
-	packet.data = static_cast<uint8_t *>(inbuf);
+	packet.data = (uint8_t *)(inbuf);
 	packet.size = inbytes;
 
 	int got_frame = 0;
 	av_frame_unref(frame_);
 
-	*outbytes = 0;
-	srcPos = 0;
+	if (outSamples) {
+		*outSamples = 0;
+	}
+	if (inbytesConsumed) {
+		*inbytesConsumed = 0;
+	}
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 48, 101)
 	if (inbytes != 0) {
 		int err = avcodec_send_packet(codecCtx_, &packet);
 		if (err < 0) {
-			ERROR_LOG(ME, "Error sending audio frame to decoder (%d bytes): %d (%08x)", inbytes, err, err);
+			ERROR_LOG(Log::ME, "Error sending audio frame to decoder (%d bytes): %d (%08x)", inbytes, err, err);
 			return false;
 		}
 	}
 	int err = avcodec_receive_frame(codecCtx_, frame_);
 	int len = 0;
 	if (err >= 0) {
-		len = frame_->pkt_size;
+		len = packet.size;
 		got_frame = 1;
 	} else if (err != AVERROR(EAGAIN)) {
 		len = err;
@@ -219,49 +352,34 @@ bool SimpleAudio::Decode(void *inbuf, int inbytes, uint8_t *outbuf, int *outbyte
 #endif
 
 	if (len < 0) {
-		ERROR_LOG(ME, "Error decoding Audio frame (%i bytes): %i (%08x)", inbytes, len, len);
+		ERROR_LOG(Log::ME, "Error decoding Audio frame (%i bytes): %i (%08x)", inbytes, len, len);
 		return false;
 	}
 	
 	// get bytes consumed in source
-	srcPos = len;
+	if (inbytesConsumed) {
+		*inbytesConsumed = len;
+	}
 
 	if (got_frame) {
-		// Initializing the sample rate convert. We will use it to convert float output into int.
-		int64_t wanted_channel_layout = AV_CH_LAYOUT_STEREO; // we want stereo output layout
-		int64_t dec_channel_layout = frame_->channel_layout; // decoded channel layout
-
-		if (!swrCtx_) {
-			swrCtx_ = swr_alloc_set_opts(
-				swrCtx_,
-				wanted_channel_layout,
-				AV_SAMPLE_FMT_S16,
-				wanted_resample_freq,
-				dec_channel_layout,
-				codecCtx_->sample_fmt,
-				codecCtx_->sample_rate,
-				0,
-				NULL);
-
-			if (!swrCtx_ || swr_init(swrCtx_) < 0) {
-				ERROR_LOG(ME, "swr_init: Failed to initialize the resampling context");
-				avcodec_close(codecCtx_);
-				codec_ = 0;
-				return false;
-			}
+		_dbg_assert_(outputChannels == 2);
+		int samples = 0;
+		if (outbuf != nullptr) {
+#if LIBAVUTIL_VERSION_MAJOR >= 59
+			const int channels = frame_->ch_layout.nb_channels;
+#else
+			const int channels = frame_->channels;
+#endif
+			samples = ConvertToStereoS16(frame_, channels, outbuf);
 		}
-
-		// convert audio to AV_SAMPLE_FMT_S16
-		int swrRet = swr_convert(swrCtx_, &outbuf, frame_->nb_samples, (const u8 **)frame_->extended_data, frame_->nb_samples);
-		if (swrRet < 0) {
-			ERROR_LOG(ME, "swr_convert: Error while converting: %d", swrRet);
+		if (samples < 0) {
+			ERROR_LOG(Log::ME, "Can't convert decoded audio (format %d) to s16", frame_->format);
 			return false;
 		}
-		// output samples per frame, we should *2 since we have two channels
-		outSamples = swrRet * 2;
-
-		// each sample occupies 2 bytes
-		*outbytes = outSamples * 2;
+		// output stereo samples per frame
+		if (outSamples) {
+			*outSamples = samples;
+		}
 
 		// Save outbuf into pcm audio, you can uncomment this line to save and check the decoded audio into pcm file.
 		// SaveAudio("dump.pcm", outbuf, *outbytes);
@@ -269,26 +387,24 @@ bool SimpleAudio::Decode(void *inbuf, int inbytes, uint8_t *outbuf, int *outbyte
 	return true;
 #else
 	// Zero bytes output. No need to memset.
-	*outbytes = 0;
+	*outSamples = 0;
 	return true;
 #endif  // USE_FFMPEG
 }
 
-int SimpleAudio::GetOutSamples() {
-	return outSamples;
-}
-
-int SimpleAudio::GetSourcePos() {
-	return srcPos;
-}
-
-void AudioClose(SimpleAudio **ctx) {
+void AudioClose(AudioDecoder **ctx) {
 #ifdef USE_FFMPEG
 	delete *ctx;
 	*ctx = 0;
 #endif  // USE_FFMPEG
 }
 
+void AudioClose(FFmpegAudioDecoder **ctx) {
+#ifdef USE_FFMPEG
+	delete *ctx;
+	*ctx = 0;
+#endif  // USE_FFMPEG
+}
 
 static const char *const codecNames[4] = {
 	"AT3+", "AT3", "MP3", "AAC",
@@ -302,7 +418,7 @@ const char *GetCodecName(int codec) {
 	}
 };
 
-bool IsValidCodec(int codec){
+bool IsValidCodec(PSPAudioType codec){
 	if (codec >= PSP_CODEC_AT3PLUS && codec <= PSP_CODEC_AAC) {
 		return true;
 	}
@@ -313,33 +429,21 @@ bool IsValidCodec(int codec){
 // sceAu module starts from here
 
 AuCtx::AuCtx() {
-	decoder = NULL;
-	startPos = 0;
-	endPos = 0;
-	LoopNum = -1;
-	AuBuf = 0;
-	AuBufSize = 2048;
-	PCMBuf = 0;
-	PCMBufSize = 2048;
-	AuBufAvailable = 0;
-	SumDecodedSamples = 0;
-	askedReadSize = 0;
-	audioType = 0;
-	FrameNum = 0;
-};
+}
 
-AuCtx::~AuCtx(){
-	if (decoder){
+AuCtx::~AuCtx() {
+	if (decoder) {
 		AudioClose(&decoder);
-		decoder = NULL;
+		decoder = nullptr;
 	}
-};
+}
 
 size_t AuCtx::FindNextMp3Sync() {
-	if (audioType != PSP_CODEC_MP3) {
+	// sourcebuff.size() - 2 underflows to a huge size_t when size() is 0 or 1,
+	// turning this into an out-of-bounds scan - guard against that explicitly.
+	if (sourcebuff.size() < 3) {
 		return 0;
 	}
-
 	for (size_t i = 0; i < sourcebuff.size() - 2; ++i) {
 		if ((sourcebuff[i] & 0xFF) == 0xFF && (sourcebuff[i + 1] & 0xC0) == 0xC0) {
 			return i;
@@ -350,18 +454,31 @@ size_t AuCtx::FindNextMp3Sync() {
 
 // return output pcm size, <0 error
 u32 AuCtx::AuDecode(u32 pcmAddr) {
-	if (!Memory::GetPointer(PCMBuf)) {
-		return hleLogError(ME, -1, "ctx output bufferAddress %08x is invalid", PCMBuf);
-	}
-
-	auto outbuf = Memory::GetPointer(PCMBuf);
+	u32 outptr = PCMBuf + nextOutputHalf * PCMBufSize / 2;
+	auto outbuf = Memory::GetPointerWriteRangeOrException(outptr, PCMBufSize / 2);
 	int outpcmbufsize = 0;
 
+	if (pcmAddr)
+		Memory::WriteOrException_U32(outptr, pcmAddr);
+
+	// The stream is over once the decoder has consumed up to endPos, whatever is still sitting in
+	// the buffer. A game can hand us more than the file actually had - audio/mp3/stream notifies
+	// the full size it asked for even when the read came up short - and the hardware won't decode
+	// that tail, it just reports the end. A stream that still has loops left was already rewound
+	// by the block below, so this only stops us for good.
+	bool end = (int64_t)readPos - AuBufAvailable >= (int64_t)endPos;
+
 	// Decode a single frame in sourcebuff and output into PCMBuf.
-	if (!sourcebuff.empty()) {
+	if (!end && !sourcebuff.empty()) {
 		// FFmpeg doesn't seem to search for a sync for us, so let's do that.
-		int nextSync = (int)FindNextMp3Sync();
-		decoder->Decode(&sourcebuff[nextSync], (int)sourcebuff.size() - nextSync, outbuf, &outpcmbufsize);
+		int nextSync = 0;
+		if (decoder->GetAudioType() == PSP_CODEC_MP3) {
+			nextSync = (int)FindNextMp3Sync();
+		}
+		int inbytesConsumed = 0;
+		int outSamples = 0;
+		decoder->Decode(&sourcebuff[nextSync], (int)sourcebuff.size() - nextSync, &inbytesConsumed, 2, (int16_t *)outbuf, &outSamples);
+		outpcmbufsize = outSamples * 2 * sizeof(int16_t);
 
 		if (outpcmbufsize == 0) {
 			// Nothing was output, hopefully we're at the end of the stream.
@@ -369,9 +486,9 @@ u32 AuCtx::AuDecode(u32 pcmAddr) {
 			sourcebuff.clear();
 		} else {
 			// Update our total decoded samples, but don't count stereo.
-			SumDecodedSamples += decoder->GetOutSamples() / 2;
+			SumDecodedSamples += outSamples;
 			// get consumed source length
-			int srcPos = decoder->GetSourcePos() + nextSync;
+			int srcPos = inbytesConsumed + nextSync;
 			// remove the consumed source
 			if (srcPos > 0)
 				sourcebuff.erase(sourcebuff.begin(), sourcebuff.begin() + srcPos);
@@ -381,7 +498,9 @@ u32 AuCtx::AuDecode(u32 pcmAddr) {
 		}
 	}
 
-	bool end = readPos - AuBufAvailable >= (int64_t)endPos;
+	// Check again now that the decode has consumed more. The hardware rewinds in the same call that
+	// decodes the last frame, so the sum reads back as zero right after it (audio/mp3/getsumdecoded).
+	end = (int64_t)readPos - AuBufAvailable >= (int64_t)endPos;
 	if (end && LoopNum != 0) {
 		// When looping, start the sum back off at zero and reset readPos to the start.
 		SumDecodedSamples = 0;
@@ -391,28 +510,21 @@ u32 AuCtx::AuDecode(u32 pcmAddr) {
 	}
 
 	if (outpcmbufsize == 0 && !end) {
-		outpcmbufsize = MaxOutputSample * 4;
-		memset(outbuf, 0, PCMBufSize);
-	} else if ((u32)outpcmbufsize < PCMBufSize) {
-		// TODO: We probably should use a rolling buffer instead.
-		memset(outbuf + outpcmbufsize, 0, PCMBufSize - outpcmbufsize);
+		// If we didn't decode anything, we fill this half of the buffer with zeros.
+		outpcmbufsize = PCMBufSize / 2;
+		if (outbuf != nullptr)
+			memset(outbuf, 0, outpcmbufsize);
+	} else if ((u32)outpcmbufsize < PCMBufSize / 2) {
+		// TODO: Not sure it actually zeros this out.
+		if (outbuf != nullptr)
+			memset(outbuf + outpcmbufsize, 0, PCMBufSize / 2 - outpcmbufsize);
 	}
 
-	NotifyMemInfo(MemBlockFlags::WRITE, pcmAddr, outpcmbufsize, "AuDecode");
-	if (pcmAddr)
-		Memory::Write_U32(PCMBuf, pcmAddr);
+	if (outpcmbufsize != 0)
+		NotifyMemInfo(MemBlockFlags::WRITE, outptr, outpcmbufsize, "AuDecode");
+
+	nextOutputHalf ^= 1;
 	return outpcmbufsize;
-}
-
-u32 AuCtx::AuGetLoopNum()
-{
-	return LoopNum;
-}
-
-u32 AuCtx::AuSetLoopNum(int loop)
-{
-	LoopNum = loop;
-	return 0;
 }
 
 // return 1 to read more data stream, 0 don't read
@@ -425,29 +537,84 @@ int AuCtx::AuCheckStreamDataNeeded() {
 }
 
 int AuCtx::AuStreamBytesNeeded() {
-	if (audioType == PSP_CODEC_MP3) {
+	// libaac.prx double buffers the same way (sceAacGetInfoToAddStreamData hands out up to the end
+	// of the current half, and the write pointer flips to the other half once the decoder is past it).
+	if (decoder->GetAudioType() == PSP_CODEC_MP3 || decoder->GetAudioType() == PSP_CODEC_AAC) {
 		// The endPos and readPos are not considered, except when you've read to the end.
-		if (readPos >= endPos)
+		// Compare signed: readPos is an int and can legitimately go negative (a game can notify
+		// a negative size), and promoting that to u64 would make it look like the end of the
+		// stream instead of what the hardware reports.
+		if ((int64_t)readPos >= (int64_t)endPos)
 			return 0;
-		// Account for the workarea.
-		int offset = AuStreamWorkareaSize();
-		return (int)AuBufSize - AuBufAvailable - offset;
+
+		// The area after the workarea is double buffered: the game may write ahead up to the end
+		// of the half that follows the one the decoder is currently reading from, so a half only
+		// opens up once the decoder has consumed past its end. Decoding a single frame therefore
+		// usually frees nothing at all, which is what the hardware reports (audio/mp3/checkneeded).
+		// Games depend on it: Beats sleeps 50ms every time sceMp3CheckStreamDataNeeded() says it's
+		// behind, so handing back the bytes each decode consumed made it sleep once per frame and
+		// fall to less than half of realtime - badly stuttering custom soundtracks.
+		//
+		// Every case seen so far - the two hardware tests, Beats and Wipeout Pulse - passes the
+		// minimum 8192 byte buffer, so the split being exactly half is unverified for anything
+		// larger. If a game with a bigger buffer ever streams badly, suspect this first: the real
+		// granularity could be a fixed chunk size rather than half of whatever it was given.
+		int half = AuStreamHalfSize();
+		if (half <= 0)
+			return 0;
+		int64_t written = (int64_t)readPos - (int64_t)startPos;
+		int64_t consumed = written - AuBufAvailable;
+		// Floor division - consumed can go negative if a game notifies a negative size.
+		int64_t halvesDone = consumed / half - ((consumed % half < 0) ? 1 : 0);
+		// Note that this is deliberately not clamped to the buffer size. The hardware reports
+		// 6721 bytes to write for an 8192 byte buffer after notifying a size of -1.
+		return (int)std::max((int64_t)0, (halvesDone + 2) * half - written);
 	}
 
-	// TODO: Untested.  Maybe similar to MP3.
+	// TODO: Untested for other codecs, if any.
 	return std::min((int)AuBufSize - AuBufAvailable, (int)endPos - readPos);
 }
 
 int AuCtx::AuStreamWorkareaSize() {
 	// Note that this is 31 bytes more than the max layer 3 frame size.
-	if (audioType == PSP_CODEC_MP3)
+	if (decoder->GetAudioType() == PSP_CODEC_MP3)
 		return 0x05c0;
+	// libaac.prx, sceAacInit: the halves start 0x640 into the buffer.
+	if (decoder->GetAudioType() == PSP_CODEC_AAC)
+		return 0x0640;
 	return 0;
+}
+
+// Size of each of the two halves the stream buffer is split into, after the workarea.
+int AuCtx::AuStreamHalfSize() {
+	return ((int)AuBufSize - AuStreamWorkareaSize()) / 2;
+}
+
+// Offset into the stream buffer (past the workarea) that the next added bytes go to. The write
+// position simply walks the two halves in turn and wraps around, it doesn't follow the decoder.
+int AuCtx::AuStreamWriteOffset() {
+	int size = AuStreamHalfSize() * 2;
+	if (size <= 0)
+		return 0;
+	int64_t pos = ((int64_t)readPos - (int64_t)startPos) % size;
+	if (pos < 0)
+		pos += size;
+	return (int)pos;
 }
 
 // check how many bytes we have read from source file
 u32 AuCtx::AuNotifyAddStreamData(int size) {
 	int offset = AuStreamWorkareaSize();
+	// Where AuGetInfoToAddStreamData pointed the game, i.e. where the bytes it just added start.
+	// Has to be sampled before readPos moves on below.
+	const int writeOffset = AuStreamWriteOffset();
+
+	// libaac.prx (sceAacNotifyAddStreamData) only takes the bytes up to endPos, so the tail of a
+	// half past the end of the file never reaches the decoder. Keeping it put garbage in front of
+	// the looped stream in Fortix.
+	if (decoder->GetAudioType() == PSP_CODEC_AAC && askedReadSize == 0 && size > 0 && (int64_t)readPos + size > (int64_t)endPos) {
+		size = (int)std::max((int64_t)0, (int64_t)endPos - (int64_t)readPos);
+	}
 
 	if (askedReadSize != 0) {
 		// Old save state, numbers already adjusted.
@@ -463,9 +630,15 @@ u32 AuCtx::AuNotifyAddStreamData(int size) {
 		AuBufAvailable += size;
 	}
 
-	if (Memory::IsValidRange(AuBuf, size)) {
+	// `size` is game-supplied and was previously trusted outright: a negative value
+	// would make sourcebuff.resize() attempt a huge allocation (size_t underflow),
+	// and an unbounded positive value would grow sourcebuff without limit (DoS).
+	// The validated range also has to match what's actually read below - it was
+	// checking [AuBuf, AuBuf+size) while the copy reads from [AuBuf+offset, ...).
+	if (size > 0 && (int64_t)offset + writeOffset + size <= (int64_t)AuBufSize &&
+		Memory::IsValidRange(AuBuf + offset + writeOffset, size)) {
 		sourcebuff.resize(sourcebuff.size() + size);
-		Memory::MemcpyUnchecked(&sourcebuff[sourcebuff.size() - size], AuBuf + offset, size);
+		Memory::MemcpyUnchecked(&sourcebuff[sourcebuff.size() - size], AuBuf + offset + writeOffset, size);
 	}
 
 	return 0;
@@ -476,22 +649,29 @@ u32 AuCtx::AuNotifyAddStreamData(int size) {
 u32 AuCtx::AuGetInfoToAddStreamData(u32 bufPtr, u32 sizePtr, u32 srcPosPtr) {
 	int readsize = AuStreamBytesNeeded();
 	int offset = AuStreamWorkareaSize();
+	// The game writes readsize bytes at the write offset, so never let that run off the end of the
+	// buffer, whatever state a failed decode left behind. Not for MP3, where the hardware does hand
+	// out more than fits after a negative notify (audio/mp3/notifyadd).
+	if (decoder->GetAudioType() == PSP_CODEC_AAC && AuStreamHalfSize() > 0) {
+		readsize = std::min(readsize, AuStreamHalfSize() * 2 - AuStreamWriteOffset());
+	}
 
-	// we can recharge AuBuf from its beginning
+	// The write position walks forward through the two halves as data is added and wraps around,
+	// so point the game at that rather than at the start of the work area.
 	if (readsize != 0) {
 		if (Memory::IsValidAddress(bufPtr))
-			Memory::Write_U32(AuBuf + offset, bufPtr);
+			Memory::WriteUnchecked_U32(AuBuf + offset + AuStreamWriteOffset(), bufPtr);
 		if (Memory::IsValidAddress(sizePtr))
-			Memory::Write_U32(readsize, sizePtr);
+			Memory::WriteUnchecked_U32(readsize, sizePtr);
 		if (Memory::IsValidAddress(srcPosPtr))
-			Memory::Write_U32(readPos, srcPosPtr);
+			Memory::WriteUnchecked_U32(readPos, srcPosPtr);
 	} else {
 		if (Memory::IsValidAddress(bufPtr))
-			Memory::Write_U32(0, bufPtr);
+			Memory::WriteUnchecked_U32(0, bufPtr);
 		if (Memory::IsValidAddress(sizePtr))
-			Memory::Write_U32(0, sizePtr);
+			Memory::WriteUnchecked_U32(0, sizePtr);
 		if (Memory::IsValidAddress(srcPosPtr))
-			Memory::Write_U32(0, srcPosPtr);
+			Memory::WriteUnchecked_U32(0, srcPosPtr);
 	}
 
 	// Just for old save states.
@@ -521,7 +701,7 @@ u32 AuCtx::AuResetPlayPosition() {
 }
 
 void AuCtx::DoState(PointerWrap &p) {
-	auto s = p.Section("AuContext", 0, 1);
+	auto s = p.Section("AuContext", 0, 2);
 	if (!s)
 		return;
 
@@ -537,6 +717,7 @@ void AuCtx::DoState(PointerWrap &p) {
 	Do(p, Channels);
 	Do(p, MaxOutputSample);
 	Do(p, readPos);
+	int audioType = decoder ? (int)decoder->GetAudioType() : 0;
 	Do(p, audioType);
 	Do(p, BitRate);
 	Do(p, SamplingRate);
@@ -545,8 +726,27 @@ void AuCtx::DoState(PointerWrap &p) {
 	Do(p, dummy);
 	Do(p, FrameNum);
 
+	// The decoder writes a whole frame into each half. The game side requires at least this much,
+	// except for an MP3 handle reserved without parameters, which has no buffers at all.
+	const u32 minPCMBufSize = audioType == PSP_CODEC_AAC ? 8192 : 9216;
+	const bool noBuffers = PCMBuf == 0 && PCMBufSize == 0;
+	if (p.mode == p.MODE_READ && PCMBufSize < minPCMBufSize && !noBuffers) {
+		ERROR_LOG(Log::SaveState, "AuCtx: PCM buffer of %d bytes in savestate is too small", PCMBufSize);
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
+
+	if (s < 2) {
+		AuBufAvailable = 0;
+		Version = 3;
+	} else {
+		Do(p, Version);
+		Do(p, AuBufAvailable);
+		Do(p, sourcebuff);
+		Do(p, nextOutputHalf);
+	}
+
 	if (p.mode == p.MODE_READ) {
-		decoder = new SimpleAudio(audioType);
-		AuBufAvailable = 0; // reset to read from file at position readPos
+		decoder = CreateAudioDecoder((PSPAudioType)audioType);
 	}
 }

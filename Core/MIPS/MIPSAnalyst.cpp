@@ -16,18 +16,17 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
-#include <map>
-#include <set>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
 
 #include "ext/cityhash/city.h"
-#include "ext/xxhash.h"
-
 #include "Common/File/FileUtil.h"
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Common/TimeUtil.h"
+#include "Common/Math/math_util.h"
 #include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Core/System.h"
@@ -36,6 +35,7 @@
 #include "Core/MIPS/MIPSTables.h"
 #include "Core/MIPS/MIPSAnalyst.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
+#include "Core/MIPS/InterpreterVFPU.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/Debugger/DebugInterface.h"
 #include "Core/HLE/ReplaceTables.h"
@@ -46,10 +46,6 @@ using namespace MIPSCodeUtils;
 typedef std::vector<MIPSAnalyst::AnalyzedFunction> FunctionsVector;
 static FunctionsVector functions;
 std::recursive_mutex functions_lock;
-
-// One function can appear in multiple copies in memory, and they will all have 
-// the same hash and should all be replaced if possible.
-static std::unordered_multimap<u64, MIPSAnalyst::AnalyzedFunction *> hashToFunction;
 
 struct HashMapFunc {
 	char name[64];
@@ -77,7 +73,7 @@ namespace std {
 
 static std::unordered_set<HashMapFunc> hashMap;
 
-static std::string hashmapFileName;
+static Path hashmapFileName;
 
 #define MIPSTABLE_IMM_MASK 0xFC000000
 
@@ -100,7 +96,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x019ba2099fb88f3c, 48, "vector_normalize_t", },
 	{ 0x0266f96d740c7e03, 912, "memcpy", }, // Final Fantasy 4 (US)
 	{ 0x02bd2859045d2383, 240, "bcmp", },
-	{ 0x030507c9a1f0fc85, 92, "matrix_rot_x", },
+	{ 0x030507c9a1f0fc85, 92, "sceVfpuMatrix4RotX", },
 	{ 0x0483fceefa4557ff, 1360, "__udivdi3", },
 	{ 0x0558ad5c5be00ca1, 76, "vtfm_t", },
 	{ 0x05aceb23092fd6a1, 36, "zettai_hero_update_minimap_tex", }, // Zettai Hero Project (US)
@@ -123,8 +119,9 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x0f1e7533a546f6a1, 228, "dl_write_bone_matrix_4", },
 	{ 0x0f2a1106ad84fb74, 52, "strcmp", },
 	{ 0x0ffa5db8396d4274, 64, "memcpy_jak", }, // CRUSH
+	{ 0x11624abe9542fb01, 180, "everybodysgolf_copy_portrait", }, // Everybody's Golf (EUR)
 	{ 0x1252e902d0b49bfb, 44, "vector_sub_q_2", },
-	{ 0x12df3d33a58d0298, 52, "vmidt_t", },
+	{ 0x12df3d33a58d0298, 52, "sceVfpuMatrix3Unit", },
 	{ 0x12feef7b017d3431, 700, "memmove", },
 	{ 0x1322c7e3fe6dff4d, 784, "_free_r", },
 	{ 0x1376c115d5f1d90c, 36, "strlen", },
@@ -135,27 +132,31 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x1616ee7052542059, 48, "vtfm_t", },
 	{ 0x16965ca11a4e7dac, 104, "vmmul_q_transp", },
 	{ 0x16afe830a5dd2de2, 40, "vdiv_q", },
+	{ 0x181b963854b3045f, 1736, "zuma_pad_analog", }, // Zuma
 	{ 0x184e834a63a79016, 32, "isnanf", },
 	{ 0x1874ee898c7b9f16, 512, "kokoroconnect_download_frame", }, // Kokoro Connect Yochi Random
 	{ 0x189212bda9c94df1, 736, "atanf", },
 	{ 0x199821ce500ef9d2, 24, "vocp_t", },
 	{ 0x1a3c8e9d637ed421, 104, "__adddf3", },
 	{ 0x1a7564fa3e25c992, 844, "memcpy", }, // Valkyria Chronicles 3
-	{ 0x1aad94c0723edfc0, 124, "vmmul_t_transp", },
+	{ 0x1aad94c0723edfc0, 124, "sceVfpuMatrix3Mul", },
 	{ 0x1ab33b12b3cb8cb0, 28, "vqmul_q", },
 	{ 0x1ac05627df1f87f4, 112, "memcpy16", }, // Valkyria Chronicles 3
+	{ 0x1aee5a57e8bc2e78, 740, "resistance_muzzle_light", },
 	{ 0x1bdf3600844373fd, 112, "strstr", },
 	{ 0x1c967be07917ddc9, 92, "strcat", },
 	{ 0x1d03fa48334ca966, 556, "_strtol_r", },
 	{ 0x1d1311966d2243e9, 428, "suikoden1_and_2_download_frame_1", }, // Gensou Suikoden 1&2
+	{ 0x1d66a9d38981b9da, 184, "everybodysgolf2_copy_portrait", }, // Everybody's Golf 2 (EUR)
 	{ 0x1d7de04b4e87d00b, 680, "kankabanchoutbr_download_frame", }, // Kenka Banchou Bros: Tokyo Battle Royale
 	{ 0x1daf6eaf0442391d, 1024, "utawarerumono_download_frame", }, // Utawarerumono portable
 	{ 0x1e1525e3bc2f6703, 676, "rint", },
-	{ 0x1ec055f28bb9f4d1, 88, "gu_update_stall", },
+	{ 0x1ec055f28bb9f4d1, 88, "_sceGuUpdateStallAddr", },
 	{ 0x1ef9cfe6afd3c035, 180, "memset", }, // Kingdom Hearts (US)
 	{ 0x1f53eac122f96b37, 224, "cosf", },
 	{ 0x2097a8b75c8fe651, 436, "atan2", },
 	{ 0x21411b3c860822c0, 36, "matrix_scale_q_t", },
+	{ 0x2161ea81a06bcacd, 1032, "soltrigger_render_ucschar", }, // Sol Trigger
 	{ 0x24d82a8675800808, 220, "ceilf", },
 	{ 0x26cc90cb25af9d27, 476, "log10", },
 	{ 0x275c79791a2bab83, 116, "rezel_cross_download_frame", }, // Rezel Cross
@@ -171,11 +172,11 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x2bcf5268dd26345a, 340, "acos", },
 	{ 0x2c4cb2028a1735bf, 600, "floor", },
 	{ 0x2c61a9a06a345b43, 1084, "otomenoheihou_download_frame", }, // Sangoku Koi Senki Otome no Heihou
-	{ 0x2ca5958bb816c72e, 44, "vector_i2f_t", },
+	{ 0x2ca5958bb816c72e, 44, "sceVfpuVector3FromIVector", },
 	{ 0x2e7022d9767c9018, 2100, "atan", },
 	{ 0x2f10d3faec84b5bb, 276, "sinf", },
-	{ 0x2f639673670caa0e, 772, "dl_write_matrix_2", },
-	{ 0x2f718936b371fc44, 40, "vcos_s", },
+	{ 0x2f639673670caa0e, 772, "sceGupSetMatrix", },
+	{ 0x2f718936b371fc44, 40, "sceVfpuScalarCos", },
 	{ 0x3024e961d1811dea, 396, "fmod", },
 	{ 0x3050bfd0e729dfbf, 220, "atvoffroadfuryblazintrails_download_frame", }, // ATV Offroad Fury Blazin' Trails (US)
 	{ 0x30c9c4f420573eb6, 540, "expf", },
@@ -192,26 +193,28 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x35d3527ff8c22ff2, 56, "matrix_scale_q", },
 	{ 0x368f6cf979709a31, 744, "memmove", }, // Jui Dr. Touma Jotarou
 	{ 0x373ce518eee5a2d2, 20, "matrix300_store_q", },
+	{ 0x38260ad724f4d8f7, 804, "zuma_aim_cursor", }, // Zuma
 	{ 0x3840f5766fada4b1, 592, "dissidia_recordframe_avi", }, // Dissidia (US), Dissidia 012 (US)
-	{ 0x388043e96b0e11fd, 144, "dl_write_material_2", },
+	{ 0x388043e96b0e11fd, 144, "sceGupMaterial", },
 	{ 0x38f19bc3be215acc, 388, "log10f", },
 	{ 0x3913b81ddcbe1efe, 880, "katamari_render_check", }, // Me and My Katamari (US)
 	{ 0x393047f06eceaba1, 96, "strcspn", },
+	{ 0x3966eef670a93781, 188, "memcpy", }, // SSX On Tour (EU, KR) - copies decoded video frames into the framebuffer
 	{ 0x39a651942a0b3861, 204, "tan", },
 	{ 0x3a3bc2b20a55bf02, 68, "memchr", },
-	{ 0x3ab08b5659de1746, 40, "vsin_s", },
+	{ 0x3ab08b5659de1746, 40, "sceVfpuScalarSin", },
 	{ 0x3c421a9265f37ebc, 700, "memmove", }, // Final Fantasy 4 (US)
 	{ 0x3cbc2d50a3db59e9, 100, "strncmp", },
-	{ 0x3ce1806699a91d9d, 148, "dl_write_light", },
+	{ 0x3ce1806699a91d9d, 148, "sceGupLight", },
 	{ 0x3d5e914011c181d4, 444, "scalbnf", },
 	{ 0x3ea41eafb53fc99a, 388, "logf", },
 	{ 0x3fe38bff09ac3da0, 436, "_strtoul_r", },
 	{ 0x40a25c7e1fd44fe2, 24, "fabsf", },
 	// Unsafe due to immediates.
 	//{ 0x410d48d9b6580b4a, 36, "dl_write_ztest", },
-	{ 0x42dc17c8018f30f2, 44, "vtan.s", },
+	{ 0x42dc17c8018f30f2, 44, "sceVfpuScalarTan", },
 	{ 0x436b07caa2aab931, 352, "acos", },
-	{ 0x444472537eedf966, 32, "vmzero_q", },
+	{ 0x444472537eedf966, 32, "sceVfpuMatrix4Zero", },
 	{ 0x449ff96982626338, 28, "vmidt_q", },
 	{ 0x44f65b1a72c45703, 36, "strlen", },
 	{ 0x45528de3948615dc, 64, "memcpy", },
@@ -236,12 +239,13 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x514161da54d37416, 1416, "__umoddi3", },
 	{ 0x51c52d7dd4d2191c, 360, "cos", },
 	{ 0x5287d4b8abd5806b, 768, "_strtoll_r", },
-	{ 0x52d5141545a75eda, 60, "dl_write_clutformat", },
-	{ 0x530cbe1ce9b45d58, 108, "dl_write_light_vector", },
+	{ 0x52d5141545a75eda, 60, "sceGuClutMode", },
+	{ 0x530cbe1ce9b45d58, 108, "sceGuLightAtt", },
 	{ 0x53c9aa23504a630f, 96, "vmmul_q_5", },
+	{ 0x534ee7407afd0428, 1868, "syphonfilterls_update_trail", }, // Syphon Filter: Logan's Shadow (US)
 	{ 0x54015ccbcbc75374, 24, "strlen", }, // Metal Gear Solid: Peace Walker demo
 	{ 0x5550d87a851c218c, 168, "dl_write_viewport", },
-	{ 0x55c1294280bfade0, 88, "dl_write_blend_fixed", },
+	{ 0x55c1294280bfade0, 88, "sceGuBlendFunc", },
 	{ 0x5642a63f3802a792, 456, "orenoimouto_download_frame", }, // Ore no Imouto ga Konnani Kawaii Wake ga Nai
 	{ 0x56c9929e8c8c5768, 24, "fabsf", },
 	{ 0x572b2d9e57e6e363, 788, "memcpy_thingy", },
@@ -251,13 +255,13 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x59a0cb08f5ecf8b6, 28, "copysignf", },
 	{ 0x5ae4ec2a5e133de3, 28, "vector_cross_t", },
 	{ 0x5b005f8375d7c364, 236, "floorf", },
-	{ 0x5b103d973fd1dd94, 92, "matrix_rot_y", },
+	{ 0x5b103d973fd1dd94, 92, "sceVfpuMatrix4RotY", },
 	{ 0x5b9d7e9d4c905694, 196, "_calloc_r", },
 	{ 0x5bf7a77b028e9f66, 324, "sqrtf", },
 	{ 0x5c0b3edc0e48852c, 148, "memmove", }, // Dissidia 1 (US)
 	{ 0x5e898df42c4af6b8, 76, "wcsncmp", },
 	{ 0x5f473780835e3458, 52, "vclamp_q", },
-	{ 0x5fc58ed2c4d48b79, 40, "vtfm_q_transp", },
+	{ 0x5fc58ed2c4d48b79, 40, "sceVfpuMatrix4Transform", },
 	{ 0x6145029ef86f0365, 76, "__extendsfdf2", },
 	{ 0x62815f41fa86a131, 656, "scalbn", },
 	{ 0x6301fa5149bd973a, 120, "wcscat", },
@@ -282,18 +286,19 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x6e9884c842a51142, 236, "strncasecmp", },
 	{ 0x6f101c5c4311c144, 276, "floorf", },
 	{ 0x6f1731f84bbf76c3, 116, "strcmp", },
-	{ 0x6f4e1a1a84df1da0, 68, "dl_write_texmode", },
+	{ 0x6f4e1a1a84df1da0, 68, "sceGupTexMode", },
 	{ 0x6f7c9109b5b8fa47, 688, "danganronpa1_2_download_frame", }, // Danganronpa 1
 	{ 0x70649c7211f6a8da, 16, "fabsf", },
 	{ 0x70a6152b265228e8, 296, "unendingbloodycall_download_frame", }, // unENDing Bloody Call
-	{ 0x7245b74db370ae72, 64, "vmmul_q_transp3", },
-	{ 0x7259d52b21814a5a, 40, "vtfm_t_transp", },
+	{ 0x7245b74db370ae72, 64, "sceVfpuMatrix4Mul", },
+	{ 0x7259d52b21814a5a, 40, "sceVfpuMatrix4TransformXYZ", },
+	{ 0x730f59cc6c0f5732, 452, "godseaterburst_depthmask_5551", }, // Gods Eater Burst (US)
 	{ 0x7354fd206796d817, 864, "flowers_download_frame", }, // Flowers
 	{ 0x736b34ebc702d873, 104, "vmmul_q_transp", },
 	{ 0x73a614c08f777d52, 792, "danganronpa2_2_download_frame", }, // Danganronpa 2
 	{ 0x7499a2ce8b60d801, 12, "abs", },
 	{ 0x74c77fb521740cd2, 284, "toheart2_download_frame_2", }, // To Heart 2 Portable
-	{ 0x74ebbe7d341463f3, 72, "dl_write_colortest", },
+	{ 0x74ebbe7d341463f3, 72, "sceGuColorFunc", },
 	{ 0x755a41f9183bb89a, 60, "vmmul_q", },
 	{ 0x757d7ab0afbc03f5, 948, "kirameki_school_life_download_frame", }, // Toradora! Portable
 	{ 0x759834c69bb12c12, 68, "strcpy", },
@@ -325,14 +330,15 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x8da0164e69e9b531, 1040, "grisaianokajitsu_download_frame", }, // Grisaia no Kajitsu La Fruit de la Grisaia
 	{ 0x8dd0546db930ef25, 992, "memmove", }, // PoPoLoCrois (JPN)
 	{ 0x8df2928848857e97, 164, "strcat", },
-	{ 0x8e48cabd529ca6b5, 52, "vector_multiply_t", },
+	{ 0x8e48cabd529ca6b5, 52, "sceVfpuVector3Mul", },
 	{ 0x8e97dcb03fbaba5c, 104, "vmmul_q_transp", },
 	{ 0x8ecf804bbe7922e5, 572, "worms_copy_normalize_alpha" }, // Worms Battle Islands (US)
 	{ 0x8ee81b03d2eef1e7, 28, "vmul_t", },
 	{ 0x8f09fb8693c3c49d, 992, "kirameki_school_life_download_frame", }, // Hentai Ouji To Warawanai Neko
 	{ 0x8f19c41e8b987e18, 100, "matrix_mogrify", },
+	{ 0x8f84fb657a6ba506, 1148, "syphonfilterls_fade", }, // Syphon Filter: Logan's Shadow (US)
 	{ 0x8ff11e9bed387401, 700, "memmove", }, // God Eater 2
-	{ 0x910140c1a07aa59e, 256, "rot_matrix_euler_zyx", },
+	{ 0x910140c1a07aa59e, 256, "sceVfpuMatrix4Rot", },
 	{ 0x91606bd72ae90481, 44, "wmemcpy", },
 	{ 0x92c7d2de74068c9c, 32, "vcross_t", },
 	{ 0x93d8a275ba288b26, 32, "vdot_t", },
@@ -349,18 +355,24 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x9ce53975bb88c0e7, 96, "strncpy", },
 	{ 0x9d4f5f56b52f07f2, 808, "memmove", }, // Jeanne d'Arc (US)
 	{ 0x9e2941c4a5c5e847, 792, "memcpy", }, // LittleBigPlanet (US)
+	{ 0x9e6adef67e76ed5c, 188, "everybodystennis_copy_portrait", }, // Everybody's Tennis (EUR)
 	{ 0x9e6ce11f9d49f954, 292, "memcpy", }, // Jeanne d'Arc (US)
-	{ 0x9f269daa6f0da803, 128, "dl_write_scissor_region", },
+	{ 0x9e6e007072b74503, 2028, "syphonfilterls_draw_trail", }, // Syphon Filter: Logan's Shadow (US)
+	{ 0x9f269daa6f0da803, 128, "sceGupScissor", },
 	{ 0x9f7919eeb43982b0, 208, "__fixdfsi", },
+	{ 0xa0ec0ed83a53b883, 7304, "syphonfilter_steer", }, // Syphon Filter: Dark Mirror (US)
 	{ 0xa1c9b0a2c71235bf, 1752, "marvelalliance1_copy" }, // Marvel Ultimate Alliance 1 (EU)
+	{ 0x9b76c7f2a41aa805, 1752, "marvelalliance1_copy" }, // Marvel Ultimate alliance 1 (US)
 	{ 0xa1ca0640f11182e7, 72, "strcspn", },
 	{ 0xa243486be51ce224, 272, "cosf", },
-	{ 0xa2bcef60a550a3ef, 92, "matrix_rot_z", },
+	{ 0xa2bcef60a550a3ef, 92, "sceVfpuMatrix4RotZ", },
 	{ 0xa373f55c65cd757a, 312, "memcpy_swizzled" }, // God Eater Burst Demo
+	{ 0xa40999be36665f98, 588, "everybodysgolf_spinner_background", }, // Everybody's Golf (EUR)
 	{ 0xa41989db0f9bf97e, 1304, "pow", },
 	{ 0xa44f6227fdbc12b1, 132, "memcmp", }, // Popolocrois (US)
-	{ 0xa46cc6ea720d5775, 44, "dl_write_cull", },
+	{ 0xa46cc6ea720d5775, 44, "sceGupFrontFace", },
 	{ 0xa54967288afe8f26, 600, "ceil", },
+	{ 0xa5bada68329c05ba, 1904, "medievil_projectile_update", }, // MediEvil Resurrection (US, EU)
 	{ 0xa5ddbbc688e89a4d, 56, "isinf", },
 	{ 0xa615f6bd33195dae, 220, "atvoffroadfuryprodemo_download_frame", }, // ATV Offroad Fury Pro (US) demo
 	{ 0xa662359e30b829e4, 148, "memcmp", },
@@ -370,22 +382,23 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xa85fe8abb88b1c6f, 52, "vector_sub_t", },
 	{ 0xa9194e55cc586557, 268, "memcpy", },
 	{ 0xa91b3d60bd75105b, 28, "vadd_t", },
-	{ 0xab97ec58c58a7c75, 52, "vector_divide_t", },
+	{ 0xaaf1cc9399336a21, 1872, "resistance_update_trail", },
+	{ 0xab97ec58c58a7c75, 52, "sceVfpuVector3Div", },
 	{ 0xac84fa7571895c9a, 68, "memcpy", }, // Marvel Ultimate Alliance 2
 	{ 0xacc2c11c3ea28320, 268, "ceilf", },
-	{ 0xad67add5122b8c64, 52, "matrix_q_translate_t", },
+	{ 0xad67add5122b8c64, 52, "sceVfpuMatrix4Transfer", },
 	{ 0xada952a1adcea4f5, 60, "vmmul_q_transp5", },
 	{ 0xadfbf8fb8c933193, 56, "fabs", },
 	{ 0xae39bac51fd6e76b, 628, "gakuenheaven_download_frame", }, // Gakuen Heaven: Boy's Love Scramble!
 	{ 0xae50226363135bdd, 24, "vector_sub_t", },
-	{ 0xae6cd7dfac82c244, 48, "vpow_s", },
+	{ 0xae6cd7dfac82c244, 48, "sceVfpuScalarPow", },
 	{ 0xaf85d47f95ad2921, 1936, "pow", },
 	{ 0xafb2c7e56c04c8e9, 48, "vtfm_q", },
 	{ 0xafc9968e7d246a5e, 1588, "atan", },
 	{ 0xafcb7dfbc4d72588, 44, "vector_transform_3x4", },
 	{ 0xb07f9d82d79deea9, 536, "brandish_download_frame", },  // Brandish, and Sora no kiseki 3rd
 	{ 0xb09c9bc1343a774c, 456, "danganronpa2_1_download_frame", }, // Danganronpa 2
-	{ 0xb0db731f27d3aa1b, 40, "vmax_s", },
+	{ 0xb0db731f27d3aa1b, 40, "sceVfpuScalarMax", },
 	{ 0xb0ef265e87899f0a, 32, "vector_divide_t_s", },
 	{ 0xb183a37baa12607b, 32, "vscl_t", },
 	{ 0xb1a3e60a89af9857, 20, "fabs", },
@@ -393,6 +406,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xb3fef47fb27d57c9, 44, "vector_scale_t", },
 	{ 0xb43fd5078ae78029, 84, "send_commandi_stall", },
 	{ 0xb43ffbd4dc446dd2, 324, "atan2f", },
+	{ 0xb4686bcdfb76e454, 156, "activisionhits_frame_limit", }, // Activision Hits Remixed (issue #20287)
 	{ 0xb5fdb3083e6f4b3f, 36, "vhtfm_t", },
 	{ 0xb6a04277fb1e1a1a, 104, "vmmul_q_transp", },
 	{ 0xb726917d688ac95b, 268, "kagaku_no_ensemble_download_frame", }, // Toaru Majutsu to Kagaku no Ensemble
@@ -400,20 +414,21 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xb7d88567dc22aab1, 820, "memcpy", }, // Trails in the Sky (US)
 	{ 0xb877d3c37a7aaa5d, 60, "vmmul_q_2", },
 	{ 0xb89aa73b6f94ba95, 52, "vclamp_t", },
-	{ 0xb8bd1f0e02e9ad87, 156, "dl_write_light_dir", },
+	{ 0xb8bd1f0e02e9ad87, 156, "sceGuLightSpot", },
 	{ 0xb8cfaeebfeb2de20, 7548, "_vfprintf_r", },
 	{ 0xb97f352e85661af6, 32, "finitef", },
 	{ 0xba76a8e853426baa, 544, "soranokiseki_fc_download_frame", }, // Sora no kiseki FC
-	{ 0xbb3c6592ed319ba4, 132, "dl_write_fog_params", },
+	{ 0xbb3c6592ed319ba4, 132, "sceGuFog", },
 	{ 0xbb7d7c93e4c08577, 124, "__truncdfsf2", },
-	{ 0xbdf54d66079afb96, 200, "dl_write_bone_matrix_3", },
+	{ 0xbd015888f2167ac9, 532, "koori_download_frame", }, // Koori no Bohyou (NPJH50186)
+	{ 0xbdf54d66079afb96, 200, "sceGuBoneMatrix", },
 	{ 0xbe773f78afd1a70f, 128, "rand", },
 	{ 0xbf5d02ccb8514881, 108, "strcmp", },
 	{ 0xbf791954ebef4afb, 396, "expf", },
 	{ 0xbfa8c16038b7753d, 868, "sakurasou_download_frame", }, // Sakurasou No Pet Na Kanojo
 	{ 0xbfe07e305abc4cd1, 808, "memmove" }, // Final Fantasy Tactics (US)
 	{ 0xc062f2545ef5dc39, 1076, "kirameki_school_life_download_frame", },// Kirameki School Life SP,and Boku wa Tomodati ga Sukunai
-	{ 0xc0feb88cc04a1dc7, 48, "vector_negate_t", },
+	{ 0xc0feb88cc04a1dc7, 48, "sceVfpuVector3Neg", },
 	{ 0xc1220040b0599a75, 472, "soranokiseki_sc_download_frame", }, // Sora no kiseki SC
 	{ 0xc1f34599d0b9146b, 116, "__subdf3", },
 	{ 0xc3089f66ee6f0a24, 464, "growlanser_create_saveicon", }, // Growlanswer IV
@@ -423,6 +438,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xc51519f5dab342d4, 224, "cosf", },
 	{ 0xc52c14b9af8c3008, 76, "memcmp", },
 	{ 0xc54eae62622f1e11, 164, "dl_write_bone_matrix_2", },
+	{ 0xc626403884cabcbf, 532, "bejeweled2_draw_dirty_stuff", }, // Bejeweled 2
 	{ 0xc6b29de7d3245198, 656, "starocean_write_stencil" }, // Star Ocean 1 (US)
 	{ 0xc7b1113cfdfedab6, 104, "tonyhawkp8_upload_tutorial_frame", }, // Tony Hawk's Project 8 (US)
 	{ 0xc96e3a087ebf49a9, 100, "dl_write_light_color", },
@@ -437,15 +453,16 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xcee11483b550ce8f, 24, "vocp_q", },
 	{ 0xcfecf208769ed5fd, 272, "cosf", },
 	{ 0xd019b067b58cf6c3, 700, "memmove", }, // Star Ocean 1 (US)
-	{ 0xd12a3a91e0040229, 524, "dl_write_enable_disable", },
+	{ 0xd12a3a91e0040229, 524, "sceGupSetStatus", },
 	{ 0xd141d1efbfe13ca3, 968, "kirameki_school_life_download_frame", }, // Kirameki School Life SP,and Boku wa Tomodati ga Sukunai
 	{ 0xd1db467a23ebe00d, 724, "rewrite_download_frame", }, // Rewrite Portable
 	{ 0xd1faacfc711d61e8, 68, "__negdf2", },
 	{ 0xd207b0650a41dd9c, 28, "vmin_q", },
+	{ 0xd4af2d7a4df495ae, 1728, "resistance_draw_trail", },
 	{ 0xd6d6e0bb21654778, 24, "vneg_t", },
-	{ 0xd7229fee680e7851, 40, "vmin_s", },
+	{ 0xd7229fee680e7851, 40, "sceVfpuScalarMin", },
 	{ 0xd75670860a7f4b05, 144, "wcsncpy", },
-	{ 0xd76d1a8804c7ec2c, 100, "dl_write_material", },
+	{ 0xd76d1a8804c7ec2c, 100, "sceGupModelColor", },
 	{ 0xd7d350c0b33a4662, 28, "vadd_q", },
 	{ 0xd80051931427dca0, 116, "__subdf3", },
 	{ 0xd96ba6e4ff86f1bf, 276, "katamari_screenshot_to_565", }, // Me and My Katamari (US)
@@ -476,6 +493,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xeabb9c1b4f83d2b4, 52, "memset_jak", }, // Crisis Core (US), Jak and Daxter (this is a slow memset and needs to have slow timing)
 	{ 0xeb0f7bf63d52ece9, 88, "strncat", },
 	{ 0xeb8c0834d8bbc28c, 416, "fmodf", },
+	{ 0xec9ad8df944a770b, 180, "codedarms_stencil_check", }, // Coded Arms: Contagion (EUR)
 	{ 0xed8918f378e9a563, 628, "sd_gundam_g_generation_download_frame", }, // SD Gundam G Generation Overworld
 	{ 0xedbbe9bf9fbceca8, 172, "dl_write_viewport2", },
 	{ 0xedc3f476221f96e6, 148, "tanf", },
@@ -486,7 +504,8 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xf4ea7d2ec943fa02, 224, "sinf", },
 	{ 0xf4f8cdf479dfc4a4, 224, "sinf", },
 	{ 0xf527d906d69005a0, 848, "photokano_download_frame_2", }, // Photo Kano
-	{ 0xf52f993e444b6c52, 44, "dl_write_shademode", },
+	{ 0xf52da867662e04ad, 2024, "gtavcs_plane_control", }, // GTA: Vice City Stories (US, EU)
+	{ 0xf52f993e444b6c52, 44, "sceGupShadeModel", },
 	{ 0xf56641884b36c638, 468, "scalbn", },
 	{ 0xf5e91870b5b76ddc, 288, "motorstorm_download_frame", }, // MotorStorm: Arctic Edge
 	{ 0xf5f7826b4a61767c, 40, "matrix_copy_q", },
@@ -495,7 +514,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xf7fc691db0147e25, 96, "strspn", },
 	{ 0xf842aea3baa61f29, 32, "vector_length_t", },
 	{ 0xf8e0902f4099a9d6, 2260, "qsort", },
-	{ 0xf972543ab7df071a, 32, "vsqrt_s", },
+	{ 0xf972543ab7df071a, 32, "sceVfpuScalarSqrt", },
 	{ 0xf9b00ef163e8b9d4, 32, "vscl_q", },
 	{ 0xf9ea1bf2a897ef24, 588, "ceil", },
 	{ 0xfa156c48461eeeb9, 24, "vf2id_q", },
@@ -506,6 +525,19 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0xfe5dd338ab862291, 216, "memset", }, // Metal Gear Solid: Peace Walker demo
 	{ 0xffc8f5f8f946152c, 192, "dl_write_light_color", },
 	{ 0x249a3c5981c73480, 1472, "openseason_data_decode", },  // Open Season
+	{ 0x795d940ad0a605f8, 40, "gow_fps_hack", }, // God of War (all)
+	{ 0x4c75043b7b0c643b, 512, "gow_vortex_hack", }, // God of War: Ghost of Sparta vortex timer hack, avoids softlock #8299
+	{ 0x7624dde603717640, 288, "ZZT3_select_hack", }, // Zettai Zetsumei Toshi 3 - bypasses softlock on character select screen #4901
+	{ 0x0dc5ca84f707863c, 452, "blitz_fps_hack", }, // Blitz: Overtime
+	{ 0xf93d3cd093595a6c, 856, "brian_lara_fps_hack", }, // Brian Lara 2007: Pressure Play
+	{ 0xc1d4af42a4c8860f, 964, "persona1_download_frame", },  // Persona 1 (issue #13079)
+	{ 0xde4286b2e7f6d3c1, 304, "persona2_download_frame", },  // Persona 2 (issue #13079)
+	{ 0x478c9c93d02011af, 1068, "steinsgate_download_frame", }, // Steins;Gate (issue #18262)
+	{ 0xb85dbe639f7acf13, 312, "infinity_download_frame", },  // Never7, Ever17, Remember11
+	{ 0x649d3305344f7afd, 464, "takuyo_1_download_frame", },
+	{ 0x505ad2073e4381d7, 428, "takuyo_2_download_frame", },
+	{ 0x0f4dbf28320798d7, 1160, "takuyo_3_download_frame", },
+	{ 0xf2bbff4807c5dab2, 556, "kingdomhearts_download_frame", },
 };
 
 namespace MIPSAnalyst {
@@ -604,42 +636,28 @@ namespace MIPSAnalyst {
 	}
 
 	int OpMemoryAccessSize(u32 pc) {
-		const auto op = Memory::Read_Instruction(pc, true);
-		MIPSInfo info = MIPSGetInfo(op);
-		if ((info & (IN_MEM | OUT_MEM)) == 0) {
-			return 0;
-		}
-
-		// TODO: Verify lwl/lwr/etc.?
-		switch (info & MEMTYPE_MASK) {
-		case MEMTYPE_BYTE:
-			return 1;
-		case MEMTYPE_HWORD:
-			return 2;
-		case MEMTYPE_WORD:
-		case MEMTYPE_FLOAT:
-			return 4;
-		case MEMTYPE_VQUAD:
-			return 16;
-		}
-
-		return 0;
+		const auto op = Memory::Read_Instruction(pc);
+		return MIPSGetMemoryAccessSize(op);
 	}
 
 	bool IsOpMemoryWrite(u32 pc) {
-		const auto op = Memory::Read_Instruction(pc, true);
+		const auto op = Memory::Read_Instruction(pc);
 		MIPSInfo info = MIPSGetInfo(op);
 		return (info & OUT_MEM) != 0;
 	}
 
 	bool OpHasDelaySlot(u32 pc) {
-		const auto op = Memory::Read_Instruction(pc, true);
+		const auto op = Memory::Read_Instruction(pc);
 		MIPSInfo info = MIPSGetInfo(op);
 		return (info & DELAYSLOT) != 0;
 	}
 
-	bool OpWouldChangeMemory(u32 pc, u32 addr, u32 size) {
-		const auto op = Memory::Read_Instruction(pc, true);
+	bool OpWouldChangeMemory(MIPSState *mips, u32 pc, u32 addr, u32 size) {
+		if (!Memory::IsValidRange(addr, 4)) {
+			return false;
+		}
+
+		const auto op = Memory::Read_Instruction(pc);
 
 		// TODO: Trap sc/ll, svl.q, svr.q?
 
@@ -662,33 +680,34 @@ namespace MIPSAnalyst {
 		u32 writeVal = 0xFFFFFFFF;
 		u32 prevVal = 0x00000000;
 
-		if (gprMask != 0)
-		{
+		if (gprMask != 0) {
 			MIPSGPReg rt = MIPS_GET_RT(op);
-			writeVal = currentMIPS->r[rt] & gprMask;
-			prevVal = Memory::Read_U32(addr) & gprMask;
+			writeVal = mips->r[rt] & gprMask;
+			prevVal = Memory::ReadUnchecked_U32(addr) & gprMask;
 		}
 
 		if (IsSWC1Instr(op)) {
 			int ft = MIPS_GET_FT(op);
-			writeVal = currentMIPS->fi[ft];
-			prevVal = Memory::Read_U32(addr);
+			writeVal = mips->fi[ft];
+			prevVal = Memory::ReadUnchecked_U32(addr);
 		}
 
 		if (IsSVSInstr(op)) {
 			int vt = ((op >> 16) & 0x1f) | ((op & 3) << 5);
-			writeVal = currentMIPS->vi[voffset[vt]];
-			prevVal = Memory::Read_U32(addr);
+			writeVal = mips->vi[voffset[vt]];
+			prevVal = Memory::ReadUnchecked_U32(addr);
 		}
 
 		if (IsSVQInstr(op)) {
+			if (!Memory::IsValidRange(addr, 16)) {
+				return false;
+			}
 			int vt = (((op >> 16) & 0x1f)) | ((op & 1) << 5);
 			float rd[4];
-			ReadVector(rd, V_Quad, vt);
-			return memcmp(rd, Memory::GetPointer(addr), sizeof(float) * 4) != 0;
+			ReadVector(mips, rd, V_Quad, vt);
+			return memcmp(rd, Memory::GetPointerUnchecked(addr), 16) != 0;  // sizeof(float) * 4
 		}
 
-		// TODO: Technically, the break might be for 1 byte in the middle of a sw.
 		return writeVal != prevVal;
 	}
 
@@ -707,7 +726,7 @@ namespace MIPSAnalyst {
 		}
 
 		for (u32 addr = address, endAddr = address + MAX_ANALYZE; addr <= endAddr; addr += 4) {
-			MIPSOpcode op = Memory::Read_Instruction(addr, true);
+			MIPSOpcode op = Memory::Read_Instruction(addr);
 			MIPSInfo info = MIPSGetInfo(op);
 
 			MIPSGPReg rs = MIPS_GET_RS(op);
@@ -746,7 +765,7 @@ namespace MIPSAnalyst {
 		}
 		totalUsedRegs += numUsedRegs;
 		numAnalyzings++;
-		VERBOSE_LOG(CPU, "[ %08x ] Used regs: %i Average: %f", address, numUsedRegs, (float)totalUsedRegs / (float)numAnalyzings);
+		VERBOSE_LOG(Log::CPU, "[ %08x ] Used regs: %i Average: %f", address, numUsedRegs, (float)totalUsedRegs / (float)numAnalyzings);
 
 		return results;
 	}
@@ -754,22 +773,6 @@ namespace MIPSAnalyst {
 	void Reset() {
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
 		functions.clear();
-		hashToFunction.clear();
-	}
-
-	void UpdateHashToFunctionMap() {
-		std::lock_guard<std::recursive_mutex> guard(functions_lock);
-		hashToFunction.clear();
-		// Really need to detect C++11 features with better defines.
-#if !PPSSPP_PLATFORM(IOS)
-		hashToFunction.reserve(functions.size());
-#endif
-		for (auto iter = functions.begin(); iter != functions.end(); iter++) {
-			AnalyzedFunction &f = *iter;
-			if (f.hasHash && f.size > 16) {
-				hashToFunction.insert(std::make_pair(f.hash, &f));
-			}
-		}
 	}
 
 	enum RegisterUsage {
@@ -783,8 +786,21 @@ namespace MIPSAnalyst {
 		u32 end = addr + instrs * sizeof(u32);
 		bool canClobber = true;
 		while (addr < end) {
-			const MIPSOpcode op = Memory::Read_Instruction(addr, true);
-			const MIPSInfo info = MIPSGetInfo(op);
+			const MIPSOpcode op = Memory::Read_Instruction(addr);
+			MIPSInfo info = MIPSGetInfo(op);
+			// Only control register 31 holds the FPU condition, so cfc1/ctc1 of the others don't touch it.
+			if ((op & 0xFF600000) == 0x44400000 && ((op >> 11) & 0x1F) != 31)
+				info.value &= ~(u64)(IN_FPUFLAG | OUT_FPUFLAG);
+			if (info & OUT_VFPU_CC) {
+				// Only a write to the CC register replaces it.
+				if ((op & 0xFFE00000) == 0x48E00000 && (op & 0xFF) != 128 + VFPU_CTRL_CC)  // mtv/mtvc
+					info.value &= ~(u64)OUT_VFPU_CC;
+				else if (MIPSGetInterpretFunc(op) == &MIPSInt::Int_Vmtvc && (op & 0x7F) != VFPU_CTRL_CC)
+					info.value &= ~(u64)OUT_VFPU_CC;
+				// vcmp below .q keeps the bits of the lanes it doesn't compare.
+				else if ((op & 0xFF800000) == 0x6C000000 && GetVecSize(op) != V_Quad)
+					info.value |= IN_VFPU_CC;
+			}
 
 			// Yes, used.
 			if (info & inFlag)
@@ -824,7 +840,7 @@ namespace MIPSAnalyst {
 			break;
 		}
 
-		if (reg > 32) {
+		if (reg >= 32) {
 			return USAGE_UNKNOWN;
 		}
 
@@ -832,8 +848,11 @@ namespace MIPSAnalyst {
 		u32 end = addr + instrs * sizeof(u32);
 		bool canClobber = true;
 		while (addr < end) {
-			const MIPSOpcode op = Memory::Read_Instruction(addr, true);
-			const MIPSInfo info = MIPSGetInfo(op);
+			const MIPSOpcode op = Memory::Read_Instruction(addr);
+			MIPSInfo info = MIPSGetInfo(op);
+			// mfv/mfvc of a control register past the defined ones leaves rt alone.
+			if ((op & 0xFFE00000) == 0x48600000 && (op & 0xFF) >= 128 + VFPU_CTRL_MAX)
+				info.value &= ~(u64)OUT_RT;
 
 			// Yes, used.
 			if ((info & IN_RS) && (MIPS_GET_RS(op) == reg))
@@ -879,70 +898,74 @@ namespace MIPSAnalyst {
 		return DetermineRegisterUsage(reg, addr, instrs) == USAGE_CLOBBERED;
 	}
 
-	void HashFunctions() {
+	// Ranges are (address, size), sorted by address and not overlapping.
+	static bool InsideRanges(const std::vector<std::pair<u32, u32>> &ranges, u32 start, u32 end) {
+		start &= 0x3FFFFFFF;
+		end &= 0x3FFFFFFF;
+		auto iter = std::upper_bound(ranges.begin(), ranges.end(), start, [](u32 address, const std::pair<u32, u32> &range) {
+			return address < (range.first & 0x3FFFFFFF);
+		});
+		if (iter == ranges.begin()) {
+			return false;
+		}
+		--iter;
+		const u32 rangeStart = iter->first & 0x3FFFFFFF;
+		return start >= rangeStart && end <= rangeStart + iter->second;
+	}
+
+	static void HashFunction(AnalyzedFunction &f, std::vector<u32> &buffer) {
+		if (!Memory::IsValidRange(f.start, f.end - f.start + 4)) {
+			return;
+		}
+
+		// Immediates are masked out, so relocations don't change the hash.
+		buffer.resize((f.end - f.start + 4) / 4);
+		size_t pos = 0;
+		for (u32 addr = f.start; addr <= f.end; addr += 4) {
+			u32 validbits = 0xFFFFFFFF;
+			MIPSOpcode instr = Memory::ReadUnchecked_Instruction(addr);
+			MIPSInfo flags = MIPSGetInfo(instr);
+			if (flags & IN_IMM16)
+				validbits &= ~0xFFFF;
+			if (flags & IN_IMM26)
+				validbits &= ~0x03FFFFFF;
+			buffer[pos++] = instr & validbits;
+		}
+
+		f.hash = CityHash64((const char *) &buffer[0], buffer.size() * sizeof(u32));
+		f.hasHash = true;
+	}
+
+	static void HashFunctions(const std::vector<std::pair<u32, u32>> &unchanged = {}) {
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
 		std::vector<u32> buffer;
 
 		for (auto iter = functions.begin(), end = functions.end(); iter != end; iter++) {
 			AnalyzedFunction &f = *iter;
-			if (!Memory::IsValidRange(f.start, f.end - f.start + 4)) {
+			// end is the last instruction.
+			if (f.hasHash && InsideRanges(unchanged, f.start, f.end + 4)) {
 				continue;
 			}
-
-			// This is unfortunate.  In case of emuhacks or relocs, we have to make a copy.
-			buffer.resize((f.end - f.start + 4) / 4);
-			size_t pos = 0;
-			for (u32 addr = f.start; addr <= f.end; addr += 4) {
-				u32 validbits = 0xFFFFFFFF;
-				MIPSOpcode instr = Memory::ReadUnchecked_Instruction(addr, true);
-				if (MIPS_IS_EMUHACK(instr)) {
-					f.hasHash = false;
-					goto skip;
-				}
-
-				MIPSInfo flags = MIPSGetInfo(instr);
-				if (flags & IN_IMM16)
-					validbits &= ~0xFFFF;
-				if (flags & IN_IMM26)
-					validbits &= ~0x03FFFFFF;
-				buffer[pos++] = instr & validbits;
-			}
-
-			f.hash = CityHash64((const char *) &buffer[0], buffer.size() * sizeof(u32));
-			f.hasHash = true;
-skip:
-			;
+			HashFunction(f, buffer);
 		}
 	}
 
-	void PrecompileFunction(u32 startAddr, u32 length) {
-		// Direct calls to this ignore the bPreloadFunctions flag, since it's just for stubs.
-		if (MIPSComp::jit) {
-			MIPSComp::jit->CompileFunction(startAddr, length);
-		}
-	}
-
-	void PrecompileFunctions() {
-		if (!g_Config.bPreloadFunctions) {
-			return;
-		}
+	// Hashes the functions overlapping start to end (inclusive), code just loaded or scanned, and any
+	// that never had one. Hashing all of them for each module loaded was much of the time it took.
+	static void HashFunctionsInRange(u32 start, u32 end) {
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+		std::vector<u32> buffer;
 
-		// TODO: Load from cache file if available instead.
-
-		double st = time_now_d();
-		for (auto iter = functions.begin(), end = functions.end(); iter != end; iter++) {
-			const AnalyzedFunction &f = *iter;
-
-			PrecompileFunction(f.start, f.end - f.start + 4);
+		for (AnalyzedFunction &f : functions) {
+			if (f.hasHash && (f.end < start || f.start > end)) {
+				continue;
+			}
+			HashFunction(f, buffer);
 		}
-		double et = time_now_d();
-
-		NOTICE_LOG(JIT, "Precompiled %d MIPS functions in %0.2f milliseconds", (int)functions.size(), (et - st) * 1000.0);
 	}
 
 	static const char *DefaultFunctionName(char buffer[256], u32 startAddr) {
-		sprintf(buffer, "z_un_%08x", startAddr);
+		snprintf(buffer, 256, "z_un_%08x", startAddr);
 		return buffer;
 	}
 
@@ -951,6 +974,10 @@ skip:
 			// Must be I guess?
 			return true;
 		}
+
+		// Un named stubs, just in case.
+		if (!strncmp(name, "[UNK:", strlen("[UNK:")))
+			return true;
 
 		// Assume any z_un, not just the address, is a default func.
 		return !strncmp(name, "z_un_", strlen("z_un_")) || !strncmp(name, "u_un_", strlen("u_un_"));
@@ -983,9 +1010,9 @@ skip:
 		// We assume the furthest jumpback is within the func.
 		u32 furthestJumpbackAddr = INVALIDTARGET;
 
-		const u32 scanEnd = fromAddr + Memory::ValidSize(fromAddr, MAX_AHEAD_SCAN);
+		const u32 scanEnd = fromAddr + Memory::ClampValidSizeAt(fromAddr, MAX_AHEAD_SCAN);
 		for (u32 ahead = fromAddr; ahead < scanEnd; ahead += 4) {
-			MIPSOpcode aheadOp = Memory::Read_Instruction(ahead, true);
+			MIPSOpcode aheadOp = Memory::Read_Instruction(ahead);
 			u32 target = GetBranchTargetNoRA(ahead, aheadOp);
 			if (target == INVALIDTARGET && ((aheadOp & 0xFC000000) == 0x08000000)) {
 				target = GetJumpTarget(ahead);
@@ -1009,7 +1036,7 @@ skip:
 
 		if (closestJumpbackAddr != INVALIDTARGET && furthestJumpbackAddr == INVALIDTARGET) {
 			for (u32 behind = closestJumpbackTarget; behind < fromAddr; behind += 4) {
-				MIPSOpcode behindOp = Memory::Read_Instruction(behind, true);
+				MIPSOpcode behindOp = Memory::Read_Instruction(behind);
 				u32 target = GetBranchTargetNoRA(behind, behindOp);
 				if (target == INVALIDTARGET && ((behindOp & 0xFC000000) == 0x08000000)) {
 					target = GetJumpTarget(behind);
@@ -1026,7 +1053,11 @@ skip:
 		return furthestJumpbackAddr;
 	}
 
+	// endAddr is exclusive.
 	bool ScanForFunctions(u32 startAddr, u32 endAddr, bool insertSymbols) {
+		_assert_((startAddr & 3) == 0);
+		_assert_((endAddr & 3) == 0);
+
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
 
 		FunctionsVector new_functions;
@@ -1040,8 +1071,8 @@ skip:
 		bool decreasedSp = false;
 
 		u32 addr;
-		for (addr = startAddr; addr <= endAddr; addr += 4) {
-			MIPSOpcode op = Memory::Read_Instruction(addr, true);
+		for (addr = startAddr; addr < endAddr; addr += 4) {
+			MIPSOpcode op = Memory::Read_Instruction(addr);
 			u32 target = GetBranchTargetNoRA(addr, op);
 			if (target != INVALIDTARGET) {
 				isStraightLeaf = false;
@@ -1064,7 +1095,7 @@ skip:
 					// If it's a nearby forward jump, and not a stackless leaf, assume not a tail call.
 					if (sureTarget <= addr + MAX_JUMP_FORWARD && decreasedSp) {
 						// But let's check the delay slot.
-						MIPSOpcode op = Memory::Read_Instruction(addr + 4, true);
+						MIPSOpcode op = Memory::Read_Instruction(addr + 4);
 						// addiu sp, sp, +X
 						if ((op & 0xFFFF8000) != 0x27BD0000) {
 							furthestBranch = sureTarget;
@@ -1164,7 +1195,7 @@ skip:
 			}
 		}
 
-		if (addr <= endAddr) {
+		if (addr < endAddr) {
 			currentFunction.end = addr + 4;
 			new_functions.push_back(currentFunction);
 		}
@@ -1182,33 +1213,53 @@ skip:
 		return insertSymbols;
 	}
 
-	void FinalizeScan(bool insertSymbols) {
-		HashFunctions();
+	static void ApplyHashMapInRange(u32 start, u32 end);
+	static void ReplaceFunctionsInRange(u32 start, u32 end);
 
-		std::string hashMapFilename = GetSysDirectory(DIRECTORY_SYSTEM) + "knownfuncs.ini";
+	void FinalizeScan(bool insertSymbols, u32 start, u32 end) {
+		// Code elsewhere was handled when it was scanned.
+		HashFunctionsInRange(start, end);
+
 		if (g_Config.bFuncHashMap || g_Config.bFuncReplacements) {
-			LoadBuiltinHashMap();
+			static bool builtinHashMapLoaded = false;
+			if (!builtinHashMapLoaded) {
+				LoadBuiltinHashMap();
+				builtinHashMapLoaded = true;
+			}
 			if (g_Config.bFuncHashMap) {
+				Path hashMapFilename = GetSysDirectory(DIRECTORY_SYSTEM) / "knownfuncs.ini";
 				LoadHashMap(hashMapFilename);
 				StoreHashMap(hashMapFilename);
+				// The file can name functions anywhere.
+				start = 0;
+				end = 0xFFFFFFFF;
 			}
 			if (insertSymbols) {
-				ApplyHashMap();
+				ApplyHashMapInRange(start, end);
 			}
 			if (g_Config.bFuncReplacements) {
-				ReplaceFunctions();
+				ReplaceFunctionsInRange(start, end);
 			}
 		}
 	}
 
+	bool SkipFuncHash(const std::string &name) {
+		std::vector<std::string> funcs;
+		SplitString(g_Config.sSkipFuncHashMap, ',', funcs);
+		return std::find(funcs.begin(), funcs.end(), name) != funcs.end();
+	}
+
 	void RegisterFunction(u32 startAddr, u32 size, const char *name) {
+		_assert_((startAddr & 3) == 0);
+		_assert_((size & 3) == 0);
+
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
 
 		// Check if we have this already
 		for (auto iter = functions.begin(); iter != functions.end(); iter++) {
 			if (iter->start == startAddr) {
 				// Let's just add it to the hashmap.
-				if (iter->hasHash && size > 16) {
+				if (iter->hasHash && size > 16 && SkipFuncHash(name)) {
 					HashMapFunc hfun;
 					hfun.hash = iter->hash;
 					strncpy(hfun.name, name, 64);
@@ -1217,7 +1268,7 @@ skip:
 					hashMap.insert(hfun);
 					return;
 				} else if (!iter->hasHash || size == 0) {
-					ERROR_LOG(HLE, "%s: %08x %08x : match but no hash (%i) or no size", name, startAddr, size, iter->hasHash);
+					ERROR_LOG(Log::HLE, "%s: %08x %08x : match but no hash (%i) or no size", name, startAddr, size, iter->hasHash);
 				}
 			}
 		}
@@ -1226,27 +1277,31 @@ skip:
 		AnalyzedFunction fun;
 		fun.start = startAddr;
 		fun.end = startAddr + size - 4;
+		fun.size = size;
 		fun.isStraightLeaf = false;  // dunno really
 		strncpy(fun.name, name, 64);
 		fun.name[63] = 0;
 		functions.push_back(fun);
 
-		HashFunctions();
+		HashFunctionsInRange(fun.start, fun.end);
 	}
 
+	// endAddr is exclusive.
 	void ForgetFunctions(u32 startAddr, u32 endAddr) {
 		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+
+		_assert_((startAddr & 3) == 0);
+		_assert_((endAddr & 3) == 0);
 
 		// It makes sense to forget functions as modules are unloaded but it breaks
 		// the easy way of saving a hashmap by unloading and loading a game. I added
 		// an alternative way.
 
-		// Most of the time, functions from the same module will be contiguous in functions.
+		// Most of the time, functions from the same module will be contiguous in the vector, in address order.
 		FunctionsVector::iterator prevMatch = functions.end();
-		size_t originalSize = functions.size();
 		for (auto iter = functions.begin(); iter != functions.end(); ++iter) {
 			const bool hadPrevMatch = prevMatch != functions.end();
-			const bool match = iter->start >= startAddr && iter->start <= endAddr;
+			const bool match = iter->start >= startAddr && iter->start < endAddr;
 
 			if (!hadPrevMatch && match) {
 				// Entering a range.
@@ -1262,21 +1317,85 @@ skip:
 			functions.erase(prevMatch, functions.end());
 		}
 
-		RestoreReplacedInstructions(startAddr, endAddr);
+		RemoveReplacements(startAddr, endAddr);
+	}
 
-		if (functions.empty()) {
-			hashToFunction.clear();
-		} else if (originalSize != functions.size()) {
-			UpdateHashToFunctionMap();
+	void ScanFunctionsInRange(u32 addr, u32 size) {
+		addr = RoundDownToMultipleOf(addr, 4);
+		size = RoundUpToMultipleOf(size, 4);
+		bool insertSymbols = ScanForFunctions(addr, addr + size, true);
+		FinalizeScan(insertSymbols, addr, addr + size - 4);
+	}
+
+	u32 RemoveFunctionsInRange(u32 addr, u32 size) {
+		addr = RoundDownToMultipleOf(addr, 4);
+		size = RoundUpToMultipleOf(size, 4);
+
+		u32 funcAddr = g_symbolMap->GetFunctionStart(addr);
+		if (funcAddr == SymbolMap::INVALID_ADDRESS) {
+			funcAddr = g_symbolMap->GetNextSymbolAddress(addr, SymbolType::ST_FUNCTION);
+		}
+
+		u32 count = 0;
+		while (funcAddr < addr + size && funcAddr != SymbolMap::INVALID_ADDRESS) {
+			g_symbolMap->RemoveFunction(funcAddr, true);
+			++count;
+			funcAddr = g_symbolMap->GetNextSymbolAddress(addr, SymbolType::ST_FUNCTION);
+		}
+
+		if (count) {
+			ForgetFunctions(addr, addr + size);
+			g_symbolMap->SortSymbols();
+			UpdateHashMap();
+			ApplyHashMap();
+			if (g_Config.bFuncReplacements) {
+				ReplaceFunctions();
+			}
+		}
+		return count;
+	}
+
+	bool GetAnalyzedFunctionAt(u32 addr, AnalyzedFunction *out) {
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+		for (auto iter = functions.begin(), end = functions.end(); iter != end; ++iter) {
+			if (iter->start <= addr && iter->end >= addr) {
+				*out = *iter;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool HasFunctionsInRange(u32 startAddr, u32 endAddr) {
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+		for (const AnalyzedFunction &f : functions) {
+			if (f.start >= startAddr && f.start < endAddr) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void RehashFunctions(const std::vector<std::pair<u32, u32>> &unchanged) {
+		std::vector<std::pair<u32, u32>> sorted = unchanged;
+		std::sort(sorted.begin(), sorted.end());
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+		HashFunctions(sorted);
+	}
+
+	// For the functions starting from start to end (inclusive).
+	static void ReplaceFunctionsInRange(u32 start, u32 end) {
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
+
+		for (const AnalyzedFunction &f : functions) {
+			if (f.start >= start && f.start <= end) {
+				InstallReplacements(f.start, f.hash, f.size);
+			}
 		}
 	}
 
 	void ReplaceFunctions() {
-		std::lock_guard<std::recursive_mutex> guard(functions_lock);
-
-		for (size_t i = 0; i < functions.size(); i++) {
-			WriteReplaceInstructions(functions[i].start, functions[i].hash, functions[i].size);
-		}
+		ReplaceFunctionsInRange(0, 0xFFFFFFFF);
 	}
 
 	void UpdateHashMap() {
@@ -1290,7 +1409,7 @@ skip:
 			}
 			// Functions with default names aren't very interesting either.
 			const std::string name = g_symbolMap->GetLabelString(f.start);
-			if (IsDefaultFunction(name)) {
+			if (IsDefaultFunction(name) || SkipFuncHash(name)) {
 				continue;
 			}
 
@@ -1309,14 +1428,7 @@ skip:
 		return 0;
 	}
 
-	void SetHashMapFilename(const std::string& filename) {
-		if (filename.empty())
-			hashmapFileName = GetSysDirectory(DIRECTORY_SYSTEM) + "knownfuncs.ini";
-		else
-			hashmapFileName = filename;
-	}
-
-	void StoreHashMap(std::string filename) {
+	void StoreHashMap(Path filename) {
 		if (filename.empty())
 			filename = hashmapFileName;
 
@@ -1327,7 +1439,7 @@ skip:
 
 		FILE *file = File::OpenCFile(filename, "wt");
 		if (!file) {
-			WARN_LOG(LOADER, "Could not store hash map: %s", filename.c_str());
+			WARN_LOG(Log::Loader, "Could not store hash map: %s", filename.c_str());
 			return;
 		}
 
@@ -1335,7 +1447,7 @@ skip:
 			const HashMapFunc &mf = *it;
 			if (!mf.hardcoded) {
 				if (fprintf(file, "%016llx:%d = %s\n", mf.hash, mf.size, mf.name) <= 0) {
-					WARN_LOG(LOADER, "Could not store hash map: %s", filename.c_str());
+					WARN_LOG(Log::Loader, "Could not store hash map: %s", filename.c_str());
 					break;
 				}
 			}
@@ -1343,30 +1455,36 @@ skip:
 		fclose(file);
 	}
 
-	void ApplyHashMap() {
-		UpdateHashToFunctionMap();
+	// Names the functions starting from start to end (inclusive) that the hash map knows. A function
+	// can appear in several copies in memory, with the same hash, and they all get the name.
+	static void ApplyHashMapInRange(u32 start, u32 end) {
+		std::lock_guard<std::recursive_mutex> guard(functions_lock);
 
-		for (auto mf = hashMap.begin(), end = hashMap.end(); mf != end; ++mf) {
-			auto range = hashToFunction.equal_range(mf->hash);
-			if (range.first == range.second) {
+		HashMapFunc key;
+		for (AnalyzedFunction &f : functions) {
+			if (!f.hasHash || f.size <= 16 || f.start < start || f.start > end) {
+				continue;
+			}
+			key.hash = f.hash;
+			key.size = f.size;
+			auto mf = hashMap.find(key);
+			if (mf == hashMap.end()) {
 				continue;
 			}
 
-			// Yay, found a function.
-			for (auto iter = range.first; iter != range.second; ++iter) {
-				AnalyzedFunction &f = *iter->second;
-				if (f.hash == mf->hash && f.size == mf->size) {
-					strncpy(f.name, mf->name, sizeof(mf->name) - 1);
+			truncate_cpy(f.name, mf->name);
 
-					std::string existingLabel = g_symbolMap->GetLabelString(f.start);
-					char defaultLabel[256];
-					// If it was renamed, keep it.  Only change the name if it's still the default.
-					if (existingLabel.empty() || existingLabel == DefaultFunctionName(defaultLabel, f.start)) {
-						g_symbolMap->SetLabelName(mf->name, f.start);
-					}
-				}
+			std::string existingLabel = g_symbolMap->GetLabelString(f.start);
+			char defaultLabel[256];
+			// If it was renamed, keep it.  Only change the name if it's still the default.
+			if (existingLabel.empty() || existingLabel == DefaultFunctionName(defaultLabel, f.start)) {
+				g_symbolMap->SetLabelName(mf->name, f.start);
 			}
 		}
+	}
+
+	void ApplyHashMap() {
+		ApplyHashMapInRange(0, 0xFFFFFFFF);
 	}
 
 	void LoadBuiltinHashMap() {
@@ -1381,10 +1499,10 @@ skip:
 		}
 	}
 
-	void LoadHashMap(const std::string& filename) {
+	void LoadHashMap(const Path &filename) {
 		FILE *file = File::OpenCFile(filename, "rt");
 		if (!file) {
-			WARN_LOG(LOADER, "Could not load hash map: %s", filename.c_str());
+			WARN_LOG(Log::Loader, "Could not load hash map: %s", filename.c_str());
 			return;
 		}
 		hashmapFileName = filename;
@@ -1395,7 +1513,7 @@ skip:
 			if (fscanf(file, "%llx:%d = %63s\n", &mf.hash, &mf.size, mf.name) < 3) {
 				char temp[1024];
 				if (!fgets(temp, 1024, file)) {
-					WARN_LOG(LOADER, "Could not read from hash map: %s", filename.c_str());
+					WARN_LOG(Log::Loader, "Could not read from hash map: %s", filename.c_str());
 				}
 				continue;
 			}
@@ -1422,7 +1540,7 @@ skip:
 		return vec;
 	}
 
-	MipsOpcodeInfo GetOpcodeInfo(DebugInterface* cpu, u32 address) {
+	MipsOpcodeInfo GetOpcodeInfo(DebugInterface *cpu, u32 address) {
 		MipsOpcodeInfo info;
 		memset(&info, 0, sizeof(info));
 
@@ -1457,9 +1575,9 @@ skip:
 			}
 			break;
 		case 0x08:	// addi
-		case 0x09:	// adiu
+		case 0x09:	// addiu
 			info.hasRelevantAddress = true;
-			info.relevantAddress = cpu->GetRegValue(0,MIPS_GET_RS(op))+((s16)(op & 0xFFFF));
+			info.relevantAddress = cpu->GetRegValue(0, MIPS_GET_RS(op)) + SignExtend16ToS32(op & 0xFFFF);
 			break;
 		}
 
@@ -1509,7 +1627,7 @@ skip:
 			switch (opInfo & CONDTYPE_MASK) {
 			case CONDTYPE_EQ:
 				if (opInfo & IN_FPUFLAG) {	// fpu branch
-					info.conditionMet = currentMIPS->fpcond == 0;
+					info.conditionMet = cpu->GetFPCond() == 0;
 				} else {
 					info.conditionMet = (rt == rs);
 					if (MIPS_GET_RT(op) == MIPS_GET_RS(op))	{	// always true
@@ -1519,7 +1637,7 @@ skip:
 				break;
 			case CONDTYPE_NE:
 				if (opInfo & IN_FPUFLAG) {	// fpu branch
-					info.conditionMet = currentMIPS->fpcond != 0;
+					info.conditionMet = cpu->GetFPCond() != 0;
 				} else {
 					info.conditionMet = (rt != rs);
 					if (MIPS_GET_RT(op) == MIPS_GET_RS(op))	{	// always true
@@ -1545,21 +1663,7 @@ skip:
 		// lw, sh, ...
 		if (!IsSyscall(op) && (opInfo & (IN_MEM | OUT_MEM)) != 0) {
 			info.isDataAccess = true;
-			switch (opInfo & MEMTYPE_MASK) {
-			case MEMTYPE_BYTE:
-				info.dataSize = 1;
-				break;
-			case MEMTYPE_HWORD:
-				info.dataSize = 2;
-				break;
-			case MEMTYPE_WORD:
-			case MEMTYPE_FLOAT:
-				info.dataSize = 4;
-				break;
-
-			case MEMTYPE_VQUAD:
-				info.dataSize = 16;
-			}
+			info.dataSize = MIPSGetMemoryAccessSize(op);
 
 			u32 rs = cpu->GetRegValue(0, (int)MIPS_GET_RS(op));
 			s16 imm16 = op & 0xFFFF;

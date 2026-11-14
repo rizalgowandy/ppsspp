@@ -85,6 +85,33 @@
     <Filter Include="Render\Text">
       <UniqueIdentifier>{28139b08-f8d5-41a2-a5ee-bf86cf1469c3}</UniqueIdentifier>
     </Filter>
+    <Filter Include="VR">
+      <UniqueIdentifier>{a5bfc343-9c3a-43ff-a033-7b0406e13816}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="GPU\Vulkan">
+      <UniqueIdentifier>{096c3d00-fcfa-4877-8cf0-3b10d56b5d72}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\basis_universal">
+      <UniqueIdentifier>{8b92cc15-8e3e-45b1-ba80-ad39b1a9cdc8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\naett-lib">
+      <UniqueIdentifier>{403c3154-5e8a-4da1-ba82-8f69bef25e14}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\at3_standalone">
+      <UniqueIdentifier>{47e3b9c8-3a5f-4c78-b62b-3fa65bf23594}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\imgui">
+      <UniqueIdentifier>{06799036-06fd-4b7b-8c1d-5bdad62c2a24}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\aemu_postoffice">
+      <UniqueIdentifier>{e3871672-2a90-49d9-abb1-43fe75d73f8b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\lzma-sdk">
+      <UniqueIdentifier>{32412196-7280-4118-ad20-4ee3f6ad18ef}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ext\pugixml">
+      <UniqueIdentifier>{a9ae3474-1d81-486c-919e-82b62224172f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\Common\ABI.cpp" />
@@ -92,21 +119,21 @@
     <ClCompile Include="..\..\Common\ArmCPUDetect.cpp" />
     <ClCompile Include="..\..\Common\ArmEmitter.cpp" />
     <ClCompile Include="..\..\Common\Serialize\Serializer.cpp" />
-    <ClCompile Include="..\..\Common\ColorConv.cpp" />
-    <ClCompile Include="..\..\Common\ColorConvNEON.cpp" />
-    <ClCompile Include="..\..\Common\ConsoleListener.cpp" />
+    <ClCompile Include="..\..\Common\Data\Convert\ColorConv.cpp" />
+    <ClCompile Include="..\..\Common\Log\ConsoleListener.cpp" />
     <ClCompile Include="..\..\Common\CPUDetect.cpp" />
     <ClCompile Include="..\..\Common\FakeCPUDetect.cpp" />
     <ClCompile Include="..\..\Common\ExceptionHandlerSetup.cpp" />
+    <ClCompile Include="..\..\Common\GhidraClient.cpp" />
     <ClCompile Include="..\..\Common\Log.cpp" />
-    <ClCompile Include="..\..\Common\LogManager.cpp" />
+    <ClCompile Include="..\..\Common\Log\LogManager.cpp" />
+    <ClCompile Include="..\..\Common\LogReporting.cpp" />
     <ClCompile Include="..\..\Common\MemArenaAndroid.cpp" />
     <ClCompile Include="..\..\Common\MemArenaDarwin.cpp" />
     <ClCompile Include="..\..\Common\MemArenaPosix.cpp" />
     <ClCompile Include="..\..\Common\MemArenaWin32.cpp" />
     <ClCompile Include="..\..\Common\MemoryUtil.cpp" />
-    <ClCompile Include="..\..\Common\MipsCPUDetect.cpp" />
-    <ClCompile Include="..\..\Common\MipsEmitter.cpp" />
+    <ClCompile Include="..\..\Common\RiscVEmitter.cpp" />
     <ClCompile Include="..\..\Common\SysError.cpp" />
     <ClCompile Include="..\..\Common\OSVersion.cpp" />
     <ClCompile Include="..\..\Common\StringUtils.cpp" />
@@ -124,6 +151,7 @@
       <Filter>Crypto</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Common\Buffer.cpp" />
+    <ClCompile Include="..\..\Common\Net\NetBuffer.cpp" />
     <ClCompile Include="..\..\ext\libpng17\png.c">
       <Filter>ext\libpng17</Filter>
     </ClCompile>
@@ -178,13 +206,10 @@
     <ClCompile Include="..\..\Common\Input\InputState.cpp">
       <Filter>Input</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Common\Thread\Executor.cpp">
+    <ClCompile Include="..\..\Common\Thread\ThreadManager.cpp">
       <Filter>Thread</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Common\Thread\PrioritizedWorkQueue.cpp">
-      <Filter>Thread</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\Common\Thread\ThreadPool.cpp">
+    <ClCompile Include="..\..\Common\Thread\ParallelLoop.cpp">
       <Filter>Thread</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Common\Thread\ThreadUtil.cpp">
@@ -204,6 +229,9 @@
     </ClCompile>
     <ClCompile Include="..\..\Common\Data\Hash\Hash.cpp">
       <Filter>Data\Hash</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Data\Text\Demangle.cpp">
+      <Filter>Data\Text</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Common\Data\Text\I18n.cpp">
       <Filter>Data\Text</Filter>
@@ -226,15 +254,6 @@
     <ClCompile Include="..\..\Common\Math\math_util.cpp">
       <Filter>Math</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Common\Math\fast\fast_math.c">
-      <Filter>Math\fast</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\Common\Math\fast\fast_matrix.c">
-      <Filter>Math\fast</Filter>
-    </ClCompile>
-    <ClCompile Include="..\..\Common\Math\fast\fast_matrix_sse.c">
-      <Filter>Math\fast</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\Common\Math\lin\matrix4x4.cpp">
       <Filter>Math\lin</Filter>
     </ClCompile>
@@ -244,13 +263,19 @@
     <ClCompile Include="..\..\Common\File\DiskFree.cpp">
       <Filter>File</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\Common\File\Path.cpp">
+      <Filter>File</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\Common\File\PathBrowser.cpp">
       <Filter>File</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Common\Data\Format\RIFF.cpp">
       <Filter>Data\Format</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Common\File\VFS\AssetReader.cpp">
+    <ClCompile Include="..\..\Common\File\VFS\DirectoryReader.cpp">
+      <Filter>File\VFS</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\File\VFS\ZipFileReader.cpp">
       <Filter>File\VFS</Filter>
     </ClCompile>
     <ClCompile Include="..\..\Common\File\VFS\VFS.cpp">
@@ -355,9 +380,6 @@
     <ClCompile Include="..\..\Common\Render\Text\draw_text_android.cpp">
       <Filter>Render\Text</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Common\Render\Text\draw_text_qt.cpp">
-      <Filter>Render\Text</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\Common\Render\Text\draw_text_uwp.cpp">
       <Filter>Render\Text</Filter>
     </ClCompile>
@@ -373,6 +395,252 @@
     <ClCompile Include="..\..\Common\GPU\ShaderTranslation.cpp">
       <Filter>GPU</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\Common\File\AndroidStorage.cpp">
+      <Filter>File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Math\Statistics.cpp">
+      <Filter>Math</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\PPSSPPVR.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRBase.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRFramebuffer.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRInput.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRMath.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRRenderer.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\VRVulkan.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\VR\OpenXRLoader.cpp">
+      <Filter>VR</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\GPU\Vulkan\VulkanLoader.cpp">
+      <Filter>GPU\Vulkan</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\AsyncImageFileView.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Render\ManagedTexture.cpp">
+      <Filter>Render</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\PopupScreens.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\ScrollView.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Data\Format\DDSLoad.cpp">
+      <Filter>Data\Format</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\basis_universal\basisu_transcoder.cpp">
+      <Filter>ext\basis_universal</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\System\Request.cpp">
+      <Filter>System</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\File\AndroidContentURI.cpp">
+      <Filter>File</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\GPU\GPUBackendCommon.cpp">
+      <Filter>GPU</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\IconCache.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\System\OSD.cpp">
+      <Filter>System</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Net\HTTPRequest.cpp">
+      <Filter>Net</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Net\HTTPNaettRequest.cpp">
+      <Filter>Net</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\naett-lib\src\naett_core.c">
+      <Filter>ext\naett-lib</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\naett-lib\src\naett_win.c">
+      <Filter>ext\naett-lib</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\atrac.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\atrac3.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\atrac3plus.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\atrac3plusdec.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\atrac3plusdsp.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\compat.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\fft.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\get_bits.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\at3_standalone\mem.cpp">
+      <Filter>ext\at3_standalone</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_tables.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_widgets.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_demo.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_draw.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_impl_platform.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_impl_thin3d.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\imgui\imgui_extras.cpp">
+      <Filter>ext\imgui</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Render\AtlasGen.cpp">
+      <Filter>Render</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\Render\DropShadow.cpp">
+      <Filter>Render</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\TabHolder.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\delay_impl_cpp.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\log_impl_ppsspp.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\mutex_impl_cpp.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\postoffice.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\sock_impl_windows.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\postoffice_mem_stdc.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\list.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\client\enet.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\adhocctl\client\adhocctl.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\adhocctl\client\adhocctl_mem.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\server.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\session.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\semaphore.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\log.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\common.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\enet.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\snapshot.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\aemu_postoffice\server_cpp\native_socket_windows.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\Notice.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zArcIn.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zBuf.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zCrc.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zCrcOpt.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zDec.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zFile.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\7zStream.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\Bcj2.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\Bra.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\Bra86.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\CpuArch.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\Delta.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\Lzma2Dec.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\lzma-sdk\LzmaDec.c">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\File\VFS\SevenZipFileReader.cpp">
+      <Filter>File\VFS</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\ext\pugixml\pugixml.cpp">
+      <Filter>ext\pugixml</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Common\UI\ScreenManager.cpp">
+      <Filter>UI</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="targetver.h" />
@@ -384,22 +652,23 @@
     <ClInclude Include="..\..\Common\BitScan.h" />
     <ClInclude Include="..\..\Common\Serialize\Serializer.h" />
     <ClInclude Include="..\..\Common\CodeBlock.h" />
-    <ClInclude Include="..\..\Common\ColorConv.h" />
-    <ClInclude Include="..\..\Common\ColorConvNEON.h" />
+    <ClInclude Include="..\..\Common\Data\Convert\ColorConv.h" />
     <ClInclude Include="..\..\Common\Common.h" />
     <ClInclude Include="..\..\Common\CommonFuncs.h" />
     <ClInclude Include="..\..\Common\CommonTypes.h" />
     <ClInclude Include="..\..\Common\CommonWindows.h" />
-    <ClInclude Include="..\..\Common\ConsoleListener.h" />
+    <ClInclude Include="..\..\Common\Log\ConsoleListener.h" />
     <ClInclude Include="..\..\Common\CPUDetect.h" />
     <ClInclude Include="..\..\Common\DbgNew.h" />
     <ClInclude Include="..\..\Common\ExceptionHandlerSetup.h" />
-    <ClInclude Include="..\..\Common\GraphicsContext.h" />
+    <ClInclude Include="..\..\Common\GhidraClient.h" />
+    <ClInclude Include="..\..\Common\GPU\GraphicsContext.h" />
     <ClInclude Include="..\..\Common\Log.h" />
-    <ClInclude Include="..\..\Common\LogManager.h" />
+    <ClInclude Include="..\..\Common\Log\LogManager.h" />
+    <ClInclude Include="..\..\Common\LogReporting.h" />
     <ClInclude Include="..\..\Common\MemArena.h" />
     <ClInclude Include="..\..\Common\MemoryUtil.h" />
-    <ClInclude Include="..\..\Common\MipsEmitter.h" />
+    <ClInclude Include="..\..\Common\RiscVEmitter.h" />
     <ClInclude Include="..\..\Common\OSVersion.h" />
     <ClInclude Include="..\..\Common\StringUtils.h" />
     <ClInclude Include="..\..\Common\Swap.h" />
@@ -418,6 +687,7 @@
       <Filter>Crypto</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\Buffer.h" />
+    <ClInclude Include="..\..\Common\Net\NetBuffer.h" />
     <ClInclude Include="..\..\Common\Serialize\SerializeDeque.h" />
     <ClInclude Include="..\..\Common\Serialize\SerializeFuncs.h" />
     <ClInclude Include="..\..\Common\Serialize\SerializeList.h" />
@@ -453,13 +723,16 @@
     <ClInclude Include="..\..\Common\Input\KeyCodes.h">
       <Filter>Input</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Thread\Executor.h">
+    <ClInclude Include="..\..\Common\Thread\Channel.h">
       <Filter>Thread</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Thread\PrioritizedWorkQueue.h">
+    <ClInclude Include="..\..\Common\Thread\ParallelLoop.h">
       <Filter>Thread</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Thread\ThreadPool.h">
+    <ClInclude Include="..\..\Common\Thread\Promise.h">
+      <Filter>Thread</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Thread\ThreadManager.h">
       <Filter>Thread</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\Thread\ThreadUtil.h">
@@ -469,6 +742,9 @@
       <Filter>Data\Collections</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\Data\Collections\TinySet.h">
+      <Filter>Data\Collections</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Data\Collections\CyclicBuffer.h">
       <Filter>Data\Collections</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\Data\Random\Rng.h">
@@ -495,6 +771,9 @@
     <ClInclude Include="..\..\Common\Data\Hash\Hash.h">
       <Filter>Data\Hash</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Common\Data\Text\Demangle.h">
+      <Filter>Data\Text</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\Common\Data\Text\I18n.h">
       <Filter>Data\Text</Filter>
     </ClInclude>
@@ -519,12 +798,6 @@
     <ClInclude Include="..\..\Common\Math\math_util.h">
       <Filter>Math</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Math\fast\fast_math.h">
-      <Filter>Math\fast</Filter>
-    </ClInclude>
-    <ClInclude Include="..\..\Common\Math\fast\fast_matrix.h">
-      <Filter>Math\fast</Filter>
-    </ClInclude>
     <ClInclude Include="..\..\Common\Math\lin\matrix4x4.h">
       <Filter>Math\lin</Filter>
     </ClInclude>
@@ -537,10 +810,16 @@
     <ClInclude Include="..\..\Common\File\PathBrowser.h">
       <Filter>File</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Common\File\Path.h">
+      <Filter>File</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\Common\Data\Format\RIFF.h">
       <Filter>Data\Format</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\File\VFS\AssetReader.h">
+    <ClInclude Include="..\..\Common\File\VFS\DirectoryReader.h">
+      <Filter>File\VFS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\File\VFS\ZipFileReader.h">
       <Filter>File\VFS</Filter>
     </ClInclude>
     <ClInclude Include="..\..\Common\File\VFS\VFS.h">
@@ -654,9 +933,6 @@
     <ClInclude Include="..\..\Common\Render\Text\draw_text_android.h">
       <Filter>Render\Text</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Render\Text\draw_text_qt.h">
-      <Filter>Render\Text</Filter>
-    </ClInclude>
     <ClInclude Include="..\..\Common\Render\Text\draw_text_uwp.h">
       <Filter>Render\Text</Filter>
     </ClInclude>
@@ -669,9 +945,6 @@
     <ClInclude Include="..\..\Common\Data\Collections\Hashmaps.h">
       <Filter>Data\Collections</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\Common\Data\Collections\ThreadSafeList.h">
-      <Filter>Data\Collections</Filter>
-    </ClInclude>
     <ClInclude Include="..\..\Common\GPU\Shader.h">
       <Filter>GPU</Filter>
     </ClInclude>
@@ -681,18 +954,329 @@
     <ClInclude Include="..\..\Common\GPU\ShaderTranslation.h">
       <Filter>GPU</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Common\File\AndroidStorage.h">
+      <Filter>File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Math\Statistics.h">
+      <Filter>Math</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\PPSSPPVR.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRBase.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRFramebuffer.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRInput.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRMath.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRRenderer.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\VRVulkan.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\VR\OpenXRLoader.h">
+      <Filter>VR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\GPU\Vulkan\VulkanLoader.h">
+      <Filter>GPU\Vulkan</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\AsyncImageFileView.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Render\ManagedTexture.h">
+      <Filter>Render</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\PopupScreens.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\ScrollView.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Data\Format\DDSLoad.h">
+      <Filter>Data\Format</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_containers.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_containers_impl.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_file_headers.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_transcoder.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_transcoder_internal.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\basis_universal\basisu_transcoder_uastc.h">
+      <Filter>ext\basis_universal</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\System\Request.h">
+      <Filter>System</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\File\AndroidContentURI.h">
+      <Filter>File</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\GPU\GPUBackendCommon.h">
+      <Filter>GPU</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\IconCache.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\System\OSD.h">
+      <Filter>System</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Net\HTTPRequest.h">
+      <Filter>Net</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Net\HTTPNaettRequest.h">
+      <Filter>Net</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\naett-lib\src\naett_internal.h">
+      <Filter>ext\naett-lib</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\naett-lib\naett.h">
+      <Filter>ext\naett-lib</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Math\CrossSIMD.h">
+      <Filter>Math</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\aac_defines.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\at3_decoders.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\atrac.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\atrac3data.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\atrac3plus.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\atrac3plus_data.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\compat.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\fft.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\get_bits.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\intreadwrite.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\at3_standalone\mem.h">
+      <Filter>ext\at3_standalone</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imstb_rectpack.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imstb_textedit.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imstb_truetype.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imconfig.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imgui.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imgui_internal.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imgui_impl_platform.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imgui_impl_thin3d.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\imgui\imgui_extras.h">
+      <Filter>ext\imgui</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Render\AtlasGen.h">
+      <Filter>Render</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Render\DropShadow.h">
+      <Filter>Render</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\TabHolder.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\log_impl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\sock_impl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\postoffice_client.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\postoffice_mem.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\delay_impl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\list.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\client\enet.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\adhocctl\client\adhocctl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\adhocctl\client\adhocctl_mem.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\server.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\session.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\semaphore.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\log.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\common.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\enet.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\snapshot.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\native_socket.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\aemu_postoffice\server_cpp\config.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\Notice.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\Math\fast\fast_matrix.h" />
+    <ClInclude Include="..\..\ext\lzma-sdk\7z.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\7zBuf.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\7zCrc.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\7zFile.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\7zTypes.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\7zWindows.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Bcj2.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Bra.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Compiler.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\CpuArch.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Delta.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Lzma2Dec.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\LzmaDec.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\Precomp.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\lzma-sdk\RotateDefs.h">
+      <Filter>ext\lzma-sdk</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\File\VFS\SevenZipFileReader.h">
+      <Filter>File\VFS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\pugixml\pugiconfig.hpp">
+      <Filter>ext\pugixml</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\ext\pugixml\pugixml.hpp">
+      <Filter>ext\pugixml</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Common\UI\ScreenManager.h">
+      <Filter>UI</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <Text Include="..\..\ext\libpng17\CMakeLists.txt">
-      <Filter>ext\libpng17</Filter>
+    <None Include="..\..\ext\libpng17\CMakeLists.txt" />
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_astc.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_astc_0_255.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_atc_55.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_atc_56.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_bc7_m5_alpha.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_bc7_m5_color.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_dxt1_5.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_dxt1_6.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_pvrtc2_45.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+    <None Include="..\..\ext\basis_universal\basisu_transcoder_tables_pvrtc2_alpha_33.inc">
+      <Filter>ext\basis_universal</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <Text Include="..\..\ext\at3_standalone\CMakeLists.txt">
+      <Filter>ext\at3_standalone</Filter>
     </Text>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\..\Common\Math\fast\fast_matrix_neon.S">
-      <Filter>Math\fast</Filter>
-    </None>
-    <None Include="..\..\Common\Math\lin\matrix_neon.s">
-      <Filter>Math\lin</Filter>
-    </None>
+    <Text Include="..\..\ext\at3_standalone\README.txt">
+      <Filter>ext\at3_standalone</Filter>
+    </Text>
   </ItemGroup>
 </Project>

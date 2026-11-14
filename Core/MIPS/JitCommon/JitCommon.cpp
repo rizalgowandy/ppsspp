@@ -16,47 +16,58 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
+
 #include <cstdlib>
+#include <mutex>
 
 #include "ext/disarm.h"
+#include "ext/riscv-disas.h"
 #include "ext/udis86/udis86.h"
+#include "ext/loongarch-disasm.h"
 
+#include "Common/LogReporting.h"
 #include "Common/StringUtils.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 
 #include "Core/Util/DisArm64.h"
-#include "Core/Config.h"
 
+#include "Core/MIPS/IR/IRJit.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/JitCommon/JitState.h"
-#include "Core/MIPS/IR/IRJit.h"
+#include "Core/MIPS/MIPSCodeUtils.h"
+#include "Core/MIPS/MIPSTables.h"
 
 #if PPSSPP_ARCH(ARM)
-#include "../ARM/ArmJit.h"
+#include "../ARM/ArmIRJit.h"
 #elif PPSSPP_ARCH(ARM64)
-#include "../ARM64/Arm64Jit.h"
+#include "../ARM64/Arm64IRJit.h"
 #elif PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
-#include "../x86/Jit.h"
-#elif PPSSPP_ARCH(MIPS)
-#include "../MIPS/MipsJit.h"
-#else
-#include "../fake/FakeJit.h"
+#include "../x86/X64IRJit.h"
+#elif PPSSPP_ARCH(RISCV64)
+#include "../RiscV/RiscVJit.h"
+#elif PPSSPP_ARCH(LOONGARCH64)
+#include "../LoongArch64/LoongArch64Jit.h"
 #endif
 
 namespace MIPSComp {
-	JitInterface *jit;
-	void JitAt() {
-		jit->Compile(currentMIPS->pc);
+	JitCompileTimes g_jitCompileTimes;
+
+	void JitAt(MIPSState *mips) {
+		// TODO: We could probably check for a bad pc here, and fire an exception. Could spare us from some crashes.
+		// Although, we just tried to load from this address to check for a JIT block, and if we're here, that succeeded..
+		mips->jit->Compile(mips->pc);
 	}
 
-	void DoDummyJitState(PointerWrap &p) {
+	void DoDummyJitState(PointerWrap &p, const MIPSState *mips) {
 		// This is here so the savestate matches between jit and non-jit.
 		auto s = p.Section("Jit", 1, 2);
 		if (!s)
 			return;
 
-		bool dummy = false;
+		// This is startDefaultPrefix. Writing false made a JIT loading the state assume an uneaten
+		// prefix for the rest of the session.
+		bool dummy = mips->HasDefaultPrefix();
 		Do(p, dummy);
 		if (s >= 2) {
 			dummy = true;
@@ -64,17 +75,32 @@ namespace MIPSComp {
 		}
 	}
 
+	BranchInfo::BranchInfo(u32 pc, MIPSOpcode o, MIPSOpcode delayO, bool al, bool l)
+		: compilerPC(pc), op(o), delaySlotOp(delayO), likely(l), andLink(al) {
+	}
+
+	bool NativeJitRunsMediaEngine() {
+#if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(AMD64)
+		return true;
+#else
+		return false;
+#endif
+	}
+
 	JitInterface *CreateNativeJit(MIPSState *mipsState) {
 #if PPSSPP_ARCH(ARM)
-		return new MIPSComp::ArmJit(mipsState);
+		return new MIPSComp::ArmIRJit(mipsState);
 #elif PPSSPP_ARCH(ARM64)
-		return new MIPSComp::Arm64Jit(mipsState);
+		return new MIPSComp::Arm64IRJit(mipsState);
 #elif PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
-		return new MIPSComp::Jit(mipsState);
-#elif PPSSPP_ARCH(MIPS)
-		return new MIPSComp::MipsJit(mipsState);
+		return new MIPSComp::X64IRJit(mipsState);
+#elif PPSSPP_ARCH(RISCV64)
+		return new MIPSComp::RiscVJit(mipsState);
+#elif PPSSPP_ARCH(LOONGARCH64)
+		return new MIPSComp::LoongArch64Jit(mipsState);
 #else
-		return new MIPSComp::FakeJit(mipsState);
+		// No native JIT for this architecture.
+		return new MIPSComp::IRInterpreterJit(mipsState);
 #endif
 	}
 
@@ -90,6 +116,7 @@ std::vector<std::string> DisassembleArm2(const u8 *data, int size) {
 
 	char temp[256];
 	int bkpt_count = 0;
+	lines.reserve(size / 4);
 	for (int i = 0; i < size; i += 4) {
 		const u32 *codePtr = (const u32 *)(data + i);
 		u32 inst = codePtr[0];
@@ -109,18 +136,18 @@ std::vector<std::string> DisassembleArm2(const u8 *data, int size) {
 		}
 		ArmDis((u32)(intptr_t)codePtr, inst, temp, sizeof(temp), false);
 		std::string buf = temp;
-		if (buf == "BKPT 1") {
+		if (buf == "BKPT #1") {
 			bkpt_count++;
 		} else {
 			if (bkpt_count) {
-				lines.push_back(StringFromFormat("BKPT 1 (x%d)", bkpt_count));
+				lines.push_back(StringFromFormat("BKPT #1 (x%d)", bkpt_count));
 				bkpt_count = 0;
 			}
 			lines.push_back(buf);
 		}
 	}
 	if (bkpt_count) {
-		lines.push_back(StringFromFormat("BKPT 1 (x%d)", bkpt_count));
+		lines.push_back(StringFromFormat("BKPT #1 (x%d)", bkpt_count));
 	}
 	return lines;
 }
@@ -135,10 +162,10 @@ std::string AddAddress(const std::string &buf, uint64_t addr) {
 #if PPSSPP_ARCH(ARM64) || defined(DISASM_ALL)
 
 static bool Arm64SymbolCallback(char *buffer, int bufsize, uint8_t *address) {
-	if (MIPSComp::jit) {
+	if (mipsr4k.jit) {
 		std::string name;
-		if (MIPSComp::jit->DescribeCodePtr(address, name)) {
-			truncate_cpy(buffer, bufsize, name.c_str());
+		if (mipsr4k.jit->DescribeCodePtr(address, name)) {
+			truncate_cpy(buffer, bufsize, name);
 			return true;
 		}
 	}
@@ -150,6 +177,7 @@ std::vector<std::string> DisassembleArm64(const u8 *data, int size) {
 
 	char temp[256];
 	int bkpt_count = 0;
+	lines.reserve(size / 4);
 	for (int i = 0; i < size; i += 4) {
 		const u32 *codePtr = (const u32 *)(data + i);
 		uint64_t addr = (intptr_t)codePtr;
@@ -196,7 +224,7 @@ std::vector<std::string> DisassembleArm64(const u8 *data, int size) {
 const char *ppsspp_resolver(struct ud*,
 	uint64_t addr,
 	int64_t *offset) {
-	// For some reason these two don't seem to trigger..
+	// For some reason these don't seem to trigger..
 	if (addr >= (uint64_t)(&currentMIPS->r[0]) && addr < (uint64_t)&currentMIPS->r[32]) {
 		*offset = addr - (uint64_t)(&currentMIPS->r[0]);
 		return "mips.r";
@@ -223,18 +251,19 @@ const char *ppsspp_resolver(struct ud*,
 
 	// But these do.
 
-	// UGLY HACK because the API is terrible
+	// UGLY HACK because the disassembler API is terrible
 	static char buf[128];
 	std::string str;
-	if (MIPSComp::jit->DescribeCodePtr((u8 *)(uintptr_t)addr, str)) {
+
+	if (mipsr4k.jit && mipsr4k.jit->DescribeCodePtr((u8 *)(uintptr_t)addr, str)) {
 		*offset = 0;
-		truncate_cpy(buf, sizeof(buf), str.c_str());
+		truncate_cpy(buf, sizeof(buf), str);
 		return buf;
 	}
 	return NULL;
 }
 
-std::vector<std::string> DisassembleX86(const u8 *data, int size) {
+std::vector<std::string> DisassembleX86(const u8 *data, int size, std::vector<int> *offsets) {
 	std::vector<std::string> lines;
 	ud_t ud_obj;
 	ud_init(&ud_obj);
@@ -247,27 +276,103 @@ std::vector<std::string> DisassembleX86(const u8 *data, int size) {
 	ud_set_input_buffer(&ud_obj, data, size);
 
 	int int3_count = 0;
+	int int3_offset = 0;
 	while (ud_disassemble(&ud_obj) != 0) {
+		const int offset = (int)(ud_insn_off(&ud_obj) - (uint64_t)(intptr_t)data);
 		const char *buf = ud_insn_asm(&ud_obj);
 		if (!buf) {
 			lines.push_back("[bad]");
+			if (offsets)
+				offsets->push_back(offset);
 			continue;
 		}
 		std::string str = buf;
 		if (str == "int3") {
+			if (int3_count == 0)
+				int3_offset = offset;
 			int3_count++;
 		} else {
 			if (int3_count) {
 				lines.push_back(StringFromFormat("int3 (x%d)", int3_count));
+				if (offsets)
+					offsets->push_back(int3_offset);
 				int3_count = 0;
 			}
 			lines.push_back(str);
+			if (offsets)
+				offsets->push_back(offset);
 		}
 	}
 	if (int3_count) {
 		lines.push_back(StringFromFormat("int3 (x%d)", int3_count));
+		if (offsets)
+			offsets->push_back(int3_offset);
 	}
 	return lines;
 }
 
+#endif
+
+#if PPSSPP_ARCH(RISCV64) || defined(DISASM_ALL)
+std::vector<std::string> DisassembleRV64(const u8 *data, int size) {
+	std::vector<std::string> lines;
+
+	int invalid_count = 0;
+	auto invalid_flush = [&]() {
+		if (invalid_count != 0) {
+			lines.push_back(StringFromFormat("(%d invalid bytes)", invalid_count));
+			invalid_count = 0;
+		}
+	};
+
+	char temp[512];
+	rv_inst inst;
+	size_t len;
+	for (int i = 0; i < size; ) {
+		riscv_inst_fetch(data + i, &inst, &len);
+		if (len == 0) {
+			// Force align in case we're somehow unaligned.
+			len = 2 - ((uintptr_t)data & 1);
+			invalid_count += (int)len;
+			i += (int)len;
+			continue;
+		}
+
+		invalid_flush();
+		riscv_disasm_inst(temp, sizeof(temp), rv64, (uintptr_t)data + i, inst);
+		lines.push_back(ReplaceAll(temp, "\t", "  "));
+
+		i += (int)len;
+	}
+
+	invalid_flush();
+	return lines;
+}
+#endif
+
+#if PPSSPP_ARCH(LOONGARCH64) || defined(DISASM_ALL)
+std::vector<std::string> DisassembleLA64(const u8 *data, int size) {
+	std::vector<std::string> lines;
+
+	int invalid_count = 0;
+	auto invalid_flush = [&]() {
+		if (invalid_count != 0) {
+			lines.push_back(StringFromFormat("(%d invalid bytes)", invalid_count));
+			invalid_count = 0;
+		}
+	};
+
+	char temp[512];
+	Ins ins;
+	for (int i = 0; i < size; i += 4) {
+		const u32 *codePtr = (const u32 *)(data + i);
+		invalid_flush();
+		la_disasm(*codePtr, &ins);
+		sprint_ins(&ins, temp);
+		lines.push_back(ReplaceAll(temp, "\t", "  "));
+	}
+
+	invalid_flush();
+	return lines;
+}
 #endif

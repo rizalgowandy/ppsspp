@@ -18,14 +18,18 @@
 #pragma once
 
 #include <deque>
+#include <string>
 #include "Core/HLE/proAdhoc.h"
 
 #ifdef _MSC_VER
 #pragma pack(push,1)
 #endif
-typedef struct MatchingArgs {
-	u32_le data[6]; //ContextID, Opcode, bufAddr[ to MAC], OptLen, OptAddr[, EntryPoint]
-} PACK MatchingArgs;
+
+typedef struct ProductStruct { // Similar to SceNetAdhocctlAdhocId ?
+	s32_le unknown; // Unknown, set to 0 // Product Type ?
+	char product[PRODUCT_CODE_LENGTH]; // Game ID (Example: ULUS10000)
+} PACK ProductStruct;
+
 #ifdef _MSC_VER
 #pragma pack(pop)
 #endif
@@ -38,6 +42,8 @@ struct AdhocctlRequest {
 struct AdhocSendTarget {
 	u32 ip;
 	u16 port; // original port
+	u16 portOffset; // port offset specific for this target IP
+	SceNetEtherAddr mac;
 };
 
 struct AdhocSendTargets {
@@ -69,48 +75,112 @@ enum AdhocSocketRequestType : int
 	ADHOC_POLL_SOCKET = 7,
 };
 
+typedef struct SceNetAdhocDiscoverParam {
+	u32_le mode;  // 0 sleeps in the DISCOVER state until another console is near (Legend of the Dragon), 1 goes into the WOL state (Dissidia 012).
+	char groupName[ADHOCCTL_GROUPNAME_LEN];
+	u32_le timeoutSec;  // How long to look once awake (0x3c in Legend of the Dragon, 0x14 in Dissidia 012).
+	u32_le result;  // AdhocDiscoverResult or an adhocctl error, written when it finishes.
+} PACK SceNetAdhocDiscoverParam;
+
+enum AdhocDiscoverStatus : int {
+	NET_ADHOC_DISCOVER_STATUS_NONE = 0,
+	NET_ADHOC_DISCOVER_STATUS_IN_PROGRESS = 1,
+	NET_ADHOC_DISCOVER_STATUS_COMPLETED = 2,
+};
+
+enum AdhocDiscoverResult : int {
+	NET_ADHOC_DISCOVER_RESULT_PEER_FOUND = 0,  // In the group with a peer (pspautotests net/adhoc/pair/discover).
+	NET_ADHOC_DISCOVER_RESULT_CANCELED = 1,  // After a Stop (pspautotests net/adhoc/discover).
+	NET_ADHOC_DISCOVER_RESULT_NO_PEER_FOUND = 2,  // The timeout passed.
+	NET_ADHOC_DISCOVER_RESULT_ABORTED = 3,
+};
+
+enum class AdhocDataMode {
+	P2P = 0,
+	AemuPostoffice,
+};
+
+struct AdhocServerListEntry {
+	std::string name;
+	std::string host;
+	std::string web;
+	std::string ip;  // could be used as a fallback if DNS resolution fails. Currently unused.
+	std::string discord;
+	std::string location;
+	std::string description;
+	std::string dataJsonUrl;
+	std::string statusXmlUrl;
+	std::string statusWebUrl;
+	bool hidden = false;
+	AdhocDataMode mode = AdhocDataMode::P2P;
+};
+
+enum class AdhocLoadListMode {
+	CacheOnlySync,
+	AllSourcesAsync,
+};
+
+void AdhocLoadServerList(AdhocLoadListMode loadMode);
+std::vector<AdhocServerListEntry> AdhocGetServerList(AdhocLoadListMode loadMode);
+bool AdhocGetServerByHost(std::string_view host, AdhocServerListEntry *dest);  // CacheOnlySync is enforced.
+
 class PointerWrap;
 
 void Register_sceNetAdhoc();
+void Register_sceNetAdhocDiscover();
 
-u32_le __CreateHLELoop(u32_le* loopAddr, const char* sceFuncName, const char* hleFuncName, const char* tagName = NULL);
+// TODO: expose it via "sceNetAdhocctl.h"
+void Register_sceNetAdhocctl();
+
+
 void __NetAdhocInit();
 void __NetAdhocShutdown();
 void __NetAdhocDoState(PointerWrap &p);
+
+// TODO: expose it via "sceNetAdhocctl.h"
 void __UpdateAdhocctlHandlers(u32 flags, u32 error);
-void __UpdateMatchingHandler(MatchingArgs params);
+// Drops queued events of one kind that haven't been delivered yet.
+void __DropAdhocctlEvents(u32 flags);
+// Leaves the server's group without an event, after entering game mode timed out.
+void NetAdhocctl_GameModeTimedOut();
 
-// I have to call this from netdialog
+bool __NetAdhocConnected();
+
+// TODO: expose these via "sceNetAdhocctl.h"
+// Called from netdialog (and from sceNetApctl)
+// NOTE: use hleCall for sceNet* ones!
 int sceNetAdhocctlGetState(u32 ptrToStatus);
-int sceNetAdhocctlCreate(const char * groupName);
-int sceNetAdhocctlConnect(const char* groupName);
-int sceNetAdhocctlJoin(u32 scanInfoAddr);
-int sceNetAdhocctlScan();
-int sceNetAdhocctlGetScanInfo(u32 sizeAddr, u32 bufAddr);
+int sceNetAdhocctlCreate(MIPSState *mips, const char * groupName);
+int sceNetAdhocctlConnect(MIPSState *mips, const char* groupName);
+int sceNetAdhocctlJoin(MIPSState *mips, u32 scanInfoAddr);
+int sceNetAdhocctlScan(MIPSState *mips);
+int sceNetAdhocctlGetScanInfo(MIPSState *mips, u32 sizeAddr, u32 bufAddr);
+int sceNetAdhocctlDisconnect();
+int sceNetAdhocctlInit(MIPSState *mips, int stackSize, int prio, u32 productAddr);
+int sceNetAdhocctlTerm();
 
-int NetAdhocMatching_Term();
 int NetAdhocctl_Term();
 int NetAdhocctl_GetState();
 int NetAdhocctl_Create(const char* groupName);
+int NetAdhocDiscover_GetStatus();
+void Register_sceNetAdhocctl_lib();
+void Register_sceNetIfhandle_lib();
+
 int NetAdhoc_Term();
 
 // May need to use these from sceNet.cpp
-extern bool netAdhocInited;
-extern bool netAdhocctlInited;
-extern bool networkInited;
+extern bool netAdhocInited; // TODO: keep here
+extern bool netAdhocctlInited; // TODO: move to sceNetAdhocctl
+
 extern bool netAdhocGameModeEntered;
-extern int netAdhocEnterGameModeTimeout;
-extern int adhocDefaultTimeout; //3000000 usec
-extern int adhocDefaultDelay; //10000
-extern int adhocExtraDelay; //20000
-extern int adhocEventPollDelay; //100000; // Seems to be the same with PSP_ADHOCCTL_RECV_TIMEOUT
-extern int adhocMatchingEventDelay; //30000
-extern int adhocEventDelay; //1000000
-extern std::recursive_mutex adhocEvtMtx;
-extern int IsAdhocctlInCB;
+extern bool netAdhocUseUdp;
 
-extern u32 dummyThreadHackAddr;
-extern u32_le dummyThreadCode[3];
-extern u32 matchingThreadHackAddr;
-extern u32_le matchingThreadCode[3];
+// Exposing those for the matching routines
+// NOTE: use hleCall for sceNet* ones!
+int sceNetAdhocPdpSend(MIPSState *mips, int id, const char* mac, u32 port, void* data, int len, int timeout, int flag);
+int sceNetAdhocPdpRecv(MIPSState *mips, int id, void* addr, void* port, void* buf, void* dataLength, u32 timeout, int flag);
+int sceNetAdhocPdpCreate(MIPSState *mips, const char* mac, int port, int bufferSize, u32 flag);
 
+int NetAdhoc_SetSocketAlert(int id, s32_le flag);
+int NetAdhocPdp_Delete(int id, int unknown);
+int NetAdhocPdpCreate(const char *mac, int port, int bufferSize, u32 flag, bool postoffice_enet_pdp_reliable);

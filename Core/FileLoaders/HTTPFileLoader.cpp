@@ -17,17 +17,19 @@
 
 #include <algorithm>
 
-#include "Common/Common.h"
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
+#include "Core/Config.h"
 #include "Core/FileLoaders/HTTPFileLoader.h"
 
-HTTPFileLoader::HTTPFileLoader(const std::string &filename)
-	: url_(filename), filename_(filename) {
+HTTPFileLoader::HTTPFileLoader(const ::Path &filename)
+	: url_(filename.ToString()), progress_(&cancel_), filename_(filename), client_(nullptr) {  // no custom resolver support
 }
 
 void HTTPFileLoader::Prepare() {
 	std::call_once(preparedFlag_, [this](){
+		client_.SetUserAgent(StringFromFormat("PPSSPP/%s", PPSSPP_GIT_VERSION));
+
 		std::vector<std::string> responseHeaders;
 		Url resourceURL = url_;
 		int redirectsLeft = 20;
@@ -48,7 +50,7 @@ void HTTPFileLoader::Prepare() {
 					url = url.Relative(redirectURL);
 
 					if (url.ToString() == url_.ToString() || url.ToString() == resourceURL.ToString()) {
-						ERROR_LOG(LOADER, "HTTP request failed, hit a redirect loop");
+						ERROR_LOG(Log::Loader, "HTTP request failed, hit a redirect loop");
 						latestError_ = "Could not connect (redirect loop)";
 						return;
 					}
@@ -59,14 +61,14 @@ void HTTPFileLoader::Prepare() {
 				}
 
 				// No Location header?
-				ERROR_LOG(LOADER, "HTTP request failed, invalid redirect");
+				ERROR_LOG(Log::Loader, "HTTP request failed, invalid redirect");
 				latestError_ = "Could not connect (invalid response)";
 				return;
 			}
 
 			if (code != 200) {
 				// Leave size at 0, invalid.
-				ERROR_LOG(LOADER, "HTTP request failed, got %03d for %s", code, filename_.c_str());
+				ERROR_LOG(Log::Loader, "HTTP request failed, got %03d for %s", code, filename_.c_str());
 				latestError_ = "Could not connect (invalid response)";
 				Disconnect();
 				return;
@@ -87,6 +89,11 @@ void HTTPFileLoader::Prepare() {
 				}
 				if (size_pos != header.npos) {
 					filesize_ = atoll(&header[size_pos]);
+					// The caches size their indexes from this. Nothing we'd load is this big.
+					if (filesize_ < 0 || filesize_ > (64LL << 30)) {
+						ERROR_LOG(Log::Loader, "HTTP: Implausible Content-Length: %s", header.c_str());
+						filesize_ = 0;
+					}
 				}
 			}
 			if (startsWithNoCase(header, "Accept-Ranges:")) {
@@ -103,10 +110,10 @@ void HTTPFileLoader::Prepare() {
 		Disconnect();
 
 		if (!acceptsRange) {
-			WARN_LOG(LOADER, "HTTP server did not advertise support for range requests.");
+			WARN_LOG(Log::Loader, "HTTP server did not advertise support for range requests.");
 		}
 		if (filesize_ == 0) {
-			ERROR_LOG(LOADER, "Could not determine file size for %s", filename_.c_str());
+			ERROR_LOG(Log::Loader, "Could not determine file size for %s", filename_.c_str());
 		}
 
 		// If we didn't end up with a filesize_ (e.g. chunked response), give up.  File invalid.
@@ -115,35 +122,38 @@ void HTTPFileLoader::Prepare() {
 
 int HTTPFileLoader::SendHEAD(const Url &url, std::vector<std::string> &responseHeaders) {
 	if (!url.Valid()) {
-		ERROR_LOG(LOADER, "HTTP request failed, invalid URL");
+		ERROR_LOG(Log::Loader, "HTTP request failed, invalid URL: '%s'", url.ToString().c_str());
 		latestError_ = "Invalid URL";
 		return -400;
 	}
 
 	if (!client_.Resolve(url.Host().c_str(), url.Port())) {
-		ERROR_LOG(LOADER, "HTTP request failed, unable to resolve: |%s| port %d", url.Host().c_str(), url.Port());
+		ERROR_LOG(Log::Loader, "HTTP request failed, unable to resolve: |%s| port %d", url.Host().c_str(), url.Port());
 		latestError_ = "Could not connect (name not resolved)";
 		return -400;
 	}
 
-	client_.SetDataTimeout(20.0);
-	Connect();
+	double timeout = 20.0;
+
+	client_.SetDataTimeout(timeout);
+	Connect(10.0);
 	if (!connected_) {
-		ERROR_LOG(LOADER, "HTTP request failed, failed to connect: %s port %d", url.Host().c_str(), url.Port());
+		ERROR_LOG(Log::Loader, "HTTP request failed, failed to connect: %s port %d (resource: '%s')", url.Host().c_str(), url.Port(), url.Resource().c_str());
 		latestError_ = "Could not connect (refused to connect)";
 		return -400;
 	}
 
-	int err = client_.SendRequest("HEAD", url.Resource().c_str());
+	http::RequestParams req(url.Resource(), "*/*");
+	int err = client_.SendRequest("HEAD", req, nullptr, &progress_);
 	if (err < 0) {
-		ERROR_LOG(LOADER, "HTTP request failed, failed to send request: %s port %d", url.Host().c_str(), url.Port());
+		ERROR_LOG(Log::Loader, "HTTP request failed, failed to send request: %s port %d", url.Host().c_str(), url.Port());
 		latestError_ = "Could not connect (could not request data)";
 		Disconnect();
 		return -400;
 	}
 
-	Buffer readbuf;
-	return client_.ReadResponseHeaders(&readbuf, responseHeaders);
+	net::Buffer readbuf;
+	return client_.ReadResponseHeaders(&readbuf, responseHeaders, &progress_);
 }
 
 HTTPFileLoader::~HTTPFileLoader() {
@@ -169,7 +179,7 @@ s64 HTTPFileLoader::FileSize() {
 	return filesize_;
 }
 
-std::string HTTPFileLoader::Path() const {
+Path HTTPFileLoader::GetPath() const {
 	return filename_;
 }
 
@@ -183,7 +193,7 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 		return 0;
 	}
 
-	Connect();
+	Connect(10.0);
 	if (!connected_) {
 		return 0;
 	}
@@ -193,18 +203,19 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 	snprintf(requestHeaders, sizeof(requestHeaders),
 		"Range: bytes=%lld-%lld\r\n", absolutePos, absoluteEnd - 1);
 
-	int err = client_.SendRequest("GET", url_.Resource().c_str(), requestHeaders, nullptr);
+	http::RequestParams req(url_.Resource(), "*/*");
+	int err = client_.SendRequest("GET", req, requestHeaders, &progress_);
 	if (err < 0) {
 		latestError_ = "Invalid response reading data";
 		Disconnect();
 		return 0;
 	}
 
-	Buffer readbuf;
+	net::Buffer readbuf;
 	std::vector<std::string> responseHeaders;
-	int code = client_.ReadResponseHeaders(&readbuf, responseHeaders);
+	int code = client_.ReadResponseHeaders(&readbuf, responseHeaders, &progress_);
 	if (code != 206) {
-		ERROR_LOG(LOADER, "HTTP server did not respond with range, received code=%03d", code);
+		ERROR_LOG(Log::Loader, "HTTP server did not respond with range, received code=%03d", code);
 		latestError_ = "Invalid response reading data";
 		Disconnect();
 		return 0;
@@ -223,19 +234,21 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 				if (first == absolutePos && last == absoluteEnd - 1) {
 					supportedResponse = true;
 				} else {
-					ERROR_LOG(LOADER, "Unexpected HTTP range: got %lld-%lld, wanted %lld-%lld.", first, last, absolutePos, absoluteEnd - 1);
+					ERROR_LOG(Log::Loader, "Unexpected HTTP range: got %lld-%lld, wanted %lld-%lld.", first, last, absolutePos, absoluteEnd - 1);
 				}
 			} else {
-				ERROR_LOG(LOADER, "Unexpected HTTP range response: %s", header.c_str());
+				ERROR_LOG(Log::Loader, "Unexpected HTTP range response: %s", header.c_str());
 			}
 		}
 	}
 
 	// TODO: Would be nice to read directly.
-	Buffer output;
-	int res = client_.ReadResponseEntity(&readbuf, responseHeaders, &output);
+	net::Buffer output;
+	// We only use what we asked for, so don't let the server send more than that.
+	client_.SetMaxResponseSize((size_t)(absoluteEnd - absolutePos));
+	int res = client_.ReadResponseEntity(&readbuf, responseHeaders, &output, &progress_);
 	if (res != 0) {
-		ERROR_LOG(LOADER, "Unable to read HTTP response entity: %d", res);
+		ERROR_LOG(Log::Loader, "Unable to read HTTP response entity: %d", res);
 		// Let's take anything we got anyway.  Not worse than returning nothing?
 	}
 
@@ -243,21 +256,23 @@ size_t HTTPFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, Flags f
 	Disconnect();
 
 	if (!supportedResponse) {
-		ERROR_LOG(LOADER, "HTTP server did not respond with the range we wanted.");
+		ERROR_LOG(Log::Loader, "HTTP server did not respond with the range we wanted.");
 		latestError_ = "Invalid response reading data";
 		return 0;
 	}
 
-	size_t readBytes = output.size();
+	// Never trust the entity length: a malicious/MITM'd server can claim a
+	// matching Content-Range but send a larger body. Clamp to what we
+	// requested so we can't overflow the caller's fixed-size buffer.
+	size_t readBytes = std::min(output.size(), (size_t)(absoluteEnd - absolutePos));
 	output.Take(readBytes, (char *)data);
 	filepos_ = absolutePos + readBytes;
 	return readBytes;
 }
 
-void HTTPFileLoader::Connect() {
+void HTTPFileLoader::Connect(double timeout) {
 	if (!connected_) {
-		cancelConnect_ = false;
-		// Latency is important here, so reduce the timeout.
-		connected_ = client_.Connect(3, 10.0, &cancelConnect_);
+		cancel_ = false;
+		connected_ = client_.Connect(3, timeout, &cancel_);
 	}
 }

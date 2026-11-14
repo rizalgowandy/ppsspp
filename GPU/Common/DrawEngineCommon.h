@@ -18,103 +18,227 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
+#include <cfloat>
 
 #include "Common/CommonTypes.h"
 #include "Common/Data/Collections/Hashmaps.h"
 
+#include "GPU/Math3D.h"
 #include "GPU/GPUState.h"
-#include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/GPUDefinitions.h"
+#include "GPU/Common/GPUStateUtils.h"
 #include "GPU/Common/IndexGenerator.h"
 #include "GPU/Common/VertexDecoderCommon.h"
 
 class VertexDecoder;
+struct DepthDraw;
+class DepthRasterWorker;
 
 enum {
 	VERTEX_BUFFER_MAX = 65536,
-	DECODED_VERTEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 64,
-	DECODED_INDEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 16,
+	DECODED_VERTEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 2 * 36,  // 36 == sizeof(SimpleVertex)
+	DECODED_INDEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 6 * 6 * 2,   // * 6 for spline tessellation, then * 6 again for converting into points/lines, and * 2 for 2 bytes per index
+	// TestBoundingBox handles up to 1025 vertices: corners (SimpleVertex), then positions, then decoded vertices.
+	BBOX_SCRATCH_CORNERS_OFFSET = 0,
+	BBOX_SCRATCH_VERTS_OFFSET = 64 * 1024,
+	BBOX_SCRATCH_TEMP_OFFSET = 128 * 1024,
+	BBOX_SCRATCH_SIZE = 256 * 1024,
 };
 
-inline uint32_t GetVertTypeID(uint32_t vertType, int uvGenMode) {
-	// As the decoder depends on the UVGenMode when we use UV prescale, we simply mash it
-	// into the top of the verttype where there are unused bits.
-	return (vertType & 0xFFFFFF) | (uvGenMode << 24);
-}
+enum {
+	TEX_SLOT_PSP_TEXTURE = 0,
+	TEX_SLOT_SHADERBLEND_SRC = 1,
+	TEX_SLOT_ALPHATEST = 2,
+	TEX_SLOT_CLUT = 3,
+};
+
+enum FBOTexState {
+	FBO_TEX_NONE,
+	FBO_TEX_COPY_BIND_TEX,
+	FBO_TEX_READ_FRAMEBUFFER,
+};
 
 struct SimpleVertex;
 namespace Spline { struct Weight2D; }
 
-class TessellationDataTransfer {
-public:
-	virtual ~TessellationDataTransfer() {}
-	void CopyControlPoints(float *pos, float *tex, float *col, int posStride, int texStride, int colStride, const SimpleVertex *const *points, int size, u32 vertType);
-	virtual void SendDataToShader(const SimpleVertex *const *points, int size_u, int size_v, u32 vertType, const Spline::Weight2D &weights) = 0;
+// Culling plane, group of 8.
+struct alignas(16) Plane8 {
+	float x[8], y[8], z[8], w[8];
+	void Set(int i, float _x, float _y, float _z, float _w) { x[i] = _x; y[i] = _y; z[i] = _z; w[i] = _w; }
+	float Test(int i, const float f[3]) const { return x[i] * f[0] + y[i] * f[1] + z[i] * f[2] + w[i]; }
 };
 
 class DrawEngineCommon {
 public:
+	DrawEngineCommon(const DrawEngineCommon &) = delete;
+	DrawEngineCommon &operator=(const DrawEngineCommon &) = delete;
 	DrawEngineCommon();
 	virtual ~DrawEngineCommon();
 
-	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
+	void Init();
 
-	static u32 NormalizeVertices(u8 *outPtr, u8 *bufPtr, const u8 *inPtr, VertexDecoder *dec, int lowerBound, int upperBound, u32 vertType);
+	virtual void BeginFrame() {}
 
-	// Flush is normally non-virtual but here's a virtual way to call it, used by the shared spline code, which is expensive anyway.
-	// Not really sure if these wrappers are worth it...
-	virtual void DispatchFlush() = 0;
+	void SetGPUCommon(GPUCommon *gpuCommon) {
+		gpuCommon_ = gpuCommon;
+	}
+
+	virtual void DeviceLost() = 0;
+	virtual void DeviceRestore(Draw::DrawContext *draw) = 0;
+
+	// Dispatches the queued-up draws.
+	virtual void Flush() = 0;
 
 	// This would seem to be unnecessary now, but is still required for splines/beziers to work in the software backend since SubmitPrim
 	// is different. Should probably refactor that.
 	// Note that vertTypeID should be computed using GetVertTypeID().
-	virtual void DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead) {
-		SubmitPrim(verts, inds, prim, vertexCount, vertTypeID, cullMode, bytesRead);
+	virtual void DispatchSubmitPrim(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, bool clockwise, int *bytesRead, ClipInfoFlags clipInfoFlags) {
+		VertexDecoder *dec = GetVertexDecoder(vertTypeID);
+		SubmitPrim(verts, inds, prim, vertexCount, dec, vertTypeID, clockwise, bytesRead, clipInfoFlags);
 	}
 
-	bool TestBoundingBox(void* control_points, int vertexCount, u32 vertType, int *bytesRead);
+	virtual void DispatchSubmitImm(GEPrimitiveType prim, TransformedVertex *buffer, int vertexCount, int cullMode, bool continuation);
 
-	void SubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, int cullMode, int *bytesRead);
+	bool TestBoundingBox(const void *control_points, const void *inds, int vertexCount, const VertexDecoder *dec, u32 vertType);
+
+	// This is a less accurate version of TestBoundingBox, but faster. Can have more false positives.
+	// cpuCullSupported: the backend can take ClipInfoFlags::CpuCull for the draw (see CpuCullSupported()).
+	static bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags, bool cpuCullSupported = false);
+	bool TestBoundingBoxThrough(GEPrimitiveType prim, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, int *bytesRead, ClipInfoFlags *flags);
+	// For a draw too big or complex for TestBoundingBoxFast: the fallbacks it would need on a GPU that lacks
+	// depth clamp or clip distances, assuming the worst, or nothing (not Valid) if none are needed.
+	static ClipInfoFlags UncheckedClipInfoFlags();
+	bool EstimateThroughPrimSafeSize(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, u32 vertType, int *safeWidth, int *safeHeight);
+
+	void FlushPartialDecode() {
+		DecodeVerts(dec_, decoded_);
+	}
+
+	void FlushSkin() {
+		if (dec_ && dec_->skinInDecode) {
+			FlushPartialDecode();
+		}
+	}
+
+	// maxVerts: how many vertices fit in valid memory from the current vertex address.
+	int ExtendNonIndexedPrim(const uint32_t *cmd, const uint32_t *stall, const VertexDecoder *dec, u32 vertTypeID, bool clockwise, int *bytesRead, bool isTriangle, ClipInfoFlags clipInfoFlags, int maxVerts);
+	bool SubmitPrim(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, u32 vertTypeID, bool clockwise, int *bytesRead, ClipInfoFlags clipInfoFlags);
+	void SkipPrim(GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, int *bytesRead);
+
 	template<class Surface>
 	void SubmitCurve(const void *control_points, const void *indices, Surface &surface, u32 vertType, int *bytesRead, const char *scope);
-	void ClearSplineBezierWeights();
+	static void ClearSplineBezierWeights();
 
-	bool CanUseHardwareTransform(int prim);
-	bool CanUseHardwareTessellation(GEPatchPrimType prim);
+	bool CanUseHardwareTransform(int prim) const;
 
 	std::vector<std::string> DebugGetVertexLoaderIDs();
-	std::string DebugGetVertexLoaderString(std::string id, DebugShaderStringType stringType);
+	std::string DebugGetVertexLoaderString(std::string_view id, DebugShaderStringType stringType);
 
-	virtual void Resized();
+	virtual void NotifyConfigChanged();
 
-	bool IsCodePtrVertexDecoder(const u8 *ptr) const {
-		return decJitCache_->IsInSpace(ptr);
-	}
+	bool DescribeCodePtr(const u8 *ptr, std::string &name) const;
 	int GetNumDrawCalls() const {
-		return numDrawCalls;
+		return numDrawVerts_;
 	}
 
-	VertexDecoder *GetVertexDecoder(u32 vtype);
+	VertexDecoder *GetVertexDecoder(u32 vertTypeID) {
+		VertexDecoder *dec;
+		if (decoderMap_.Get(vertTypeID, &dec))
+			return dec;
+		dec = new VertexDecoder();
+		_assert_(dec);
+		dec->SetVertexType(vertTypeID, decOptions_, decJitCache_);
+		decoderMap_.Insert(vertTypeID, dec);
+		return dec;
+	}
+
+	void AssertEmpty() {
+		_dbg_assert_(numDrawVerts_ == 0 && numDrawInds_ == 0);
+	}
+
+	// temporary hack
+	uint8_t *GetTempSpace() {
+		return decoded_ + 12 * 65536;
+	}
+
+	// Rasterizes the queued depth draws, and waits for them.
+	void FlushQueuedDepth();
+	// Starts rasterizing the queued depth draws, without waiting.
+	void SubmitQueuedDepth();
+	// Waits for the depth draws already submitted, leaving the queued ones queued.
+	void WaitForSubmittedDepth();
+	// Waits if depth rasterization in progress may write to these bytes.
+	void WaitForDepthWrites(u32 addr, u32 size);
 
 protected:
-	virtual bool UpdateUseHWTessellation(bool enabled) { return enabled; }
-	virtual void ClearTrackedVertexArrays() {}
+	bool CheckClipFlags(bool useHwTransform) const;
+
+	void DecodeVerts(const VertexDecoder *dec, u8 *dest);
+	int DecodeInds();
+
+	// How many vertices software transform turns a prim into, for the prims it expands to quads.
+	static int ExpandedVertexCount(GEPrimitiveType prim, int vertexCount) {
+		switch (prim) {
+		case GE_PRIM_POINTS: return vertexCount * 4;
+		case GE_PRIM_LINES: return (vertexCount / 2) * 4;
+		case GE_PRIM_LINE_STRIP: return vertexCount > 1 ? (vertexCount - 1) * 4 : 0;
+		case GE_PRIM_RECTANGLES: return (vertexCount / 2) * 4;
+		default: return 0;
+		}
+	}
+
+	// Whether an indexed draw can share the previous draw's vertex decode, by widening its index range.
+	bool CanExtendDecode(const void *verts, const void *inds, const VertexDecoder *dec) const {
+		return inds && numDrawVerts_ > decodeVertsCounter_ && drawVerts_[numDrawVerts_ - 1].verts == verts && !dec->skinInDecode;
+	}
 
 	int ComputeNumVertsToDecode() const;
-	void DecodeVerts(u8 *dest);
+	// A hardware transformed draw that the CPU clips and culls (ClipInfoFlags::CpuCull), lighting on the CPU what it
+	// clips if needed.
+	struct CpuClip {
+		bool active = false;
+		// The draw has the stream of CPU-lit colors (DecVtxFormat::cpuLit), for the shader to use on the vertices
+		// clipping made. Every lit draw has it where the CPU lights, so they all share one shader and input layout.
+		bool cpuLit = false;
+		// With cpuLit: numVerts * 8 bytes of it in RAM, or null when it's all zeroes (nothing lit on the CPU).
+		const u8 *cpuLitStream = nullptr;
+		int numVerts = 0;
+		// Of the vertices the draw reads, in decoded_ when active.
+		DecVtxFormat fmt;
+		ClipInfoFlags ShaderFlags(ClipInfoFlags flags) const {
+			return cpuLit ? (flags | ClipInfoFlags::CpuLit) : flags;
+		}
+	};
+	// Before the vertex shader is picked, which lighting on the CPU changes.
+	CpuClip BeginCpuClip(bool useHWTransform);
+	// For an active CpuClip: decodes the vertices into decoded_ and the indices into decIndex_, then clips and culls
+	// them there. clip->numVerts vertices of clip->fmt are then in decoded_, to be pushed.
+	void DecodeClipCull(CpuClip *clip, GEPrimitiveType *prim, int *vertexCount, int *maxIndex, bool *useElements);
+	// Resolves ClipInfoFlags::MinMaxZCheck, decoding the vertices into decoded_ to do so. At the start of the flush,
+	// before the flags are compared with the last ones.
+	void CheckSkinnedMinMaxZ(bool useHWTransform);
+	void DepthRasterSubmitHW(GEPrimitiveType prim, int vertexCount, const CpuClip &clip);
 
-	// Preprocessing for spline/bezier
-	u32 NormalizeVertices(u8 *outPtr, u8 *bufPtr, const u8 *inPtr, int lowerBound, int upperBound, u32 vertType, int *vertexSize = nullptr);
+	// With ClipInfoFlags::CpuCull, clips the triangles that cross the near plane, adding vertices to verts, and drops the
+	// primitives the GE culls: those entirely beyond the far plane, and the clipped triangles outside the guardband.
+	// verts are the decoded vertices the indices point into. Returns the new index count.
+	int ClipCullPrims(GEPrimitiveType prim, u8 *verts, const DecVtxFormat &fmt, int *numVerts, u16 *inds, int indexCount);
+	// Whether lit draws get the stream of CPU-lit colors: where the CPU lights the triangles it clips.
+	bool CpuLightsClipped() const;
 
-	// Utility for vertex caching
-	u32 ComputeMiniHash();
-	uint64_t ComputeHash();
+	void ApplyFramebufferRead(FBOTexState *fboTexState);
+	// For BindFramebufferAsColorTexture, when the draw reads the target for shader blending.
+	int ShaderReadBindFlags() const;
 
-	// Vertex decoding
-	void DecodeVertsStep(u8 *dest, int &i, int &decodedVerts);
+	void InitDepthRaster();
+	void ShutdownDepthRaster();
+	void DepthRasterSubmitRaw(GEPrimitiveType prim, const VertexDecoder *dec, uint32_t vertTypeID, int vertexCount);
+	void DepthRasterPredecoded(GEPrimitiveType prim, const void *inVerts, int numDecoded, const VertexDecoder *dec, int vertexCount, const DecVtxFormat *fmt = nullptr);
+	bool CalculateDepthDraw(DepthDraw *draw, GEPrimitiveType prim, int vertexCount, int numDecoded);
+	void CommitDepthDraw(const DepthDraw &draw, int vertexCount, int numDecoded);
 
-	bool ApplyFramebufferRead(bool *fboTexNeedsBind);
-
-	inline int IndexSize(u32 vtype) const {
+	static inline int IndexSize(u32 vtype) {
 		const u32 indexType = (vtype & GE_VTYPE_IDX_MASK);
 		if (indexType == GE_VTYPE_IDX_16BIT) {
 			return 2;
@@ -124,54 +248,206 @@ protected:
 		return 1;
 	}
 
+	inline void UpdateEverUsedEqualDepth(GEComparison comp) {
+		switch (comp) {
+		case GE_COMP_EQUAL:
+			everUsedExactEqualDepth_ = true;
+			everUsedEqualDepth_ = true;
+			break;
+
+		case GE_COMP_NOTEQUAL:
+		case GE_COMP_LEQUAL:
+		case GE_COMP_GEQUAL:
+			everUsedEqualDepth_ = true;
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	inline void ResetAfterDrawInline() {
+		gpuStats.perFrame.numFlushes++;
+		gpuStats.perFrame.numDrawCalls += numDrawInds_;
+		gpuStats.perFrame.numVertexDecodes += numDrawVerts_;
+		gpuStats.perFrame.numVertsSubmitted += vertexCountInDrawCalls_;
+		gpuStats.perFrame.numVertsDecoded += numDecodedVerts_;
+
+		indexGen.Reset();
+		numDecodedVerts_ = 0;
+		numDrawVerts_ = 0;
+		numDrawInds_ = 0;
+		vertexCountInDrawCalls_ = 0;
+		expandedVertsInDrawCalls_ = 0;
+		numVertsToDecode_ = 0;
+		decodeIndsCounter_ = 0;
+		decodeVertsCounter_ = 0;
+		seenPrims_ = 0;
+		anyCCWOrIndexed_ = false;
+		gstate_c.vertexFullAlpha = true;
+		clipInfoFlags_ = {};
+
+		// Now seems as good a time as any to reset the min/max coords, which we may examine later.
+		gstate_c.vertBounds.minU = 512;
+		gstate_c.vertBounds.minV = 512;
+		gstate_c.vertBounds.maxU = 0;
+		gstate_c.vertBounds.maxV = 0;
+	}
+
+	inline bool CollectedPureDraw() const {
+		// TODO: Do something faster.
+		if (useDepthRaster_) {
+			return false;
+		}
+
+		switch (seenPrims_) {
+		case 1 << GE_PRIM_TRIANGLE_STRIP:
+			return !anyCCWOrIndexed_ && numDrawInds_ == 1;
+		case 1 << GE_PRIM_LINES:
+		case 1 << GE_PRIM_POINTS:
+		case 1 << GE_PRIM_TRIANGLES:
+			return !anyCCWOrIndexed_;
+		default:
+			return false;
+		}
+	}
+
+	inline void DecodeIndsAndGetData(GEPrimitiveType *prim, int *numVerts, int *maxIndex, bool *useElements, bool forceIndexed) {
+		if (!forceIndexed && CollectedPureDraw()) {
+			*prim = drawInds_[0].prim;
+			*numVerts = numDecodedVerts_;
+			*maxIndex = numDecodedVerts_;
+			*useElements = false;
+		} else {
+			int vertexCount = DecodeInds();
+			*numVerts = vertexCount;
+			*maxIndex = numDecodedVerts_;
+			*prim = IndexGenerator::GeneralPrim((GEPrimitiveType)drawInds_[0].prim);
+			*useElements = true;
+		}
+	}
+
+	inline int RemainingIndices(const uint16_t *inds) const {
+		return DECODED_INDEX_BUFFER_SIZE / sizeof(uint16_t) - (inds - decIndex_);
+	}
+
 	bool useHWTransform_ = false;
-	bool useHWTessellation_ = false;
+	// Used to prevent unnecessary flushing in softgpu.
+	bool flushOnParams_ = true;
+	// Whether the backend handles ClipInfoFlags::CpuCull in its hardware transform path.
+	bool cpuCullSupported_ = false;
+public:
+	bool CpuCullSupported() const { return cpuCullSupported_; }
+protected:
+	// Whether SubmitCurve may queue its output as predecoded, rather than through DispatchSubmitPrim.
+	bool curvesPredecoded_ = true;
+
+	// Set once a equal depth test is encountered.
+	bool everUsedEqualDepth_ = false;
+	bool everUsedExactEqualDepth_ = false;
+
+	// The draw context's invalidation callback is installed from BeginFrame, on the emu thread. The draw
+	// engine is created on the loader thread, while the UI thread may already be rendering and calling it.
+	bool invalidationCallbackInstalled_ = false;
 
 	// Vertex collector buffers
-	u8 *decoded = nullptr;
-	u16 *decIndex = nullptr;
+	u8 *decoded_ = nullptr;
+	u16 *decIndex_ = nullptr;
+	// Separate from decoded_, which can hold decoded vertices that haven't been flushed yet.
+	u8 *bboxScratch_ = nullptr;
+	// Per vertex of a CPU clipped draw: VERT_BEHIND_NEAR | VERT_BEYOND_FAR.
+	std::vector<u8> vertClass_;
+	std::vector<float> clipPos_;
+	std::vector<u16> clipInds_;
+	std::vector<u8> cpuLitDone_;
+	// Per original vertex, its colors when lit on the CPU, for the vertices clipping makes from it.
+	std::vector<u32> cpuLitColors_;
+	// The stream of CPU-lit colors (see CpuClip::cpuLitStream).
+	std::vector<u8> cpuLitStream_;
+	// Whether the backend binds the stream of CPU-lit colors.
+	bool cpuLitStreamSupported_ = false;
 
 	// Cached vertex decoders
-	u32 lastVType_ = -1;
-	DenseHashMap<u32, VertexDecoder *, nullptr> decoderMap_;
-	VertexDecoder *dec_ = nullptr;
+	DenseHashMap<u32, VertexDecoder *> decoderMap_;
 	VertexDecoderJitCache *decJitCache_ = nullptr;
 	VertexDecoderOptions decOptions_{};
 
-	TransformedVertex *transformed = nullptr;
-	TransformedVertex *transformedExpanded = nullptr;
+	TransformedVertex *transformed_ = nullptr;
+	TransformedVertex *transformedExpanded_ = nullptr;
 
-	// Defer all vertex decoding to a "Flush" (except when software skinning)
-	struct DeferredDrawCall {
-		void *verts;
-		void *inds;
+	// Defer all vertex decoding to a "Flush" (except when skinning, when we decode per draw)
+	struct DeferredVerts {
+		const void *verts;
+		UVScale uvScale;
 		u32 vertexCount;
-		u8 indexType;
-		s8 prim;
 		u16 indexLowerBound;
 		u16 indexUpperBound;
-		UVScale uvScale;
-		int cullMode;
+		bool predecoded;  // Already in decoded form (a tessellated curve), so DecodeVerts only copies it, if even that.
 	};
 
-	enum { MAX_DEFERRED_DRAW_CALLS = 128 };
-	DeferredDrawCall drawCalls[MAX_DEFERRED_DRAW_CALLS];
-	int numDrawCalls = 0;
-	int vertexCountInDrawCalls_ = 0;
+	struct DeferredInds {
+		const void *inds;
+		u32 vertexCount;
+		u8 vertDecodeIndex;  // index into the drawVerts_ array to look up the vertexOffset.
+		u8 indexType;
+		GEPrimitiveType prim;
+		bool clockwise;
+		u16 offset;
+	};
 
-	int decimationCounter_ = 0;
-	int decodeCounter_ = 0;
-	u32 dcid_ = 0;
+	enum { MAX_DEFERRED_DRAW_VERTS = 128 };  // If you change this to more than 256, change type of DeferredInds::vertDecodeIndex.
+	enum { MAX_DEFERRED_DRAW_INDS = 512 };  // Monster Hunter spams indexed calls that we end up merging.
+	DeferredVerts drawVerts_[MAX_DEFERRED_DRAW_VERTS];
+	uint32_t drawVertexOffsets_[MAX_DEFERRED_DRAW_VERTS];
+	// A cull mode change flushes, so all draws in a batch share this.
+	bool BatchTrianglesReversed() const { return numDrawInds_ > 0 && !drawInds_[0].clockwise; }
+
+	DeferredInds drawInds_[MAX_DEFERRED_DRAW_INDS];
+
+	const VertexDecoder *dec_ = nullptr;
+	u32 lastVType_ = -1;  // corresponds to dec_.  Could really just pick it out of dec_...
+	int numDrawVerts_ = 0;
+	int numDrawInds_ = 0;
+	int vertexCountInDrawCalls_ = 0;
+	// How many vertices software transform expands the queued points, lines and rectangles to (4 per
+	// point, line or rectangle). Must stay <= VERTEX_BUFFER_MAX, or the expansion drops the whole draw.
+	int expandedVertsInDrawCalls_ = 0;
+	// How many vertices DecodeVerts will produce for the queued draws. Must stay <= VERTEX_BUFFER_MAX.
+	int numVertsToDecode_ = 0;
+
+	int decodeVertsCounter_ = 0;
+	int decodeIndsCounter_ = 0;
+
+	int seenPrims_ = 0;
+	bool anyCCWOrIndexed_ = 0;
+	bool anyIndexed_ = 0;
 
 	// Vertex collector state
 	IndexGenerator indexGen;
-	int decodedVerts_ = 0;
+	int numDecodedVerts_ = 0;
 	GEPrimitiveType prevPrim_ = GE_PRIM_INVALID;
 
 	// Shader blending state
-	bool fboTexNeedsBind_ = false;
 	bool fboTexBound_ = false;
 
-	// Hardware tessellation
-	TessellationDataTransfer *tessDataTransfer;
+	// Sometimes, unusual situations mean we need to reset dirty flags after state calc finishes.
+	uint64_t dirtyRequiresRecheck_ = 0;
+
+	ComputedPipelineState pipelineState_{};
+
+	GPUCommon *gpuCommon_ = nullptr;
+
+	// Software depth raster
+	bool useDepthRaster_ = false;
+
+	DepthRasterWorker *depthWorker_ = nullptr;
+
+	// Depth tracking
+	ClipInfoFlags clipInfoFlags_{};
+	ClipInfoFlags lastClipInfoFlags_{};  // Flags at the last flush. For dirtying.
+
+	double rasterTimeStart_ = 0.0;
+
+	bool lastUseHwTransform_ = true;
+	bool lastCpuLit_ = false;
 };

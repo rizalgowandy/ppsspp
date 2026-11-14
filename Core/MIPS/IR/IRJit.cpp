@@ -15,7 +15,9 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
 #include <set>
+#include <algorithm>
 
 #include "ext/xxhash.h"
 #include "Common/Profiler/Profiler.h"
@@ -23,255 +25,608 @@
 #include "Common/Log.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/StringUtils.h"
+#include "Common/File/FileUtil.h"
 
+#include "Core/Config.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/Debugger/SymbolMap.h"
+#include "Core/HLE/ReplaceTables.h"
 #include "Core/HLE/sceKernelMemory.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
-#include "Core/MIPS/MIPSInt.h"
+#include "Core/MIPS/Interpreter.h"
 #include "Core/MIPS/MIPSTables.h"
 #include "Core/MIPS/IR/IRRegCache.h"
-#include "Core/MIPS/IR/IRJit.h"
-#include "Core/MIPS/IR/IRPassSimplify.h"
 #include "Core/MIPS/IR/IRInterpreter.h"
+#include "Core/MIPS/IR/IRJit.h"
+#include "Core/MIPS/IR/IRNativeCommon.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/Reporting.h"
+#include "Common/TimeUtil.h"
+#include "Core/MIPS/MIPSTracer.h"
+
 
 namespace MIPSComp {
 
-IRJit::IRJit(MIPSState *mipsState) : frontend_(mipsState->HasDefaultPrefix()), mips_(mipsState) {
+IRJit::IRJit(MIPSState *mipsState, bool compileToNative) : frontend_(mipsState->HasDefaultPrefix()), mips_(mipsState) {
 	// u32 size = 128 * 1024;
-	// blTrampolines_ = kernelMemory.Alloc(size, true, "trampoline");
 	InitIR();
+
+	// If this IRJit instance will be used to drive a "JIT using IR", don't optimize for interpretation.
+	jo.optimizeForInterpreter = !compileToNative;
 
 	IROptions opts{};
 	opts.disableFlags = g_Config.uJitDisableFlags;
-	opts.unalignedLoadStore = opts.disableFlags & (uint32_t)JitDisable::LSU_UNALIGNED;
+#if PPSSPP_ARCH(RISCV64)
+	// Assume RISC-V always has very slow unaligned memory accesses.
+	opts.unalignedLoadStore = false;
+	opts.unalignedLoadStoreVec4 = true;
+	opts.preferVec4 = cpu_info.RiscV_V;
+#elif PPSSPP_ARCH(ARM) || PPSSPP_ARCH(ARM64)
+	opts.unalignedLoadStore = (opts.disableFlags & (uint32_t)JitDisable::LSU_UNALIGNED) == 0;
+	opts.unalignedLoadStoreVec4 = true;
+	opts.preferVec4 = true;
+#else
+	opts.unalignedLoadStore = (opts.disableFlags & (uint32_t)JitDisable::LSU_UNALIGNED) == 0;
+	// TODO: Could allow on x86 pretty easily...
+	opts.unalignedLoadStoreVec4 = false;
+	opts.preferVec4 = true;
+#endif
+	opts.optimizeForInterpreter = jo.optimizeForInterpreter;
+	// The IR interpreter, and the backends with a routine for it.
+#if PPSSPP_ARCH(ARM64)
+	opts.vfpuMultiDot = true;
+	opts.moreVec4Ops = true;
+#elif PPSSPP_ARCH(RISCV64) || PPSSPP_ARCH(LOONGARCH64)
+	opts.vfpuMultiDot = !compileToNative;
+	opts.moreVec4Ops = true;
+#else
+	opts.vfpuMultiDot = !compileToNative;
+	opts.moreVec4Ops = !compileToNative;
+#endif
+	opts.continueBranches = IR_CONTINUE_BRANCHES;
 	frontend_.SetOptions(opts);
+
+	profiling_ = !g_Config.sJitProfileFile.empty();
+	blocks_.SetAddressSpace(mipsState->space);
+	frontend_.SetAddressSpace(mipsState->space);
 }
 
 IRJit::~IRJit() {
 }
 
+IRInterpreterJit::IRInterpreterJit(MIPSState *mipsState) : IRJit(mipsState, false) {}
+
 void IRJit::DoState(PointerWrap &p) {
-	frontend_.DoState(p);
+	if (frontend_.DoState(p)) {
+		ClearCache();
+	}
 }
 
 void IRJit::UpdateFCR31() {
+	if (frontend_.UpdateFCR31(mips_->fcr31)) {
+		mips_->ClearJitCacheDeferred();
+	}
 }
 
 void IRJit::ClearCache() {
-	INFO_LOG(JIT, "IRJit: Clearing the cache!");
+	INFO_LOG(Log::JIT, "IRJit: Clearing the block cache!");
+	if (profiling_)
+		WriteProfileReport();
 	blocks_.Clear();
 }
 
+void IRInterpreterJit::ClearCache() {
+	IRJit::ClearCache();
+	arena_.clear();
+	arena_.shrink_to_fit();
+}
+
+void IRJit::FlushProfile() {
+	if (profiling_)
+		WriteProfileReport();
+}
+
+void IRInterpreterJit::WriteProfileReport() {
+	int64_t totalNanos = 0;
+	std::vector<int> hot;
+	for (int i = 0; i < blocks_.GetNumBlocks(); ++i) {
+		const JitBlock *b = blocks_.GetBlock(i);
+		if (b->profileStats_.executions == 0)
+			continue;
+		totalNanos += b->profileStats_.totalNanos;
+		hot.push_back(i);
+	}
+	// Skip the near-empty profiles of a cache cleared while booting or loading a state.
+	if (totalNanos < 100'000'000)
+		return;
+	std::sort(hot.begin(), hot.end(), [&](int a, int b) {
+		return blocks_.GetBlock(a)->profileStats_.totalNanos > blocks_.GetBlock(b)->profileStats_.totalNanos;
+	});
+
+	FILE *f = File::OpenCFile(Path(g_Config.sJitProfileFile), "a");
+	if (!f)
+		return;
+	fprintf(f, "IR interpreter profile: %.3f s in %d blocks\n\n", totalNanos * 1e-9, (int)hot.size());
+	for (int rank = 0; rank < (int)hot.size() && rank < 40; ++rank) {
+		const int blockNum = hot[rank];
+		const JitBlock *b = blocks_.GetBlock(blockNum);
+		const JitBlockProfileStats &stats = b->profileStats_;
+		const std::string label = g_symbolMap ? g_symbolMap->GetDescription(b->GetOriginalStart()) : "";
+		fprintf(f, "#%d %.2f%% block %d at %08x %s: %lld runs, %.1f ns/run\n", rank + 1, 100.0 * stats.totalNanos / totalNanos, blockNum,
+			b->GetOriginalStart(), label.c_str(), (long long)stats.executions, (double)stats.totalNanos / stats.executions);
+		const IRInst *inst = arena_.data() + b->GetEntry();
+		for (int i = 0; i < b->GetNumIRInstructions(); ++i) {
+			char temp[256];
+			DisassembleIR(temp, sizeof(temp), inst[i]);
+			fprintf(f, "    %s\n", temp);
+		}
+		fprintf(f, "\n");
+	}
+	fclose(f);
+
+	for (int blockNum : hot)
+		blocks_.GetBlock(blockNum)->profileStats_ = JitBlockProfileStats{};
+}
+
 void IRJit::InvalidateCacheAt(u32 em_address, int length) {
-	blocks_.InvalidateICache(em_address, length);
+	const uint64_t start = time_now_fast_ticks();
+	std::vector<int> numbers = blocks_.FindInvalidatedBlockNumbers(em_address, length);
+	if (numbers.empty()) {
+		g_jitCompileTimes.invalidateNanos += (int64_t)((time_now_fast_ticks() - start) * fast_ticks_to_nanos());
+		return;
+	}
+
+	DEBUG_LOG(Log::JIT, "Invalidating IR block cache at %08x (%d bytes): %d blocks", em_address, length, (int)numbers.size());
+	invalidations_++;
+	invalidatedBlocks_ += (int)numbers.size();
+
+	for (int block_num : numbers) {
+		// TODO: We are invalidating a lot of blocks that are already invalid (yu gi oh).
+		InvalidateBlock(block_num);
+	}
+	g_jitCompileTimes.invalidateNanos += (int64_t)((time_now_fast_ticks() - start) * fast_ticks_to_nanos());
+}
+
+void IRJit::InvalidateChangedBlocks() {
+	const uint64_t start = time_now_fast_ticks();
+	int changed = 0;
+	for (int block_num = 0; block_num < blocks_.GetNumBlocks(); ++block_num) {
+		const JitBlock *block = blocks_.GetBlock(block_num);
+		if (block->IsValid() && block->CodeChanged()) {
+			InvalidateBlock(block_num);
+			changed++;
+		}
+	}
+	const int64_t nanos = (int64_t)((time_now_fast_ticks() - start) * fast_ticks_to_nanos());
+	DEBUG_LOG(Log::JIT, "Checked %d blocks in %.2f ms, %d had changed code", blocks_.GetNumBlocks(), nanos / 1000000.0, changed);
+	changedCodeChecks_++;
+	changedCodeBlocks_ += changed;
+	if (changed) {
+		invalidations_++;
+		invalidatedBlocks_ += changed;
+	}
+	g_jitCompileTimes.invalidateNanos += nanos;
+}
+
+void IRJit::InvalidateBlock(int block_num) {
+	JitBlock *block = blocks_.GetBlock(block_num);
+	// Before Destroy, which forgets the block's address. Blocks linked to it jump straight in.
+	InvalidateTargetBlock(block_num);
+	blocks_.RemoveBlockFromPageLookup(block_num);
+	block->Destroy(blocks_.Space());
+}
+
+void IRJit::InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep) {
+	if (keep.empty()) {
+		ClearCache();
+		return;
+	}
+
+	int kept = 0;
+	int invalidated = 0;
+	for (int block_num = 0; block_num < blocks_.GetNumBlocks(); ++block_num) {
+		const JitBlock *block = blocks_.GetBlock(block_num);
+		if (!block->IsValid()) {
+			continue;
+		}
+		u32 start, size;
+		block->GetRange(&start, &size);
+		start &= 0x3FFFFFFF;
+		bool inside = false;
+		for (const auto &[keepStart, keepSize] : keep) {
+			const u32 maskedStart = keepStart & 0x3FFFFFFF;
+			if (start >= maskedStart && start + size <= maskedStart + keepSize) {
+				inside = true;
+				break;
+			}
+		}
+		if (inside) {
+			kept++;
+		} else {
+			InvalidateBlock(block_num);
+			invalidated++;
+		}
+	}
+	INFO_LOG(Log::JIT, "IRJit: Kept %d blocks, invalidated %d", kept, invalidated);
 }
 
 void IRJit::Compile(u32 em_address) {
+	_dbg_assert_(compilerEnabled_);
+
 	PROFILE_THIS_SCOPE("jitc");
 
-	if (g_Config.bPreloadFunctions) {
-		// Look to see if we've preloaded this block.
-		int block_num = blocks_.FindPreloadBlock(em_address);
-		if (block_num != -1) {
-			IRBlock *b = blocks_.GetBlock(block_num);
-			// Okay, let's link and finalize the block now.
-			b->Finalize(block_num);
-			if (b->IsValid()) {
-				// Success, we're done.
-				return;
-			}
-		}
-	}
-
-	std::vector<IRInst> instructions;
+	// A member, to keep its capacity. Compiling isn't reentrant (the frontend has its state in members too).
+	std::vector<IRInst> &instructions = compileInstructions_;
 	u32 mipsBytes;
-	if (!CompileBlock(em_address, instructions, mipsBytes, false)) {
-		// Ran out of block numbers - need to reset.
-		ERROR_LOG(JIT, "Ran out of block numbers, clearing cache");
-		ClearCache();
-		CompileBlock(em_address, instructions, mipsBytes, false);
+	const CompileResult result = CompileBlock(em_address, instructions, mipsBytes);
+	if (result != CompileResult::OK) {
+		if (result == CompileResult::ARENA_FULL) {
+			ERROR_LOG(Log::JIT, "IR arena full (%d blocks), clearing cache", blocks_.GetNumBlocks());
+			irArenaFullClears_++;
+		} else {
+			ERROR_LOG(Log::JIT, "Native code space full (%d blocks), clearing cache", blocks_.GetNumBlocks());
+			codeFullClears_++;
+		}
+		TimedClearCache();
+		CompileBlock(em_address, instructions, mipsBytes);
 	}
 
 	if (frontend_.CheckRounding(em_address)) {
 		// Our assumptions are all wrong so it's clean-slate time.
+		TimedClearCache();
+		CompileBlock(em_address, instructions, mipsBytes);
+	}
+}
+
+void IRJit::BenchmarkCompile() {
+	std::vector<u32> starts;
+	for (int i = 0; i < blocks_.GetNumBlocks(); i++) {
+		const JitBlock *block = blocks_.GetBlock(i);
+		if (block->IsValid())
+			starts.push_back(block->GetOriginalStart());
+	}
+	std::sort(starts.begin(), starts.end());
+	starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+	if (starts.empty()) {
+		NOTICE_LOG(Log::JIT, "JIT bench: no blocks to compile");
+		return;
+	}
+
+	// The best of a few runs, since a phone's clocks and core assignment vary a lot.
+	constexpr int RUNS = 5;
+	JitCompileTimes best{};
+	int64_t bestTotal = INT64_MAX;
+	std::vector<IRInst> instructions;
+	// Of the IR the passes made, to tell whether a change to them changed what they make.
+	uint64_t irHash = 0;
+	size_t codeBytes = 0;
+	benchmarking_ = true;
+	for (int run = 0; run < RUNS; run++) {
 		ClearCache();
-		CompileBlock(em_address, instructions, mipsBytes, false);
+		const JitCompileTimes before = g_jitCompileTimes;
+		for (u32 start : starts) {
+			u32 mipsBytes;
+			if (CompileBlock(start, instructions, mipsBytes) != CompileResult::OK) {
+				ERROR_LOG(Log::JIT, "JIT bench: the cache filled up, stopping");
+				ClearCache();
+				benchmarking_ = false;
+				return;
+			}
+			if (run == 0) {
+				irHash = XXH3_64bits_withSeed(instructions.data(), instructions.size() * sizeof(IRInst), irHash);
+			}
+		}
+		if (run == 0) {
+			// A hash of the code would change with ASLR, which moves the addresses it has in it.
+			codeBytes = TargetCodeBytes();
+		}
+		const JitCompileTimes &after = g_jitCompileTimes;
+		JitCompileTimes t{};
+		t.frontendNanos = after.frontendNanos - before.frontendNanos;
+		t.passNanos = after.passNanos - before.passNanos;
+		t.backendNanos = after.backendNanos - before.backendNanos;
+		t.finalizeNanos = after.finalizeNanos - before.finalizeNanos;
+		t.mipsInstructions = after.mipsInstructions - before.mipsInstructions;
+		t.irInstructions = after.irInstructions - before.irInstructions;
+		NOTICE_LOG(Log::JIT, "JIT bench run %d: %d blocks in %0.2f ms (frontend %0.2f, passes %0.2f, backend %0.2f, finalize %0.2f)",
+			run, (int)starts.size(), t.TotalNanos() * 1e-6, t.frontendNanos * 1e-6, t.passNanos * 1e-6, t.backendNanos * 1e-6, t.finalizeNanos * 1e-6);
+		if (t.TotalNanos() < bestTotal) {
+			bestTotal = t.TotalNanos();
+			best = t;
+		}
 	}
+	benchmarking_ = false;
+
+	// And as games compile, without timing the phases: what reading the clock for them costs.
+	int64_t bestWhole = INT64_MAX;
+	for (int run = 0; run < RUNS; run++) {
+		ClearCache();
+		const Instant start = Instant::Now();
+		for (u32 pc : starts) {
+			u32 mipsBytes;
+			if (CompileBlock(pc, instructions, mipsBytes) != CompileResult::OK) {
+				ERROR_LOG(Log::JIT, "JIT bench: the cache filled up, stopping");
+				ClearCache();
+				return;
+			}
+		}
+		bestWhole = std::min(bestWhole, start.ElapsedNanos());
+	}
+	NOTICE_LOG(Log::JIT, "JIT bench: %0.3f ns per timer tick, IR hash %016llx, %d bytes of code", fast_ticks_to_nanos(), (unsigned long long)irHash, (int)codeBytes);
+	NOTICE_LOG(Log::JIT, "JIT bench best without the phases: %0.2f ms, %0.2f us/block", bestWhole * 1e-6, bestWhole * 1e-3 / starts.size());
+	NOTICE_LOG(Log::JIT, "JIT bench best: %d blocks, %d MIPS -> %d IR instructions, %0.2f ms, %0.2f us/block (frontend %0.2f, passes %0.2f, backend %0.2f, finalize %0.2f)",
+		(int)starts.size(), (int)best.mipsInstructions, (int)best.irInstructions, bestTotal * 1e-6, bestTotal * 1e-3 / starts.size(),
+		best.frontendNanos * 1e-3 / starts.size(), best.passNanos * 1e-3 / starts.size(), best.backendNanos * 1e-3 / starts.size(), best.finalizeNanos * 1e-3 / starts.size());
 }
 
-bool IRJit::CompileBlock(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes, bool preload) {
-	frontend_.DoJit(em_address, instructions, mipsBytes, preload);
-	if (instructions.empty()) {
-		_dbg_assert_(preload);
-		// We return true when preloading so it doesn't abort.
-		return preload;
+void IRJit::TimedClearCache() {
+	const Instant start = Instant::Now();
+	ClearCache();
+	g_jitCompileTimes.clearNanos += start.ElapsedNanos();
+	g_jitCompileTimes.clears++;
+}
+
+IRJit::CompileResult IRJit::CompileBlock(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes) {
+	_dbg_assert_(compilerEnabled_);
+
+	JitCompileTimes &times = g_jitCompileTimes;
+	// Each phase ends where the next starts, to read the clock as little as possible.
+	const bool timePhases = benchmarking_ || g_Config.iDebugOverlay == (int)DebugOverlay::JIT_STATS;
+	const uint64_t start = timePhases ? 0 : time_now_fast_ticks();
+	frontend_.DoJit(em_address, instructions, mipsBytes, timePhases);
+	_dbg_assert_(!instructions.empty());
+	times.mipsInstructions += mipsBytes / 4;
+	times.irInstructions += instructions.size();
+	const uint64_t backendStart = frontend_.LastEnd();
+	const double nanosPerTick = fast_ticks_to_nanos();
+
+	if (mipsTracer.tracing_enabled && instructions.size() > 1 && instructions[1].op == IROp::LogIRBlock) {
+		// Before the IR interpreter's block cache takes its copy.
+		instructions[1].constant = mipsTracer.prepare_block(em_address, mipsBytes);
 	}
 
-	int block_num = blocks_.AllocateBlock(em_address);
-	if ((block_num & ~MIPS_EMUHACK_VALUE_MASK) != 0) {
-		// Out of block numbers.  Caller will handle.
-		return false;
-	}
+	int block_num = blocks_.AllocateBlock(em_address, mipsBytes, (u32)instructions.size());
+	JitBlock *b = blocks_.GetBlock(block_num);
+	// For the tracer, and so InvalidateChangedBlocks() can tell the code was overwritten.
+	b->UpdateHash();
 
-	IRBlock *b = blocks_.GetBlock(block_num);
-	b->SetInstructions(instructions);
-	b->SetOriginalSize(mipsBytes);
-	if (preload) {
-		// Hash, then only update page stats, don't link yet.
-		b->UpdateHash();
-		blocks_.FinalizeBlock(block_num, true);
-	} else {
-		// Overwrites the first instruction, and also updates stats.
-		// TODO: Should we always hash?  Then we can reuse blocks.
+	// Caller handles a full arena or code space.
+	const CompileResult result = CompileTargetBlock(block_num, instructions);
+	const uint64_t finalizeStart = timePhases ? time_now_fast_ticks() : 0;
+	if (result == CompileResult::OK) {
+		// Updates stats, also enters the block in the block shadow.
 		blocks_.FinalizeBlock(block_num);
+		FinalizeTargetBlock(block_num);
 	}
-
-	return true;
+	const uint64_t end = time_now_fast_ticks();
+	int64_t blockNanos;
+	if (timePhases) {
+		const int64_t backendNanos = (int64_t)((finalizeStart - backendStart) * nanosPerTick);
+		const int64_t finalizeNanos = (int64_t)((end - finalizeStart) * nanosPerTick);
+		times.frontendNanos += frontend_.LastFrontendNanos();
+		times.passNanos += frontend_.LastPassNanos();
+		times.backendNanos += backendNanos;
+		times.finalizeNanos += finalizeNanos;
+		times.phaseBlocks++;
+		blockNanos = frontend_.LastFrontendNanos() + frontend_.LastPassNanos() + backendNanos + finalizeNanos;
+	} else {
+		blockNanos = (int64_t)((end - start) * nanosPerTick);
+		times.unphasedNanos += blockNanos;
+	}
+	if (result != CompileResult::OK)
+		return result;
+	times.blocks++;
+	times.maxBlockNanos = std::max(times.maxBlockNanos, blockNanos);
+	return CompileResult::OK;
 }
 
-void IRJit::CompileFunction(u32 start_address, u32 length) {
-	PROFILE_THIS_SCOPE("jitc");
-
-	// Note: we don't actually write emuhacks yet, so we can validate hashes.
-	// This way, if the game changes the code afterward, we'll catch even without icache invalidation.
-
-	// We may go up and down from branches, so track all block starts done here.
-	std::set<u32> doneAddresses;
-	std::vector<u32> pendingAddresses;
-	pendingAddresses.push_back(start_address);
-	while (!pendingAddresses.empty()) {
-		u32 em_address = pendingAddresses.back();
-		pendingAddresses.pop_back();
-
-		// To be safe, also check if a real block is there.  This can be a runtime module load.
-		u32 inst = Memory::ReadUnchecked_U32(em_address);
-		if (MIPS_IS_RUNBLOCK(inst) || doneAddresses.find(em_address) != doneAddresses.end()) {
-			// Already compiled this address.
-			continue;
-		}
-
-		std::vector<IRInst> instructions;
-		u32 mipsBytes;
-		if (!CompileBlock(em_address, instructions, mipsBytes, true)) {
-			// Ran out of block numbers - let's hope there's no more code it needs to run.
-			// Will flush when actually compiling.
-			ERROR_LOG(JIT, "Ran out of block numbers while compiling function");
-			return;
-		}
-
-		doneAddresses.insert(em_address);
-
-		for (const IRInst &inst : instructions) {
-			u32 exit = 0;
-
-			switch (inst.op) {
-			case IROp::ExitToConst:
-			case IROp::ExitToConstIfEq:
-			case IROp::ExitToConstIfNeq:
-			case IROp::ExitToConstIfGtZ:
-			case IROp::ExitToConstIfGeZ:
-			case IROp::ExitToConstIfLtZ:
-			case IROp::ExitToConstIfLeZ:
-			case IROp::ExitToConstIfFpTrue:
-			case IROp::ExitToConstIfFpFalse:
-				exit = inst.constant;
-				break;
-
-			case IROp::ExitToPC:
-			case IROp::Break:
-				// Don't add any, we'll do block end anyway (for jal, etc.)
-				exit = 0;
-				break;
-
-			default:
-				exit = 0;
-				break;
-			}
-
-			// Only follow jumps internal to the function.
-			if (exit != 0 && exit >= start_address && exit < start_address + length) {
-				// Even if it's a duplicate, we check at loop start.
-				pendingAddresses.push_back(exit);
-			}
-		}
-
-		// Also include after the block for jal returns.
-		if (em_address + mipsBytes < start_address + length) {
-			pendingAddresses.push_back(em_address + mipsBytes);
-		}
+IRJit::CompileResult IRInterpreterJit::CompileTargetBlock(int block_num, const std::vector<IRInst> &instructions) {
+	if (arena_.empty()) {
+		// Offset 0 would mean "no block" in the block shadow, and 1 a replacement hook.
+		arena_.push_back(IRInst{ IROp::Bad });
+		arena_.push_back(IRInst{ IROp::Bad });
 	}
+	const int offset = (int)arena_.size();
+	if (offset >= MAX_ARENA_SIZE) {
+		WARN_LOG(Log::JIT, "Filled IR arena, restarting");
+		return CompileResult::ARENA_FULL;
+	}
+	arena_.insert(arena_.end(), instructions.begin(), instructions.end());
+	blocks_.GetBlock(block_num)->SetEntry(offset);
+	return CompileResult::OK;
 }
 
-void IRJit::RunLoopUntil(u64 globalticks) {
+void IRInterpreterJit::GetBlockInstructions(const JitBlock &block, std::vector<IRInst> &instructions) const {
+	if (block.GetEntry() == 0) {
+		instructions.clear();
+		return;
+	}
+	const IRInst *start = arena_.data() + block.GetEntry();
+	instructions.assign(start, start + block.GetNumIRInstructions());
+}
+
+void IRJit::GetStats(JitStats *stats) const {
+	stats->numBlocks = blocks_.GetNumBlocks();
+	stats->numValidBlocks = blocks_.CountValidBlocks();
+	stats->irArenaFullClears = irArenaFullClears_;
+	stats->codeFullClears = codeFullClears_;
+	stats->invalidations = invalidations_;
+	stats->invalidatedBlocks = invalidatedBlocks_;
+	stats->changedCodeChecks = changedCodeChecks_;
+	stats->changedCodeBlocks = changedCodeBlocks_;
+}
+
+int IRInterpreterJit::GetBlockCodeSize(int block_num) const {
+	// Bloat is counted in instructions, as if IR were 4 bytes like MIPS.
+	return blocks_.GetBlock(block_num)->GetNumIRInstructions() * 4;
+}
+
+void IRInterpreterJit::GetStats(JitStats *stats) const {
+	IRJit::GetStats(stats);
+	stats->irArenaUsed = arena_.size();
+	stats->irArenaSize = MAX_ARENA_SIZE;
+}
+
+void IRInterpreterJit::RunLoopUntil(u64 globalticks) {
 	PROFILE_THIS_SCOPE("jit");
+	if (profiling_)
+		RunBlocks<true>();
+	else
+		RunBlocks<false>();
+}
 
-	// ApplyRoundingMode(true);
+// Runs blocks, compiling as needed, until the downcount runs out (or the core stops).
+template <bool profile>
+inline void IRInterpreterJit::RunBlocksUntilDowncount() {
+	MIPSState *mips = mips_;
+	while (mips->downcount >= 0) {
+		// The block's offset into the IR arena, or 0 for none, or a replacement hook (handled by
+		// compiling a block).
+		const u32 offset = *mips->space->GetBlockShadowEntry(mips->pc);
+		static_assert(Memory::BLOCK_SHADOW_HOOK_NO_JIT == 1, "IR arena reserves offsets 0 and 1");
+		if (offset > Memory::BLOCK_SHADOW_HOOK_NO_JIT) {
+			const IRInst *instPtr = arena_.data() + offset;
+			// First op is always, except when using breakpoints, downcount, to save one dispatch inside IRInterpret.
+			// This branch is very cpu-branch-predictor-friendly so this still beats the dispatch.
+			if (instPtr->op == IROp::Downcount) {
+				mips->downcount -= instPtr->constant;
+				instPtr++;
+			}
+			if constexpr (profile) {
+				JitBlock *block = blocks_.GetBlock(blocks_.FindByEntry(offset));
+				Instant start = Instant::Now();
+				mips->pc = IRInterpret(mips, instPtr);
+				block->profileStats_.executions += 1;
+				block->profileStats_.totalNanos += start.ElapsedNanos();
+			} else {
+				// Runs on through the blocks it can, as long as downcount lasts.
+				mips->pc = IRInterpret(mips, instPtr, arena_.data());
+			}
+			// Note: this will "jump to zero" on a badly constructed block missing exits.
+			if (!mips->space->IsValid4AlignedAddress(mips->pc)) {
+				int blockNum = blocks_.FindByEntry(offset);
+				JitBlock *block = blocks_.GetBlockUnchecked(blockNum);
+				Core_ExecException(mips->pc, block->GetOriginalStart(), ExecExceptionType::JUMP);
+				return;
+			}
+		} else {
+			RestoreHostRoundingMode();
+#ifdef _DEBUG
+			compilerEnabled_ = true;
+#endif
+			Compile(mips->pc);
+#ifdef _DEBUG
+			compilerEnabled_ = false;
+#endif
+			ApplyHostRoundingMode(mips);
+		}
+	}
+}
+
+template <bool profile>
+void IRInterpreterJit::RunBlocks() {
 	// IR Dispatcher
-	
+	// The guest's rounding mode applies while running blocks, like in the native JITs' dispatchers
+	// (see ApplyHostRoundingMode).
+	MIPSState *mips = mips_;
 	while (true) {
-		// RestoreRoundingMode(true);
-		CoreTiming::Advance();
-		// ApplyRoundingMode(true);
+		RestoreHostRoundingMode();
+		CoreTiming::Advance(mips);
 		if (coreState != 0) {
 			break;
 		}
-		while (mips_->downcount >= 0) {
-			u32 inst = Memory::ReadUnchecked_U32(mips_->pc);
-			u32 opcode = inst & 0xFF000000;
-			if (opcode == MIPS_EMUHACK_OPCODE) {
-				u32 data = inst & 0xFFFFFF;
-				IRBlock *block = blocks_.GetBlock(data);
-				mips_->pc = IRInterpret(mips_, block->GetInstructions(), block->GetNumInstructions());
-				if (!Memory::IsValidAddress(mips_->pc)) {
-					Core_ExecException(mips_->pc, mips_->pc, ExecExceptionType::JUMP);
-					break;
-				}
-			} else {
-				// RestoreRoundingMode(true);
-				Compile(mips_->pc);
-				// ApplyRoundingMode(true);
-			}
-		}
+		ApplyHostRoundingMode(mips);
+
+#ifdef _DEBUG
+		compilerEnabled_ = false;
+#endif
+		RunBlocksUntilDowncount<profile>();
+#ifdef _DEBUG
+		compilerEnabled_ = true;
+#endif
 	}
 
-	// RestoreRoundingMode(true);
+	RestoreHostRoundingMode();
 }
 
-bool IRJit::DescribeCodePtr(const u8 *ptr, std::string &name) {
-	// Used in target disassembly viewer.
-	return false;
+void IRInterpreterJit::RunDowncount() {
+	ApplyHostRoundingMode(mips_);
+#ifdef _DEBUG
+	compilerEnabled_ = false;
+#endif
+	if (profiling_)
+		RunBlocksUntilDowncount<true>();
+	else
+		RunBlocksUntilDowncount<false>();
+#ifdef _DEBUG
+	compilerEnabled_ = true;
+#endif
+	RestoreHostRoundingMode();
 }
 
-void IRJit::LinkBlock(u8 *exitPoint, const u8 *checkedEntry) {
-	Crash();
-}
-
-void IRJit::UnlinkBlock(u8 *checkedEntry, u32 originalAddress) {
-	Crash();
-}
-
-bool IRJit::ReplaceJalTo(u32 dest) {
-	Crash();
-	return false;
-}
-
-void IRBlockCache::Clear() {
-	for (int i = 0; i < (int)blocks_.size(); ++i) {
-		blocks_[i].Destroy(i);
+void JitBlockTable::Clear() {
+	for (JitBlock &block : blocks_) {
+		block.Destroy(*space_);
 	}
 	blocks_.clear();
 	byPage_.clear();
 }
 
-void IRBlockCache::InvalidateICache(u32 address, u32 length) {
-	u32 startPage = AddressToPage(address);
-	u32 endPage = AddressToPage(address + length);
+int JitBlockTable::CountValidBlocks() const {
+	int count = 0;
+	for (const JitBlock &block : blocks_) {
+		if (block.IsValid()) {
+			count++;
+		}
+	}
+	return count;
+}
 
+int JitBlockTable::AllocateBlock(int emAddr, u32 origSize, u32 numIRInstructions) {
+	int newBlockIndex = (int)blocks_.size();
+	blocks_.push_back(JitBlock(emAddr, origSize, numIRInstructions));
+	return newBlockIndex;
+}
+
+int JitBlockTable::FindByEntry(int entry) const {
+	// Entries rise with the block number (we don't go back and replace them when invalidated). So we can binary search.
+	int low = 0;
+	int high = (int)blocks_.size() - 1;
+	while (low <= high) {
+		int mid = low + (high - low) / 2;
+		const int blockEntry = blocks_[mid].GetEntry();
+		if (blockEntry == entry) {
+			return mid;
+		}
+		if (blockEntry < entry) {
+			low = mid + 1;
+		} else {
+			high = mid - 1;
+		}
+	}
+	return -1;
+}
+
+std::vector<int> JitBlockTable::FindInvalidatedBlockNumbers(u32 address, u32 lengthInBytes) {
+	u32 startPage = AddressToPage(address);
+	u32 endPage = AddressToPage(address + lengthInBytes);
+
+	std::vector<int> found;
+	// sceKernelIcacheInvalidateAll covers all of memory, a million pages.
+	if (endPage - startPage >= byPage_.size()) {
+		for (const auto &[page, blocksInPage] : byPage_) {
+			if (page < startPage || page > endPage)
+				continue;
+			for (int i : blocksInPage) {
+				if (blocks_[i].OverlapsRange(address, lengthInBytes))
+					found.push_back(i);
+			}
+		}
+		return found;
+	}
 	for (u32 page = startPage; page <= endPage; ++page) {
 		const auto iter = byPage_.find(page);
 		if (iter == byPage_.end())
@@ -279,141 +634,59 @@ void IRBlockCache::InvalidateICache(u32 address, u32 length) {
 
 		const std::vector<int> &blocksInPage = iter->second;
 		for (int i : blocksInPage) {
-			if (blocks_[i].OverlapsRange(address, length)) {
-				// Not removing from the page, hopefully doesn't build up with small recompiles.
-				blocks_[i].Destroy(i);
+			if (blocks_[i].OverlapsRange(address, lengthInBytes)) {
+				// We now try to remove these during invalidation.
+				found.push_back(i);
 			}
 		}
 	}
+
+	return found;
 }
 
-void IRBlockCache::FinalizeBlock(int i, bool preload) {
-	if (!preload) {
-		blocks_[i].Finalize(i);
-	}
+void JitBlockTable::FinalizeBlock(int blockIndex) {
+	JitBlock &block = blocks_[blockIndex];
+	block.Finalize(*space_);
 
 	u32 startAddr, size;
-	blocks_[i].GetRange(startAddr, size);
+	block.GetRange(&startAddr, &size);
 
 	u32 startPage = AddressToPage(startAddr);
 	u32 endPage = AddressToPage(startAddr + size);
 
 	for (u32 page = startPage; page <= endPage; ++page) {
-		byPage_[page].push_back(i);
+		byPage_[page].push_back(blockIndex);
 	}
 }
 
-u32 IRBlockCache::AddressToPage(u32 addr) const {
+// Call after Destroy-ing it.
+void JitBlockTable::RemoveBlockFromPageLookup(int blockIndex) {
+	// We need to remove the block from the byPage lookup.
+	JitBlock &block = blocks_[blockIndex];
+
+	u32 startAddr, size;
+	block.GetRange(&startAddr, &size);
+
+	u32 startPage = AddressToPage(startAddr);
+	u32 endPage = AddressToPage(startAddr + size);
+
+	for (u32 page = startPage; page <= endPage; ++page) {
+		auto iter = std::find(byPage_[page].begin(), byPage_[page].end(), blockIndex);
+		if (iter != byPage_[page].end()) {
+			byPage_[page].erase(iter);
+		} else if (block.IsValid()) {
+			// If it was previously invalidated, we don't care, hence the above check.
+			WARN_LOG(Log::JIT, "RemoveBlock: Block at %08x was not found where expected in byPage table.", startAddr);
+		}
+	}
+}
+
+u32 JitBlockTable::AddressToPage(u32 addr) const {
 	// Use relatively small pages since basic blocks are typically small.
 	return (addr & 0x3FFFFFFF) >> 10;
 }
 
-int IRBlockCache::FindPreloadBlock(u32 em_address) {
-	u32 page = AddressToPage(em_address);
-	auto iter = byPage_.find(page);
-	if (iter == byPage_.end())
-		return -1;
-
-	const std::vector<int> &blocksInPage = iter->second;
-	for (int i : blocksInPage) {
-		u32 start, mipsBytes;
-		blocks_[i].GetRange(start, mipsBytes);
-
-		if (start == em_address) {
-			if (blocks_[i].HashMatches()) {
-				return i;
-			}
-		}
-	}
-
-	return -1;
-}
-
-std::vector<u32> IRBlockCache::SaveAndClearEmuHackOps() {
-	std::vector<u32> result;
-	result.resize(blocks_.size());
-
-	for (int number = 0; number < (int)blocks_.size(); ++number) {
-		IRBlock &b = blocks_[number];
-		if (b.IsValid() && b.RestoreOriginalFirstOp(number)) {
-			result[number] = number;
-		} else {
-			result[number] = 0;
-		}
-	}
-
-	return result;
-}
-
-void IRBlockCache::RestoreSavedEmuHackOps(std::vector<u32> saved) {
-	if ((int)blocks_.size() != (int)saved.size()) {
-		ERROR_LOG(JIT, "RestoreSavedEmuHackOps: Wrong saved block size.");
-		return;
-	}
-
-	for (int number = 0; number < (int)blocks_.size(); ++number) {
-		IRBlock &b = blocks_[number];
-		// Only if we restored it, write it back.
-		if (b.IsValid() && saved[number] != 0 && b.HasOriginalFirstOp()) {
-			b.Finalize(number);
-		}
-	}
-}
-
-JitBlockDebugInfo IRBlockCache::GetBlockDebugInfo(int blockNum) const {
-	const IRBlock &ir = blocks_[blockNum];
-	JitBlockDebugInfo debugInfo{};
-	uint32_t start, size;
-	ir.GetRange(start, size);
-	debugInfo.originalAddress = start;  // TODO
-
-	for (u32 addr = start; addr < start + size; addr += 4) {
-		char temp[256];
-		MIPSDisAsm(Memory::Read_Instruction(addr), addr, temp, true);
-		std::string mipsDis = temp;
-		debugInfo.origDisasm.push_back(mipsDis);
-	}
-
-	for (int i = 0; i < ir.GetNumInstructions(); i++) {
-		IRInst inst = ir.GetInstructions()[i];
-		char buffer[256];
-		DisassembleIR(buffer, sizeof(buffer), inst);
-		debugInfo.irDisasm.push_back(buffer);
-	}
-	return debugInfo;
-}
-
-void IRBlockCache::ComputeStats(BlockCacheStats &bcStats) const {
-	double totalBloat = 0.0;
-	double maxBloat = 0.0;
-	double minBloat = 1000000000.0;
-	for (const auto &b : blocks_) {
-		double codeSize = (double)b.GetNumInstructions() * sizeof(IRInst);
-		if (codeSize == 0)
-			continue;
-
-		u32 origAddr, mipsBytes;
-		b.GetRange(origAddr, mipsBytes);
-		double origSize = (double)mipsBytes;
-		double bloat = codeSize / origSize;
-		if (bloat < minBloat) {
-			minBloat = bloat;
-			bcStats.minBloatBlock = origAddr;
-		}
-		if (bloat > maxBloat) {
-			maxBloat = bloat;
-			bcStats.maxBloatBlock = origAddr;
-		}
-		totalBloat += bloat;
-		bcStats.bloatMap[bloat] = origAddr;
-	}
-	bcStats.numBlocks = (int)blocks_.size();
-	bcStats.minBloat = minBloat;
-	bcStats.maxBloat = maxBloat;
-	bcStats.avgBloat = totalBloat / (double)blocks_.size();
-}
-
-int IRBlockCache::GetBlockNumberFromStartAddress(u32 em_address, bool realBlocksOnly) const {
+int JitBlockTable::GetBlockNumberFromStartAddress(u32 em_address) const {
 	u32 page = AddressToPage(em_address);
 
 	const auto iter = byPage_.find(page);
@@ -423,9 +696,7 @@ int IRBlockCache::GetBlockNumberFromStartAddress(u32 em_address, bool realBlocks
 	const std::vector<int> &blocksInPage = iter->second;
 	int best = -1;
 	for (int i : blocksInPage) {
-		uint32_t start, size;
-		blocks_[i].GetRange(start, size);
-		if (start == em_address) {
+		if (blocks_[i].GetOriginalStart() == em_address) {
 			best = i;
 			if (blocks_[i].IsValid()) {
 				return i;
@@ -435,70 +706,126 @@ int IRBlockCache::GetBlockNumberFromStartAddress(u32 em_address, bool realBlocks
 	return best;
 }
 
-bool IRBlock::HasOriginalFirstOp() const {
-	return Memory::ReadUnchecked_U32(origAddr_) == origFirstOpcode_.encoding;
-}
-
-bool IRBlock::RestoreOriginalFirstOp(int number) {
-	const u32 emuhack = MIPS_EMUHACK_OPCODE | number;
-	if (Memory::ReadUnchecked_U32(origAddr_) == emuhack) {
-		Memory::Write_Opcode_JIT(origAddr_, origFirstOpcode_);
-		return true;
-	}
-	return false;
-}
-
-void IRBlock::Finalize(int number) {
-	// Check it wasn't invalidated, in case this is after preload.
-	// TODO: Allow reusing blocks when the code matches hash_ again, instead.
-	if (origAddr_) {
-		origFirstOpcode_ = Memory::Read_Opcode_JIT(origAddr_);
-		MIPSOpcode opcode = MIPSOpcode(MIPS_EMUHACK_OPCODE | number);
-		Memory::Write_Opcode_JIT(origAddr_, opcode);
+void JitBlock::Finalize(const Memory::AddressSpace &space) {
+	// Check it wasn't invalidated.
+	if (origAddr_ && space.IsValid4AlignedAddress(origAddr_)) {
+		origFirstOpcode_ = space.IsMediaEngine() ? MIPSOpcode(space.ReadUnchecked_U32(origAddr_)) : Memory::ReadUnchecked_Instruction(origAddr_);
+		_dbg_assert_(entry_ != 0);
+		space.WriteBlockShadow(origAddr_, entry_);
+	} else {
+		WARN_LOG(Log::JIT, "Finalizing invalid block (entry: %d)", entry_);
 	}
 }
 
-void IRBlock::Destroy(int number) {
-	if (origAddr_) {
-		MIPSOpcode opcode = MIPSOpcode(MIPS_EMUHACK_OPCODE | number);
-		if (Memory::ReadUnchecked_U32(origAddr_) == opcode.encoding)
-			Memory::Write_Opcode_JIT(origAddr_, origFirstOpcode_);
-
+void JitBlock::Destroy(const Memory::AddressSpace &space) {
+	if (origAddr_ && space.IsValid4AlignedAddress(origAddr_)) {
+		// A block at a mirror may have taken over the entry, leave that alone. One that never got an
+		// entry (the arena or code space filled while compiling it) has nothing in the shadow.
+		if (entry_ != 0)
+			space.ClearBlockShadow(origAddr_, entry_);
 		// Let's mark this invalid so we don't try to clear it again.
 		origAddr_ = 0;
 	}
 }
 
-u64 IRBlock::CalculateHash() const {
-	if (origAddr_) {
-		// This is unfortunate.  In case of emuhacks, we have to make a copy.
-		std::vector<u32> buffer;
-		buffer.resize(origSize_ / 4);
-		size_t pos = 0;
-		for (u32 off = 0; off < origSize_; off += 4) {
-			// Let's actually hash the replacement, if any.
-			MIPSOpcode instr = Memory::ReadUnchecked_Instruction(origAddr_ + off, false);
-			buffer[pos++] = instr.encoding;
-		}
-
-		return XXH3_64bits(&buffer[0], origSize_);
+u64 JitBlock::CalculateHash() const {
+	if (origAddr_ && Memory::IsValidRange(origAddr_, origSize_)) {
+		return XXH3_64bits(Memory::GetPointerUnchecked(origAddr_), origSize_);
 	}
-
 	return 0;
 }
 
-bool IRBlock::OverlapsRange(u32 addr, u32 size) const {
+bool JitBlock::OverlapsRange(u32 addr, u32 size) const {
 	addr &= 0x3FFFFFFF;
 	u32 origAddr = origAddr_ & 0x3FFFFFFF;
 	return addr + size > origAddr && addr < origAddr + origSize_;
 }
 
-MIPSOpcode IRJit::GetOriginalOp(MIPSOpcode op) {
-	IRBlock *b = blocks_.GetBlock(op.encoding & 0xFFFFFF);
-	if (b) {
-		return b->GetOriginalFirstOp();
+int IRJitDebugInterface::GetNumBlocks() const {
+	return jit_.blocks_.GetNumBlocks();
+}
+
+int IRJitDebugInterface::GetBlockNumberFromStartAddress(u32 em_address) const {
+	return jit_.blocks_.GetBlockNumberFromStartAddress(em_address);
+}
+
+bool IRJitDebugInterface::IsValidBlock(int blockNum) const {
+	return jit_.blocks_.IsValidBlock(blockNum);
+}
+
+JitBlockMeta IRJitDebugInterface::GetBlockMeta(int blockNum) const {
+	JitBlockMeta meta{};
+	if (IsValidBlock(blockNum)) {
+		meta.valid = true;
+		jit_.blocks_.GetBlock(blockNum)->GetRange(&meta.addr, &meta.sizeInBytes);
 	}
-	return op;
+	return meta;
+}
+
+JitBlockProfileStats IRJitDebugInterface::GetBlockProfileStats(int blockNum) const {
+	return jit_.blocks_.GetBlock(blockNum)->profileStats_;
+}
+
+bool IRJitDebugInterface::SupportsProfiling() const {
+	return jit_.HasBlockProfile();
+}
+
+JitBlockDebugInfo IRJitDebugInterface::GetBlockDebugInfo(int blockNum) const {
+	const JitBlock &block = *jit_.blocks_.GetBlock(blockNum);
+	JitBlockDebugInfo debugInfo{};
+	uint32_t start, size;
+	block.GetRange(&start, &size);
+	debugInfo.originalAddress = start;  // TODO
+	if (!Memory::IsValid4AlignedAddress(start)) {
+		return debugInfo;
+	}
+
+	debugInfo.origDisasm.reserve(size / 4);
+	for (u32 addr = start; addr < start + size; addr += 4) {
+		char temp[256];
+		MIPSDisAsm(Replacement_GetDisplayOp(addr), addr, temp, sizeof(temp), true);
+		debugInfo.origDisasm.push_back(temp);
+	}
+
+	std::vector<IRInst> instructions;
+	jit_.GetBlockInstructions(block, instructions);
+	debugInfo.irDisasm.reserve(instructions.size());
+	for (const IRInst &inst : instructions) {
+		char buffer[256];
+		DisassembleIR(buffer, sizeof(buffer), inst);
+		debugInfo.irDisasm.push_back(buffer);
+	}
+
+	jit_.GetBlockTargetDisasm(blockNum, debugInfo.targetDisasm);
+	return debugInfo;
+}
+
+void IRJitDebugInterface::ComputeStats(BlockCacheStats &bcStats) const {
+	double totalBloat = 0.0;
+	double maxBloat = 0.0;
+	double minBloat = 1000000000.0;
+	const int numBlocks = GetNumBlocks();
+	for (int i = 0; i < numBlocks; ++i) {
+		const int codeSize = jit_.GetBlockCodeSize(i);
+		if (codeSize == 0)
+			continue;
+		u32 origAddr, mipsBytes;
+		jit_.blocks_.GetBlock(i)->GetRange(&origAddr, &mipsBytes);
+		double bloat = (double)codeSize / (double)mipsBytes;
+		if (bloat < minBloat) {
+			minBloat = bloat;
+			bcStats.minBloatBlock = origAddr;
+		}
+		if (bloat > maxBloat) {
+			maxBloat = bloat;
+			bcStats.maxBloatBlock = origAddr;
+		}
+		totalBloat += bloat;
+	}
+	bcStats.numBlocks = numBlocks;
+	bcStats.minBloat = (float)minBloat;
+	bcStats.maxBloat = (float)maxBloat;
+	bcStats.avgBloat = (float)(totalBloat / (double)numBlocks);
 }
 
 }  // namespace MIPSComp

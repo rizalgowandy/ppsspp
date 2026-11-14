@@ -26,12 +26,28 @@
 #include "Core/HLE/sceSfmt19937.h"
 
 
+// The whole state struct is in game memory.
+static bool ValidSfmt(u32 sfmt) {
+	return Memory::IsValidRange(sfmt, sizeof(sfmt_t));
+}
+
+// In 64 bits, since count * size wraps (and the end can straddle a gap between regions).
+static bool ValidArray(u32 addr, int count, int elemSize) {
+	return count > 0 && (u64)count * elemSize <= 0xFFFFFFFF && Memory::IsValidRange(addr, (u32)((u64)count * elemSize));
+}
+
+// The library indexes its state with idx, which lives in game memory.
+static bool ValidSfmtIndex(u32 sfmt) {
+	const sfmt_t *psfmt = (const sfmt_t *)Memory::GetPointerUnchecked(sfmt);
+	return psfmt->idx >= 0 && psfmt->idx <= SFMT_N32;
+}
+
 static int sceSfmt19937InitGenRand(u32 sfmt, u32 seed) {
-	if (!Memory::IsValidAddress(sfmt)) {
-		ERROR_LOG(HLE, "sceSfmt19937InitGenRand(sfmt=%08x, seed=%08x) - bad address(es)", sfmt, seed);
+	if (!ValidSfmt(sfmt)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937InitGenRand(sfmt=%08x, seed=%08x) - bad address(es)", sfmt, seed);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937InitGenRand(sfmt=%08x, seed=%08x)", sfmt, seed);
+	INFO_LOG(Log::HLE, "sceSfmt19937InitGenRand(sfmt=%08x, seed=%08x)", sfmt, seed);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	sfmt_init_gen_rand(psfmt, seed);
@@ -40,11 +56,11 @@ static int sceSfmt19937InitGenRand(u32 sfmt, u32 seed) {
 }
 
 static int sceSfmt19937InitByArray(u32 sfmt, u32 seeds, int seedslen) {
-	if (!Memory::IsValidAddress(sfmt) || !Memory::IsValidAddress(seeds) || !Memory::IsValidAddress(seeds + 4 * (seedslen - 1))) {
-		ERROR_LOG(HLE, "sceSfmt19937InitByArray(sfmt=%08x, seeds=%08x, seedslen=%08x)  - bad address(es)", sfmt, seeds, seedslen);
+	if (!ValidSfmt(sfmt) || !ValidArray(seeds, seedslen, 4)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937InitByArray(sfmt=%08x, seeds=%08x, seedslen=%08x)  - bad address(es)", sfmt, seeds, seedslen);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937InitByArray(sfmt=%08x, seeds=%08x, seedslen=%08x)", sfmt, seeds, seedslen);
+	INFO_LOG(Log::HLE, "sceSfmt19937InitByArray(sfmt=%08x, seeds=%08x, seedslen=%08x)", sfmt, seeds, seedslen);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	uint32_t *pseeds = (uint32_t *)Memory::GetPointerUnchecked(seeds);
@@ -54,11 +70,11 @@ static int sceSfmt19937InitByArray(u32 sfmt, u32 seeds, int seedslen) {
 }
 
 static u32 sceSfmt19937GenRand32(u32 sfmt) {
-	if (!Memory::IsValidAddress(sfmt)) {
-		ERROR_LOG(HLE, "sceSfmt19937GenRand32(sfmt=%08x)  - bad address(es)", sfmt);
+	if (!ValidSfmt(sfmt) || !ValidSfmtIndex(sfmt)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937GenRand32(sfmt=%08x)  - bad address(es)", sfmt);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937GenRand32(sfmt=%08x)", sfmt);
+	INFO_LOG(Log::HLE, "sceSfmt19937GenRand32(sfmt=%08x)", sfmt);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	u32 ret = sfmt_genrand_uint32(psfmt);
@@ -67,11 +83,11 @@ static u32 sceSfmt19937GenRand32(u32 sfmt) {
 }
 
 static u64 sceSfmt19937GenRand64(u32 sfmt) {
-	if (!Memory::IsValidAddress(sfmt)) {
-		ERROR_LOG(HLE, "sceSfmt19937GenRand64(sfmt=%08x)  - bad address(es)", sfmt);
+	if (!ValidSfmt(sfmt) || !ValidSfmtIndex(sfmt)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937GenRand64(sfmt=%08x)  - bad address(es)", sfmt);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937GenRand64(sfmt=%08x)", sfmt);
+	INFO_LOG(Log::HLE, "sceSfmt19937GenRand64(sfmt=%08x)", sfmt);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	u64 ret = sfmt_genrand_uint64(psfmt);
@@ -80,11 +96,12 @@ static u64 sceSfmt19937GenRand64(u32 sfmt) {
 }
 
 static int sceSfmt19937FillArray32(u32 sfmt, u32 array, int arraylen) {
-	if (!Memory::IsValidAddress(sfmt) || !Memory::IsValidAddress(array) || !Memory::IsValidAddress(array + 4 * (arraylen - 1))) {
-		ERROR_LOG(HLE, "sceSfmt19937FillArray32(sfmt=%08x, ar=%08x, arlen=%08x)  - bad address(es)", sfmt, array, arraylen);
+	// The library fills whole blocks, and needs at least a state's worth of them.
+	if (arraylen < SFMT_N32 || (arraylen % 4) != 0 || !ValidSfmt(sfmt) || !ValidArray(array, arraylen, 4)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937FillArray32(sfmt=%08x, ar=%08x, arlen=%08x)  - bad address(es)", sfmt, array, arraylen);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937FillArray32(sfmt=%08x, ar=%08x, arlen=%08x)", sfmt, array, arraylen);
+	INFO_LOG(Log::HLE, "sceSfmt19937FillArray32(sfmt=%08x, ar=%08x, arlen=%08x)", sfmt, array, arraylen);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	uint32_t *parray = (uint32_t *)Memory::GetPointerUnchecked(array);
@@ -94,11 +111,12 @@ static int sceSfmt19937FillArray32(u32 sfmt, u32 array, int arraylen) {
 }
 
 static int sceSfmt19937FillArray64(u32 sfmt, u32 array, int arraylen) {
-	if (!Memory::IsValidAddress(sfmt) || !Memory::IsValidAddress(array) || !Memory::IsValidAddress(array + 8 * (arraylen - 1))) {
-		ERROR_LOG(HLE, "sceSfmt19937FillArray64(sfmt=%08x, ar=%08x, arlen=%08x)  - bad address(es)", sfmt, array, arraylen);
+	// The library fills whole blocks, and needs at least a state's worth of them.
+	if (arraylen < SFMT_N64 || (arraylen % 2) != 0 || !ValidSfmt(sfmt) || !ValidArray(array, arraylen, 8)) {
+		ERROR_LOG(Log::HLE, "sceSfmt19937FillArray64(sfmt=%08x, ar=%08x, arlen=%08x)  - bad address(es)", sfmt, array, arraylen);
 		return -1;
 	}
-	INFO_LOG(HLE, "sceSfmt19937FillArray64(sfmt=%08x, ar=%08x, arlen=%08x)", sfmt, array, arraylen);
+	INFO_LOG(Log::HLE, "sceSfmt19937FillArray64(sfmt=%08x, ar=%08x, arlen=%08x)", sfmt, array, arraylen);
 
 	sfmt_t *psfmt = (sfmt_t *)Memory::GetPointerUnchecked(sfmt);
 	uint64_t *parray = (uint64_t *)Memory::GetPointerUnchecked(array);
@@ -119,5 +137,5 @@ const HLEFunction sceSfmt19937[] =
 
 void Register_sceSfmt19937()
 {
-	RegisterModule("sceSfmt19937", ARRAY_SIZE(sceSfmt19937), sceSfmt19937);
+	RegisterHLEModule("sceSfmt19937", ARRAY_SIZE(sceSfmt19937), sceSfmt19937);
 }

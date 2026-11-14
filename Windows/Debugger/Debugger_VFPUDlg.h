@@ -9,17 +9,24 @@ public:
 	CVFPUDlg(HINSTANCE _hInstance, HWND _hParent, DebugInterface *cpu_);
 	~CVFPUDlg();
 
-	void Goto(u32 addr);
-	void Update();
-	void Size();
+	void Update() override;
 
 private:
-	int index;
+	void ComputeLayout();
+	void Paint(HDC hdc);
+	BOOL DlgProc(UINT message, WPARAM wParam, LPARAM lParam) override;
+
+	// In pixels, derived from the font.
+	struct Layout {
+		int rowHeight;
+		int columnWidth;
+		int xStart;
+		int yStart;
+		int pad;
+	};
+
 	DebugInterface *cpu;
 	HFONT font;
 	int mode;
-	BOOL DlgProc(UINT message, WPARAM wParam, LPARAM lParam);
+	Layout layout_{};
 };
-
-
-extern CVFPUDlg *vfpudlg;

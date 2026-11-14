@@ -15,23 +15,29 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <mutex>
+#include <vector>
 
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
-#include "Core/HLE/HLE.h"
-#include "Core/HLE/FunctionWrappers.h"
-#include "Core/MIPS/MIPS.h"
+#include "Common/Math/math_util.h"
 #include "Core/CoreTiming.h"
-#include "Core/MemMapHelpers.h"
-#include "Core/Replay.h"
-#include "Core/Util/AudioFormat.h"  // for clamp_u8
+#include "Core/HLE/HLE.h"
+#include "Core/HLE/ErrorCodes.h"
+#include "Core/HLE/FunctionWrappers.h"
 #include "Core/HLE/sceCtrl.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceKernelThread.h"
 #include "Core/HLE/sceKernelInterrupt.h"
+#include "Core/HW/Display.h"
+#include "Core/System.h"
+#include "Core/MemMapHelpers.h"
+#include "Core/MIPS/MIPS.h"
+#include "Core/Replay.h"
+#include "Core/Util/AudioFormat.h"  // for clamp_u8
 
 /* Index for the two analog directions */
 #define CTRL_ANALOG_X   0
@@ -101,6 +107,16 @@ static u8 vibrationRightDropout = 160;
 // Not related to sceCtrl*RapidFire(), although it may do the same thing.
 static bool emuRapidFire = false;
 static u32 emuRapidFireFrames = 0;
+static bool emuRapidFireToggle = true;
+static u32 emuRapidFireInterval = 5;
+
+// Set while a system overlay (the HOME button's quit screen) owns the controls: the game then reads
+// no buttons and centered sticks, as impose does on a PSP. Host-side peeks still see the real state.
+static std::atomic<bool> gameInputBlocked{ false };
+
+// Buttons pressed since the last sample. A press and release that both land between two samples
+// would otherwise never be seen by the game. Guarded by ctrlMutex.
+static u32 ctrlUnsampledPresses = 0;
 
 // These buttons are not affected by rapid fire (neither is analog.)
 const u32 CTRL_EMU_RAPIDFIRE_MASK = CTRL_UP | CTRL_DOWN | CTRL_LEFT | CTRL_RIGHT;
@@ -110,14 +126,34 @@ static void __CtrlUpdateLatch()
 	std::lock_guard<std::mutex> guard(ctrlMutex);
 	u64 t = CoreTiming::GetGlobalTimeUs();
 
-	u32 buttons = ctrlCurrent.buttons;
-	if (emuRapidFire && (emuRapidFireFrames % 10) < 5)
+	u32 buttons = ctrlCurrent.buttons | ctrlUnsampledPresses;
+	ctrlUnsampledPresses = 0;
+	if (emuRapidFire && emuRapidFireToggle)
 		buttons &= CTRL_EMU_RAPIDFIRE_MASK;
 
 	ReplayApplyCtrl(buttons, ctrlCurrent.analog, t);
 
 	// Copy in the current data to the current buffer.
 	ctrlBufs[ctrlBuf] = ctrlCurrent;
+
+	if (PSP_CoreParameter().compat.flags().DaxterRotatedAnalogStick) {
+		// For some reason, Daxter rotates the analog input. See #17015
+		float angle = (15.0f / 360.0f) * (2.0f * M_PI);
+		float cosAngle = cosf(angle);
+		float sinAngle = sinf(angle);
+		float x = ctrlBufs[ctrlBuf].analog[0][0] - 128;
+		float y = ctrlBufs[ctrlBuf].analog[0][1] - 128;
+		float rX = x * cosAngle - y * sinAngle;
+		float rY = x * sinAngle + y * cosAngle;
+		ctrlBufs[ctrlBuf].analog[0][0] = (u8)Clamp(rX + 128, 0.0f, 255.0f);
+		ctrlBufs[ctrlBuf].analog[0][1] = (u8)Clamp(rY + 128, 0.0f, 255.0f);
+	}
+
+	if (gameInputBlocked) {
+		buttons = 0;
+		memset(ctrlBufs[ctrlBuf].analog, CTRL_ANALOG_CENTER, sizeof(ctrlBufs[ctrlBuf].analog));
+	}
+
 	ctrlBufs[ctrlBuf].buttons = buttons;
 
 	u32 changed = buttons ^ ctrlOldButtons;
@@ -150,11 +186,32 @@ static int __CtrlResetLatch()
 	return oldBufs;
 }
 
+void __CtrlSetGameInputBlocked(bool blocked) {
+	gameInputBlocked = blocked;
+}
+
+bool __CtrlIsGameInputBlocked() {
+	return gameInputBlocked;
+}
+
 u32 __CtrlPeekButtons()
 {
 	std::lock_guard<std::mutex> guard(ctrlMutex);
 
 	return ctrlCurrent.buttons;
+}
+
+u32 __CtrlPeekButtonsVisual()
+{
+	u32 buttons;
+	{
+		std::lock_guard<std::mutex> guard(ctrlMutex);
+		buttons = ctrlCurrent.buttons;
+	}
+
+	if (emuRapidFire && emuRapidFireToggle)
+		buttons &= CTRL_EMU_RAPIDFIRE_MASK;
+	return buttons;
 }
 
 void __CtrlPeekAnalog(int stick, float *x, float *y)
@@ -173,38 +230,97 @@ u32 __CtrlReadLatch()
 	return ret;
 }
 
-// Functions so that the rest of the emulator can control what the sceCtrl interface should return
-// to the game:
+// Presses held for a number of vblank samples (the debugger's input.buttons.press). Counted down on
+// the emulator thread at each vblank, so how long a press lasts doesn't depend on how fast the
+// emulator runs. Guarded by ctrlMutex; not saved.
+struct TimedPress {
+	int id;
+	u32 buttons;
+	int samplesLeft;
+};
+static std::vector<TimedPress> timedPresses;
+static int nextTimedPressId = 1;
 
-void __CtrlButtonDown(u32 buttonBit)
-{
+int __CtrlPressFor(u32 buttons, int vblanks) {
 	std::lock_guard<std::mutex> guard(ctrlMutex);
-	ctrlCurrent.buttons |= buttonBit;
+	buttons &= CTRL_MASK_USER;
+	ctrlCurrent.buttons |= buttons;
+	const int id = nextTimedPressId++;
+	timedPresses.push_back(TimedPress{ id, buttons, std::max(vblanks, 1) });
+	return id;
 }
 
-void __CtrlButtonUp(u32 buttonBit)
-{
+bool __CtrlPressActive(int id) {
 	std::lock_guard<std::mutex> guard(ctrlMutex);
-	ctrlCurrent.buttons &= ~buttonBit;
+	for (const TimedPress &press : timedPresses) {
+		if (press.id == id) {
+			return true;
+		}
+	}
+	return false;
 }
 
-void __CtrlSetAnalogX(float x, int stick)
-{
-	u8 scaled = clamp_u8((int)ceilf(x * 127.5f + 127.5f));
+// After the vblank's sample, so a press of N vblanks is seen by N samples.
+static void __CtrlUpdateTimedPresses() {
 	std::lock_guard<std::mutex> guard(ctrlMutex);
-	ctrlCurrent.analog[stick][CTRL_ANALOG_X] = scaled;
+	if (timedPresses.empty()) {
+		return;
+	}
+	u32 released = 0;
+	for (TimedPress &press : timedPresses) {
+		if (--press.samplesLeft <= 0) {
+			released |= press.buttons;
+		}
+	}
+	timedPresses.erase(std::remove_if(timedPresses.begin(), timedPresses.end(), [](const TimedPress &press) {
+		return press.samplesLeft <= 0;
+	}), timedPresses.end());
+	// Unless another press still holds them.
+	for (const TimedPress &press : timedPresses) {
+		released &= ~press.buttons;
+	}
+	ctrlCurrent.buttons &= ~released;
 }
 
-void __CtrlSetAnalogY(float y, int stick)
+void __CtrlUpdateButtons(u32 bitsToSet, u32 bitsToClear)
 {
-	u8 scaled = clamp_u8((int)ceilf(-y * 127.5f + 127.5f));
+	bitsToClear &= CTRL_MASK_USER;
+	bitsToSet &= CTRL_MASK_USER;
+
 	std::lock_guard<std::mutex> guard(ctrlMutex);
-	ctrlCurrent.analog[stick][CTRL_ANALOG_Y] = scaled;
+	// There's no atomic operation for this, so mutex it is.
+	ctrlUnsampledPresses |= bitsToSet & ~ctrlCurrent.buttons;
+	ctrlCurrent.buttons =(ctrlCurrent.buttons & ~bitsToClear) | bitsToSet;
 }
 
-void __CtrlSetRapidFire(bool state)
+void __CtrlSetAnalogXY(int stick, float x, float y)
 {
+	u8 scaledX = clamp_u8((int)ceilf(x * 127.5f + 127.5f));
+	// TODO: We might have too many negations of Y...
+	u8 scaledY = clamp_u8((int)ceilf(-y * 127.5f + 127.5f));
+
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	ctrlCurrent.analog[stick][CTRL_ANALOG_X] = scaledX;
+	ctrlCurrent.analog[stick][CTRL_ANALOG_Y] = scaledY;
+}
+
+// not making XY to use these due to mutex guard usage
+void __CtrlSetAnalogX(int stick, float x) {
+	u8 scaledX = clamp_u8((int)ceilf(x * 127.5f + 127.5f));
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	ctrlCurrent.analog[stick][CTRL_ANALOG_X] = scaledX;
+}
+
+void __CtrlSetAnalogY(int stick, float y) {
+	u8 scaledY = clamp_u8((int)ceilf(-y * 127.5f + 127.5f));
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	ctrlCurrent.analog[stick][CTRL_ANALOG_Y] = scaledY;
+}
+
+void __CtrlSetRapidFire(bool state, int interval) {
 	emuRapidFire = state;
+	emuRapidFireToggle = true;
+	emuRapidFireInterval = interval;
 }
 
 bool __CtrlGetRapidFire()
@@ -291,9 +407,12 @@ retry:
 	}
 }
 
-static void __CtrlVblank()
-{
+void __CtrlVblank() {
 	emuRapidFireFrames++;
+	if (emuRapidFireFrames >= emuRapidFireInterval) {
+		emuRapidFireFrames = 0;
+		emuRapidFireToggle = !emuRapidFireToggle;
+	}
 
 	// Reduce gamepad Vibration by set % each frame
 	leftVibration *= (float)vibrationLeftDropout / 256.0f;
@@ -302,6 +421,7 @@ static void __CtrlVblank()
 	// This always runs, so make sure we're in vblank mode.
 	if (ctrlCycle == 0)
 		__CtrlDoSample();
+	__CtrlUpdateTimedPresses();
 }
 
 static void __CtrlTimerUpdate(u64 userdata, int cyclesLate)
@@ -314,10 +434,8 @@ static void __CtrlTimerUpdate(u64 userdata, int cyclesLate)
 	__CtrlDoSample();
 }
 
-void __CtrlInit()
-{
+void __CtrlInit() {
 	ctrlTimer = CoreTiming::RegisterEvent("CtrlSampleTimer", __CtrlTimerUpdate);
-	__DisplayListenVblank(__CtrlVblank);
 
 	ctrlIdleReset = -1;
 	ctrlIdleBack = -1;
@@ -335,6 +453,8 @@ void __CtrlInit()
 	// Start with everything released.
 	latch.btnRelease = 0xffffffff;
 
+	gameInputBlocked = false;
+	ctrlUnsampledPresses = 0;
 	memset(&ctrlCurrent, 0, sizeof(ctrlCurrent));
 	memset(ctrlCurrent.analog, CTRL_ANALOG_CENTER, sizeof(ctrlCurrent.analog));
 	analogEnabled = false;
@@ -351,6 +471,9 @@ void __CtrlDoState(PointerWrap &p)
 	if (!s)
 		return;
 
+	// Host input from before the load shouldn't show up in the loaded state.
+	ctrlUnsampledPresses = 0;
+
 	Do(p, analogEnabled);
 	Do(p, ctrlLatchBufs);
 	Do(p, ctrlOldButtons);
@@ -362,6 +485,13 @@ void __CtrlDoState(PointerWrap &p)
 	}
 	Do(p, ctrlBuf);
 	Do(p, ctrlBufRead);
+	if (ctrlBuf >= NUM_CTRL_BUFFERS || ctrlBufRead >= NUM_CTRL_BUFFERS) {
+		ERROR_LOG(Log::sceCtrl, "Savestate failure: invalid ctrl buffer index");
+		p.SetError(p.ERROR_FAILURE);
+		ctrlBuf = 0;
+		ctrlBufRead = 0;
+		return;
+	}
 	Do(p, latch);
 	if (s == 1) {
 		dialogBtnMake = 0;
@@ -384,16 +514,14 @@ void __CtrlDoState(PointerWrap &p)
 void __CtrlShutdown()
 {
 	waitingThreads.clear();
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	timedPresses.clear();
 }
 
 static u32 sceCtrlSetSamplingCycle(u32 cycle)
 {
-	DEBUG_LOG(SCECTRL, "sceCtrlSetSamplingCycle(%u)", cycle);
-
-	if ((cycle > 0 && cycle < 5555) || cycle > 20000)
-	{
-		WARN_LOG(SCECTRL, "SCE_KERNEL_ERROR_INVALID_VALUE=sceCtrlSetSamplingCycle(%u)", cycle);
-		return SCE_KERNEL_ERROR_INVALID_VALUE;
+	if ((cycle > 0 && cycle < 5555) || cycle > 20000) {
+		return hleLogWarning(Log::sceCtrl, SCE_KERNEL_ERROR_INVALID_VALUE);
 	}
 
 	u32 prev = ctrlCycle;
@@ -404,118 +532,112 @@ static u32 sceCtrlSetSamplingCycle(u32 cycle)
 	if (cycle > 0)
 		CoreTiming::ScheduleEvent(usToCycles(ctrlCycle), ctrlTimer, 0);
 
-	return prev;
+	return hleLogDebug(Log::sceCtrl, prev);
 }
 
 static int sceCtrlGetSamplingCycle(u32 cyclePtr)
 {
-	DEBUG_LOG(SCECTRL, "sceCtrlGetSamplingCycle(%08x)", cyclePtr);
 	if (Memory::IsValidAddress(cyclePtr))
-		Memory::Write_U32(ctrlCycle, cyclePtr);
-	return 0;
+		Memory::WriteUnchecked_U32(ctrlCycle, cyclePtr);
+	return hleLogDebug(Log::sceCtrl, 0);
 }
 
 static u32 sceCtrlSetSamplingMode(u32 mode)
 {
 	u32 retVal = 0;
-
-	DEBUG_LOG(SCECTRL, "sceCtrlSetSamplingMode(%i)", mode);
 	if (mode > 1)
-		return SCE_KERNEL_ERROR_INVALID_MODE;
+		return hleLogError(Log::sceCtrl, SCE_KERNEL_ERROR_INVALID_MODE);
 
 	retVal = analogEnabled == true ? CTRL_MODE_ANALOG : CTRL_MODE_DIGITAL;
 	analogEnabled = mode == CTRL_MODE_ANALOG ? true : false;
-	return retVal;
+	return hleLogDebug(Log::sceCtrl, retVal);
 }
 
 static int sceCtrlGetSamplingMode(u32 modePtr)
 {
 	u32 retVal = analogEnabled == true ? CTRL_MODE_ANALOG : CTRL_MODE_DIGITAL;
-	DEBUG_LOG(SCECTRL, "%d=sceCtrlGetSamplingMode(%08x)", retVal, modePtr);
 
 	if (Memory::IsValidAddress(modePtr))
-		Memory::Write_U32(retVal, modePtr);
+		Memory::WriteUnchecked_U32(retVal, modePtr);
 
-	return 0;
+	return hleLogDebug(Log::sceCtrl, 0);
+}
+
+// Hides buttons from user mode readers, for kernel code that takes them over (Daedalus, for the
+// system buttons, which games don't get here anyway).
+static int sceCtrlSetButtonIntercept(u32 buttons, int intercept) {
+	return hleLogDebug(Log::sceCtrl, 0);
 }
 
 static int sceCtrlSetIdleCancelThreshold(int idleReset, int idleBack)
 {
-	DEBUG_LOG(SCECTRL, "FAKE sceCtrlSetIdleCancelThreshold(%d, %d)", idleReset, idleBack);
-
 	if (idleReset < -1 || idleBack < -1 || idleReset > 128 || idleBack > 128)
-		return SCE_KERNEL_ERROR_INVALID_VALUE;
+		return hleLogError(Log::sceCtrl, SCE_KERNEL_ERROR_INVALID_VALUE);
 
 	ctrlIdleReset = idleReset;
 	ctrlIdleBack = idleBack;
-	return 0;
+	return hleLogDebug(Log::sceCtrl, 0);
 }
 
 static int sceCtrlGetIdleCancelThreshold(u32 idleResetPtr, u32 idleBackPtr)
 {
-	DEBUG_LOG(SCECTRL, "sceCtrlSetIdleCancelThreshold(%08x, %08x)", idleResetPtr, idleBackPtr);
-
-	if (idleResetPtr && !Memory::IsValidAddress(idleResetPtr))
-		return SCE_KERNEL_ERROR_PRIV_REQUIRED;
-	if (idleBackPtr && !Memory::IsValidAddress(idleBackPtr))
-		return SCE_KERNEL_ERROR_PRIV_REQUIRED;
+	if (idleResetPtr && !Memory::IsValid4AlignedAddress(idleResetPtr))
+		return hleLogError(Log::sceCtrl, SCE_KERNEL_ERROR_PRIV_REQUIRED);
+	if (idleBackPtr && !Memory::IsValid4AlignedAddress(idleBackPtr))
+		return hleLogError(Log::sceCtrl, SCE_KERNEL_ERROR_PRIV_REQUIRED);
 
 	if (idleResetPtr)
-		Memory::Write_U32(ctrlIdleReset, idleResetPtr);
+		Memory::WriteUnchecked_U32(ctrlIdleReset, idleResetPtr);
 	if (idleBackPtr)
-		Memory::Write_U32(ctrlIdleBack, idleBackPtr);
+		Memory::WriteUnchecked_U32(ctrlIdleBack, idleBackPtr);
 
-	return 0;
+	return hleLogDebug(Log::sceCtrl, 0);
 }
 
-static int sceCtrlReadBufferPositive(u32 ctrlDataPtr, u32 nBufs)
+int sceCtrlReadBufferPositive(u32 ctrlDataPtr, u32 nBufs)
 {
 	int done = __CtrlReadBuffer(ctrlDataPtr, nBufs, false, false);
 	hleEatCycles(330);
-	if (done != 0)
-	{
-		DEBUG_LOG(SCECTRL, "%d=sceCtrlReadBufferPositive(%08x, %i)", done, ctrlDataPtr, nBufs);
-	}
-	else
-	{
+	if (done != 0) {
+		return hleLogDebug(Log::sceCtrl, done);
+	} else {
 		waitingThreads.push_back(__KernelGetCurThread());
 		__KernelWaitCurThread(WAITTYPE_CTRL, CTRL_WAIT_POSITIVE, ctrlDataPtr, 0, false, "ctrl buffer waited");
-		DEBUG_LOG(SCECTRL, "sceCtrlReadBufferPositive(%08x, %i) - waiting", ctrlDataPtr, nBufs);
+		return hleLogDebug(Log::sceCtrl, done, "waiting");
 	}
-	return done;
 }
 
 static int sceCtrlReadBufferNegative(u32 ctrlDataPtr, u32 nBufs)
 {
 	int done = __CtrlReadBuffer(ctrlDataPtr, nBufs, true, false);
 	hleEatCycles(330);
-	if (done != 0)
-	{
-		DEBUG_LOG(SCECTRL, "%d=sceCtrlReadBufferNegative(%08x, %i)", done, ctrlDataPtr, nBufs);
+	if (done != 0) {
+		return hleLogDebug(Log::sceCtrl, done);
 	}
 	else
 	{
 		waitingThreads.push_back(__KernelGetCurThread());
 		__KernelWaitCurThread(WAITTYPE_CTRL, CTRL_WAIT_NEGATIVE, ctrlDataPtr, 0, false, "ctrl buffer waited");
-		DEBUG_LOG(SCECTRL, "sceCtrlReadBufferNegative(%08x, %i) - waiting", ctrlDataPtr, nBufs);
+		return hleLogDebug(Log::sceCtrl, done, "waiting");
 	}
-	return done;
 }
 
 static int sceCtrlPeekBufferPositive(u32 ctrlDataPtr, u32 nBufs)
 {
 	int done = __CtrlReadBuffer(ctrlDataPtr, nBufs, false, true);
-	DEBUG_LOG(SCECTRL, "%d=sceCtrlPeekBufferPositive(%08x, %i)", done, ctrlDataPtr, nBufs);
-	hleEatCycles(330);
-	return done;
+	// ~0.2us more for each sample copied: 15us for 64 on hardware.
+	hleEatCycles(330 + 45 * std::max(done, 0));
+	// Some homebrew call this in a tight loop - so VERBOSE it is.
+	return hleLogVerbose(Log::sceCtrl, done);
 }
 
 static int sceCtrlPeekBufferNegative(u32 ctrlDataPtr, u32 nBufs)
 {
 	int done = __CtrlReadBuffer(ctrlDataPtr, nBufs, true, true);
-	DEBUG_LOG(SCECTRL, "%d=sceCtrlPeekBufferNegative(%08x, %i)", done, ctrlDataPtr, nBufs);
-	hleEatCycles(330);
-	return done;
+	// ~0.2us more for each sample copied: 15us for 64 on hardware.
+	hleEatCycles(330 + 45 * std::max(done, 0));
+	// Some homebrew call this in a tight loop - so VERBOSE it is.
+	return hleLogVerbose(Log::sceCtrl, done);
 }
 
 static void __CtrlWriteUserLatch(CtrlLatch *userLatch, int bufs) {
@@ -533,7 +655,7 @@ static u32 sceCtrlPeekLatch(u32 latchDataPtr) {
 	if (userLatch.IsValid()) {
 		__CtrlWriteUserLatch(userLatch, ctrlLatchBufs);
 	}
-	return hleLogSuccessI(SCECTRL, ctrlLatchBufs);
+	return hleLogDebug(Log::sceCtrl, ctrlLatchBufs);
 }
 
 static u32 sceCtrlReadLatch(u32 latchDataPtr) {
@@ -541,7 +663,7 @@ static u32 sceCtrlReadLatch(u32 latchDataPtr) {
 	if (userLatch.IsValid()) {
 		__CtrlWriteUserLatch(userLatch, ctrlLatchBufs);
 	}
-	return hleLogSuccessI(SCECTRL, __CtrlResetLatch());
+	return hleLogDebug(Log::sceCtrl, __CtrlResetLatch());
 }
 
 static const HLEFunction sceCtrl[] =
@@ -563,24 +685,41 @@ static const HLEFunction sceCtrl[] =
 	{0X6841BE1A, nullptr,                                  "sceCtrlSetRapidFire",              '?', ""  },
 	{0XA7144800, &WrapI_II<sceCtrlSetIdleCancelThreshold>, "sceCtrlSetIdleCancelThreshold",    'i', "ii"},
 	{0X687660FA, &WrapI_UU<sceCtrlGetIdleCancelThreshold>, "sceCtrlGetIdleCancelThreshold",    'i', "xx"},
+	// The "2" variants take a port first: (int port, data, int count).
+	{0X5A36B1C2, nullptr,                                  "sceCtrlPeekBufferPositive2",       '?', ""  },
+	{0X239A6BA7, nullptr,                                  "sceCtrlPeekBufferNegative2",       '?', ""  },
+	{0X1098030B, nullptr,                                  "sceCtrlReadBufferPositive2",       '?', ""  },
+	{0X7C3675AB, nullptr,                                  "sceCtrlReadBufferNegative2",       '?', ""  },
+	// sceCtrl_driver's NID for sceCtrlPeekBufferPositive in 3.71. Imported by NJEMU's SystemButtons.prx
+	// kernel plugin, which picks it when sceKernelDevkitVersion() is 3.71 or newer (#8925).
+	{0XC4AAD55F, &WrapI_UU<sceCtrlPeekBufferPositive>,     "sceCtrlPeekBufferPositive",        'i', "xx"},
+	// sceCtrl_driver NID for sceCtrlReadBufferPositive (firmware 3.71+, per JPCSP).
+	// Imported by translation-patch loaders like CLANNAD's chfont.prx.
+	{0X454455AC, &WrapI_UU<sceCtrlReadBufferPositive>,     "sceCtrlReadBufferPositive",        'i', "xx"},
+	// Driver only.
+	{0X7CA723DC, &WrapI_UI<sceCtrlSetButtonIntercept>,     "sceCtrlSetButtonIntercept",        'i', "xi"},
+	// sceCtrl_driver NIDs in 3.71-3.73's ctrl.prx (at the same addresses as the user exports), which
+	// LightMP3's support.prx imports.
+	{0X28E71A16, &WrapU_U<sceCtrlSetSamplingMode>,         "sceCtrlSetSamplingMode",           'x', "x" },
+	{0X6D74BF08, &WrapU_U<sceCtrlSetSamplingCycle>,        "sceCtrlSetSamplingCycle",          'x', "x" },
 };
 
 void Register_sceCtrl()
 {
-	RegisterModule("sceCtrl", ARRAY_SIZE(sceCtrl), sceCtrl);
+	RegisterHLEModule("sceCtrl", ARRAY_SIZE(sceCtrl), sceCtrl);
 }
 
 void Register_sceCtrl_driver()
 {
-	RegisterModule("sceCtrl_driver", ARRAY_SIZE(sceCtrl), sceCtrl);
+	RegisterHLEModule("sceCtrl_driver", ARRAY_SIZE(sceCtrl), sceCtrl);
 }
 
 u16 sceCtrlGetRightVibration() {
-	return rightVibration;
+	return hleNoLog(rightVibration);
 }
 
 u16 sceCtrlGetLeftVibration() {
-	return leftVibration;
+	return hleNoLog(leftVibration);
 }
 
 namespace SceCtrl {

@@ -15,15 +15,24 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
+#include "Common/Log.h"
+#include "Common/Math/CrossSIMD.h"
+#include "Common/Math/math_util.h"
+#include "Core/Config.h"
+#include "Core/HW/SasAudio.h"
 #include "Core/HW/SasReverb.h"
 #include "Core/Util/AudioFormat.h"
 
-// This is under the assumption that the reverb used in Sas is the same as the PSX SPU reverb.
-
+// The Sas reverb really is the PSX SPU reverb, with some tweaks. The formula below is nocash's:
+//
 // Source: http://problemkaputt.de/psx-spx.htm#spureverbformula
+//
+// The preset constants, though, are the PSP's own and not the PS1's. Six of the nine are the
+// same in both; Room and Echo/Delay are not.
 
 struct SasReverbData {
 	const char *name;
@@ -74,8 +83,9 @@ static const SasReverbData presets[10] = {
 		0x26C0,
 		0x007D,0x005B,0x6D80,0x54B8,(int16_t)0xBED0,0x0000,0x0000,(int16_t)0xBA80,
 		0x5800,0x5300,0x04D6,0x0333,0x03F0,0x0227,0x0374,0x01EF,
-		0x0334,0x01B5,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,
-		0x0000,0x0000,0x01B4,0x0136,0x00B8,0x005C, //(int16_t)0x8000,(int16_t)0x8000,
+		// The diff-side taps used to be zero here, straight from the PS1 table. The PSP has real values.
+		0x0336,0x01B7,0x0335,0x01B6,0x0334,0x01B5,0x0334,0x01B5,
+		0x0334,0x01B5,0x01B4,0x0136,0x00B8,0x005C, //(int16_t)0x8000,(int16_t)0x8000,
 	},
 	{
 		"Studio Small",
@@ -123,22 +133,33 @@ static const SasReverbData presets[10] = {
 		0x1056,0x0AE1,0x0AE0,0x07A2,0x0464,0x0232, //(int16_t)0x8000,(int16_t)0x8000,
 	},
 
+	// Echo and Delay are not really presets: the hardware recomputes mLSAME, mRSAME, mLCOMB1,
+	// dLSAME, mLAPF1, mRAPF1 and vWALL from sceSasRevParam's delay and feedback every time the
+	// preset is (re)loaded - see ApplyParams() below. What's left in the table is the constants
+	// that recompute reads (dAPF1, dAPF2, mRCOMB1, dRSAME, mLAPF2) plus the fields it doesn't
+	// touch. The values below are the PSP's, not the PS1's; the rows here used to be the PS1's,
+	// which have zeros where the hardware has real diff-side taps.
+	//
+	// The stored mLSAME etc. are what the recompute produces at delay 255, but sceSasRevParam
+	// caps delay at 127, and a game that never calls it leaves delay at 0.
 	{
 		"Echo (almost infinite)",
 		0x18040,
-		0x0001,0x0001,0x7FFF,0x7FFF,0x0000,0x0000,0x0000,(int16_t)0xC080,
-		0x0000,0x0000,0x1FFF,0x0FFF,0x1005,0x0005,0x0000,0x0000,
-		0x1005,0x0005,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,
-		0x0000,0x0000,0x1004,0x1002,0x0004,0x0002, //(int16_t)0x8000,(int16_t)0x8000,
+		0x0003,0x0003,0x7FFF,0x7FFF,0x0000,0x0000,0x0000,(int16_t)0x8100,
+		0x0000,0x0000,0x1FFD,0x0FFD,0x1009,0x0009,0x0000,0x0000,
+		0x1009,0x0009,0x1FFF,0x1FFF,0x1FFE,0x1FFE,0x1FFE,0x1FFE,
+		0x1FFE,0x1FFE,0x1008,0x1004,0x0008,0x0004, //(int16_t)0x8000,(int16_t)0x8000,
 	},
 
+	// Identical to Echo apart from vWALL, which is the default feedback: full for Echo, none for
+	// Delay. That single field is the whole difference between "almost infinite" and "one shot".
 	{
 		"Delay (one - shot echo)",
 		0x18040,
-		0x0001,0x0001,0x7FFF,0x7FFF,0x0000,0x0000,0x0000,0x0000,
-		0x0000,0x0000,0x1FFF,0x0FFF,0x1005,0x0005,0x0000,0x0000,
-		0x1005,0x0005,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,
-		0x0000,0x0000,0x1004,0x1002,0x0004,0x0002, //(int16_t)0x8000,(int16_t)0x8000,
+		0x0003,0x0003,0x7FFF,0x7FFF,0x0000,0x0000,0x0000,0x0000,
+		0x0000,0x0000,0x1FFD,0x0FFD,0x1009,0x0009,0x0000,0x0000,
+		0x1009,0x0009,0x1FFF,0x1FFF,0x1FFE,0x1FFE,0x1FFE,0x1FFE,
+		0x1FFE,0x1FFE,0x1008,0x1004,0x0008,0x0004, //(int16_t)0x8000,(int16_t)0x8000,
 	},
 
 	{
@@ -153,28 +174,80 @@ static const SasReverbData presets[10] = {
 
 SasReverb::SasReverb() : preset_(-1), pos_(0) {
 	workspace_ = new int16_t[BUFSIZE];
+	data_ = new SasReverbData{};
+	wet_ = new float[(UPSAMPLE_HISTORY + MAX_INPUT_FRAMES) * 2]();
+	sendEven_ = new float[(UPSAMPLE_HISTORY + MAX_INPUT_FRAMES) * 2]();
+	sendOdd_ = new float[(UPSAMPLE_HISTORY + MAX_INPUT_FRAMES) * 2]();
 }
 
 SasReverb::~SasReverb() {
 	delete[] workspace_;
+	delete data_;
+	delete[] wet_;
+	delete[] sendEven_;
+	delete[] sendOdd_;
 }
 
 const char *SasReverb::GetPresetName(int preset) {
 	if (preset == -1) {
 		return "Off";
+	} else if (preset < 0 || preset >= ARRAY_SIZE(presets)) {
+		return "Invalid";
 	}
 	return presets[preset].name;
 }
 
 void SasReverb::SetPreset(int preset) {
-	if (preset < (int)ARRAY_SIZE(presets))
+	// -1 means "off"; anything else must be a valid index into presets[]. Only the
+	// upper bound was checked before, so a value below -1 (e.g. from a corrupted
+	// savestate - the sceSasRevType HLE call itself already clamps to [-1, 8]) would
+	// index presets[] negatively below.
+	if (preset >= -1 && preset < (int)ARRAY_SIZE(presets))
 		preset_ = preset;
 	if (preset_ != -1) {
 		pos_ = BUFSIZE - presets[preset_].size;
 		memset(workspace_, 0, sizeof(int16_t) * BUFSIZE);
+		memset(wet_, 0, sizeof(float) * UPSAMPLE_HISTORY * 2);
+		memset(sendEven_, 0, sizeof(float) * UPSAMPLE_HISTORY * 2);
+		memset(sendOdd_, 0, sizeof(float) * UPSAMPLE_HISTORY * 2);
 	} else {
 		pos_ = 0;
 	}
+	ApplyParams();
+}
+
+void SasReverb::SetParams(int delay, int feedback) {
+	delay_ = delay;
+	feedback_ = feedback;
+	ApplyParams();
+}
+
+// Echo and Delay are computed presets. The ME reloads the whole record and then, for those two
+// types only, recomputes seven of its fields from sceSasRevParam's delay and feedback - so the
+// echo length and its feedback are live controls, not fixed per preset.
+//
+// With D = delay + 1:
+//   mLSAME = D*32 - dAPF1     mLCOMB1 = mRCOMB1 + D*16    mLAPF1 = mLAPF2 + D*16
+//   mRSAME = D*16 - dAPF2     dLSAME  = dRSAME  + D*16    mRAPF1 = D*16 + mLAPF2/2
+//   vWALL  = feedback << 8
+// The remaining fields, including the diff-side and comb3/comb4 taps, keep their table values.
+void SasReverb::ApplyParams() {
+	if (preset_ == -1) {
+		return;
+	}
+	*data_ = presets[preset_];
+	if (preset_ != PSP_SAS_EFFECT_TYPE_ECHO && preset_ != PSP_SAS_EFFECT_TYPE_DELAY) {
+		return;
+	}
+
+	const int d16 = (delay_ + 1) * 16;
+	data_->mLSAME = (int16_t)(d16 * 2 - data_->dAPF1);
+	data_->mRSAME = (int16_t)(d16 - data_->dAPF2);
+	data_->mLCOMB1 = (int16_t)(data_->mRCOMB1 + d16);
+	data_->dLSAME = (int16_t)(data_->dRSAME + d16);
+	data_->mLAPF1 = (int16_t)(data_->mLAPF2 + d16);
+	data_->mRAPF1 = (int16_t)(d16 + (data_->mLAPF2 >> 1));
+	data_->vWALL = (int16_t)(-(feedback_ << 8));
 }
 
 // Wraps around the upper part of a buffer.
@@ -205,21 +278,152 @@ private:
 	int size_;
 };
 
-void SasReverb::ProcessReverb(int16_t *output, const int16_t *input, size_t inputSize, uint16_t volLeft, uint16_t volRight) {
-	// This means replicate the input signal in the processed buffer.
-	// Can also be used to verify that the error is in here...
-	if (preset_ == -1) {
-		// Strangely, OFF is not filled with zeroes every other.  Seems special cased.
-		for (size_t i = 0; i < inputSize; ++i) {
-			output[i * 4 + 0] = clamp_s16((int)input[i * 2 + 0] * volLeft >> 15);
-			output[i * 4 + 1] = clamp_s16((int)input[i * 2 + 1] * volRight >> 15);
-			output[i * 4 + 2] = clamp_s16((int)input[i * 2 + 0] * volLeft >> 15);
-			output[i * 4 + 3] = clamp_s16((int)input[i * 2 + 1] * volRight >> 15);
+// The hardware upsamples the reverb's 22khz output by zero-stuffing, with no filter after it
+// (tests/audio/reverb/upsample: with dry off, every odd frame is exactly zero). That
+// leaves a mirror image of the whole wet signal just below 22khz, at full amplitude: it is barely
+// audible itself, but it eats the headroom of the final mix, so loud scenes clip much more (Outrun
+// 2006 while racing). We deliberately replace that with a proper interpolation filter, unless the
+// hidden ReverbFilter setting is off.
+//
+// A half-band filter: even output frames are the input samples, odd frames are interpolated from
+// UPSAMPLE_HALF_TAPS samples on each side. Kaiser-windowed sinc (beta 7.25), Q15, summing to
+// exactly unity. Flat to within 0.003dB up to 9khz and -69dB from 13khz up. The cost is a delay
+// of UPSAMPLE_HALF_TAPS samples at 22khz, about half a millisecond, which is nothing for a reverb.
+static const int32_t upsampleCoefs[12] = {
+	20754, -6625, 3643, -2278, 1478, -958, 605, -367, 209, -109, 50, -18,
+};
+
+// One output vector per input frame is (L, R) of the even frame and (L, R) of the odd one, which is
+// exactly the order they're stored in. So each tap is a single multiply-add of an unaligned load of
+// two consecutive input frames, (Lf, Rf, Lf+1, Rf+1), by a coefficient vector (a, a, b, b): the
+// even half sees frame f with weight a, the odd half frame f+1 with weight b. That costs one tap
+// more than using the symmetry, and saves every shuffle.
+struct UpsampleTable {
+	float v[24][4];
+};
+
+static UpsampleTable MakeUpsampleTable() {
+	UpsampleTable t{};
+	const int halfTaps = (int)ARRAY_SIZE(upsampleCoefs);
+	for (int m = 0; m < halfTaps * 2; m++) {
+		// The even frame is the center sample itself. The odd frame lies between the center and
+		// the next one, and d counts from it: d = 1 is the sample after the center, d = 0 the center.
+		const int d = m + 1 - halfTaps;
+		const float a = m == halfTaps ? 1.0f : 0.0f;
+		const float b = (float)(d >= 1 ? upsampleCoefs[d - 1] : upsampleCoefs[-d]) * (1.0f / 32768.0f);
+		t.v[m][0] = a;
+		t.v[m][1] = a;
+		t.v[m][2] = b;
+		t.v[m][3] = b;
+	}
+	return t;
+}
+
+void SasReverb::UpsampleWet(int16_t *out, int count) {
+	static_assert(ARRAY_SIZE(upsampleCoefs) == UPSAMPLE_HALF_TAPS, "coefficient count");
+	static const UpsampleTable table = MakeUpsampleTable();
+	static_assert(ARRAY_SIZE(table.v) == UPSAMPLE_HISTORY, "table size");
+
+	// Output frame i is centered UPSAMPLE_HALF_TAPS frames behind input frame i, which is at
+	// UPSAMPLE_HISTORY + i, so its taps start at frame i.
+	for (int i = 0; i < count; i++) {
+		const float *x = wet_ + i * 2;
+		Vec4F32 acc = Vec4F32::Zero();
+		for (int m = 0; m < UPSAMPLE_HISTORY; m++) {
+			acc = MulAdd(Vec4F32::Load(x + m * 2), Vec4F32::Load(table.v[m]), acc);
+		}
+		Vec4S32FromF32Round(acc).StoreS16Sat(out + i * 4);
+	}
+	memmove(wet_, wet_ + count * 2, sizeof(float) * UPSAMPLE_HISTORY * 2);
+}
+
+// The hardware decimates the send by keeping one frame of each pair, with no filter
+// (tests/audio/reverb/upsample: a 22.05khz tone reaches the reverb as DC), so everything above
+// 11khz aliases into the reverb. We filter it instead, with the same half-band filter as the
+// output, at half gain: the center frame times one half, plus the odd frames on each side.
+//
+// With the send split into its even frames E and odd frames O, output n is
+// E[n] / 2 + sum(c[j] / 2 * (O[n - 1 - j] + O[n + j])), so one load of O gives that tap for two
+// consecutive outputs, both channels, with the same coefficient. Delayed by UPSAMPLE_HALF_TAPS
+// frames at 22khz, like the output side.
+void SasReverb::DownsampleSend(int16_t *output, const int32_t *input, int outputFrames) {
+	_dbg_assert_(outputFrames <= MAX_INPUT_FRAMES);
+	if (!g_Config.bReverbFilter) {
+		// What the hardware does: the second frame of each pair, unfiltered.
+		for (int i = 0; i < outputFrames; i++) {
+			output[i * 2 + 0] = clamp_s16(input[i * 4 + 2]);
+			output[i * 2 + 1] = clamp_s16(input[i * 4 + 3]);
 		}
 		return;
 	}
 
-	const SasReverbData &d = presets[preset_];
+	const int halfTaps = UPSAMPLE_HALF_TAPS;
+	float *even = sendEven_ + UPSAMPLE_HISTORY * 2;
+	float *odd = sendOdd_ + UPSAMPLE_HISTORY * 2;
+	for (int i = 0; i < outputFrames; i++) {
+		even[i * 2 + 0] = (float)input[i * 4 + 0];
+		even[i * 2 + 1] = (float)input[i * 4 + 1];
+		odd[i * 2 + 0] = (float)input[i * 4 + 2];
+		odd[i * 2 + 1] = (float)input[i * 4 + 3];
+	}
+
+	float coefs[UPSAMPLE_HALF_TAPS];
+	for (int j = 0; j < halfTaps; j++) {
+		coefs[j] = (float)upsampleCoefs[j] * (0.5f / 32768.0f);
+	}
+
+	// Output n centers on history frame n + halfTaps, so its newest tap is frame n - 1 of this call.
+	for (int n = 0; n < outputFrames; n += 2) {
+		Vec4F32 acc = Vec4F32::Load(sendEven_ + (n + halfTaps) * 2) * 0.5f;
+		for (int j = 0; j < halfTaps; j++) {
+			const Vec4F32 pair = Vec4F32::Load(sendOdd_ + (n + halfTaps - 1 - j) * 2) + Vec4F32::Load(sendOdd_ + (n + halfTaps + j) * 2);
+			acc = MulAdd(pair, Vec4F32::Splat(coefs[j]), acc);
+		}
+		if (n + 1 < outputFrames) {
+			Vec4S32FromF32Round(acc).StoreS16Sat(output + n * 2);
+		} else {
+			// An odd count: the second output belongs to the next call (its taps haven't all
+			// arrived yet), so only the first is stored.
+			int16_t last[4];
+			Vec4S32FromF32Round(acc).StoreS16Sat(last);
+			output[n * 2 + 0] = last[0];
+			output[n * 2 + 1] = last[1];
+		}
+	}
+
+	memmove(sendEven_, sendEven_ + outputFrames * 2, sizeof(float) * UPSAMPLE_HISTORY * 2);
+	memmove(sendOdd_, sendOdd_ + outputFrames * 2, sizeof(float) * UPSAMPLE_HISTORY * 2);
+}
+
+void SasReverb::ProcessReverb(int16_t *output, const int16_t *input, size_t inputSize, int volLeft, int volRight) {
+	// "Off" runs at the full rate and never gets here (see SasInstance::ApplyWaveformEffect).
+	if (preset_ == -1) {
+		memset(output, 0, inputSize * 4 * sizeof(int16_t));
+		return;
+	}
+
+	const float reverbVolumeMultiplier = Volume100ToMultiplier(g_Config.iReverbVolume);
+	// Standard volume is 10, which pairs with a normal shift of 15.
+	if (reverbVolumeMultiplier <= 0.0f) {
+		// Force to zero output, which is not the same as "Off."
+		memset(output, 0, inputSize * 4 * sizeof(int16_t));
+		memset(wet_, 0, sizeof(float) * UPSAMPLE_HISTORY * 2);
+		return;
+	} else {
+		// The ME's reverb return is (evol * out) >> 11, one bit more than the "off" path's
+		// >> 12, because it only puts the wet signal on every other 44khz frame and leaves the
+		// rest at zero. We interpolate instead (see below), which gives every frame the signal,
+		// so the same average level comes from the plain >> 12 that our caller's leftVol << 3
+		// pairs with the >> 15 below. Unfiltered, the output uses >> 14 to match the ME.
+		volLeft *= reverbVolumeMultiplier;
+		volRight *= reverbVolumeMultiplier;
+	}
+
+	// Read once per grain, so a change can't split one between the two output paths.
+	const bool filter = g_Config.bReverbFilter;
+
+	_dbg_assert_(inputSize <= MAX_INPUT_FRAMES);
+	const SasReverbData &d = *data_;
 
 	// We put this on the stack instead of in the object to let the compiler optimize better (avoid mem r/w).
 	BufferWrapper<BUFSIZE> b(workspace_, pos_, d.size);
@@ -229,8 +433,13 @@ void SasReverb::ProcessReverb(int16_t *output, const int16_t *input, size_t inpu
 	// Or we could actually template the whole thing with the parameters as template arguments, as the presets are fixed.
 	for (size_t i = 0; i < inputSize; i++) {
 		// Dividing by two here is an incorrect hack. Some multiplication factor is needed to prevent the reverb from getting too loud, though.
-		int16_t LeftInput = input[i * 2] >> 1;
-		int16_t RightInput = input[i * 2 + 1] >> 1;
+		// The ME feeds the reverb at a quarter of the mix level, not a half: its send
+		// accumulator reaches sample<<9 at full voice volume, and the reverb input is
+		// accumulator * 0x20 >> 16, i.e. sample >> 2. This used to be >> 1, which drove the
+		// reverb 6dB hot - inaudible on its own, since the return above was 6dB quiet by
+		// exactly the same factor, but it changed how hard the feedback path clipped.
+		int16_t LeftInput = input[i * 2] >> 2;
+		int16_t RightInput = input[i * 2 + 1] >> 2;
 
 		int16_t Lin = LeftInput; //  (d.vLIN * LeftInput) >> 15;
 		int16_t Rin = RightInput; // (d.vRIN * RightInput) >> 15;
@@ -242,8 +451,9 @@ void SasReverb::ProcessReverb(int16_t *output, const int16_t *input, size_t inpu
 		b[d.mLDIFF] = clamp_s16(Lin + (b[d.dRDIFF] * d.vWALL >> 15) - (b[d.mLDIFF - 1]*d.vIIR >> 15) + b[d.mLDIFF - 1]); // R - to - L
 		b[d.mRDIFF] = clamp_s16(Rin + (b[d.dLDIFF] * d.vWALL >> 15) - (b[d.mRDIFF - 1]*d.vIIR >> 15) + b[d.mRDIFF - 1]); // L - to - R
 		// ___Early Echo(Comb Filter, with input from buffer)__________________________
-		int32_t Lout = ((d.vCOMB1*b[d.mLCOMB1] + d.vCOMB2*b[d.mLCOMB2] + d.vCOMB3*b[d.mLCOMB3] + d.vCOMB4*b[d.mLCOMB4]) >> 15);
-		int32_t Rout = ((d.vCOMB1*b[d.mRCOMB1] + d.vCOMB2*b[d.mRCOMB2] + d.vCOMB3*b[d.mRCOMB3] + d.vCOMB4*b[d.mRCOMB4]) >> 15);
+		// Four full-scale products can sum past 32 bits.
+		int32_t Lout = (int32_t)(((int64_t)d.vCOMB1*b[d.mLCOMB1] + (int64_t)d.vCOMB2*b[d.mLCOMB2] + (int64_t)d.vCOMB3*b[d.mLCOMB3] + (int64_t)d.vCOMB4*b[d.mLCOMB4]) >> 15);
+		int32_t Rout = (int32_t)(((int64_t)d.vCOMB1*b[d.mRCOMB1] + (int64_t)d.vCOMB2*b[d.mRCOMB2] + (int64_t)d.vCOMB3*b[d.mRCOMB3] + (int64_t)d.vCOMB4*b[d.mRCOMB4]) >> 15);
 		// ___Late Reverb APF1(All Pass Filter 1, with input from COMB)________________
 		b[d.mLAPF1] = clamp_s16(Lout - (d.vAPF1*b[(d.mLAPF1 - d.dAPF1)] >> 15));
 		Lout = b[(d.mLAPF1 - d.dAPF1)] + (b[d.mLAPF1] * d.vAPF1 >> 15);
@@ -255,15 +465,28 @@ void SasReverb::ProcessReverb(int16_t *output, const int16_t *input, size_t inpu
 		b[d.mRAPF2] = clamp_s16(Rout - (d.vAPF2*b[(d.mRAPF2 - d.dAPF2)] >> 15));
 		Rout = b[(d.mRAPF2 - d.dAPF2)] + (b[d.mRAPF2] * d.vAPF2 >> 15);
 		// ___Output to Mixer(Output volume multiplied with input from APF2)___________
-		output[i * 4 + 0] = clamp_s16(Lout * volLeft >> 15);
-		output[i * 4 + 1] = clamp_s16(Rout * volRight >> 15);
-		output[i * 4 + 2] = 0;
-		output[i * 4 + 3] = 0;
+		// Lout reaches about 17 bits and the volume 18, so this needs 64 bits.
+		if (filter) {
+			// Kept unclamped until after interpolation.
+			float *wet = wet_ + (UPSAMPLE_HISTORY + i) * 2;
+			wet[0] = (float)(((int64_t)Lout * volLeft) >> 15);
+			wet[1] = (float)(((int64_t)Rout * volRight) >> 15);
+		} else {
+			// What the hardware does: every other frame at twice the level (its >> 11), the rest zero.
+			output[i * 4 + 0] = (int16_t)std::clamp(((int64_t)Lout * volLeft) >> 14, (int64_t)-32768, (int64_t)32767);
+			output[i * 4 + 1] = (int16_t)std::clamp(((int64_t)Rout * volRight) >> 14, (int64_t)-32768, (int64_t)32767);
+			output[i * 4 + 2] = 0;
+			output[i * 4 + 3] = 0;
+		}
 
 		b.Next();
 	}
 
 	// Save the state in the object.
 	pos_ = b.GetPosition();
+
+	if (filter) {
+		UpsampleWet(output, (int)inputSize);
+	}
 }
 

@@ -15,52 +15,63 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include <fstream>
 #include <string>
 #include <cstring>
 
 #include "Common/Log.h"
-#include "Common/File/FileUtil.h"
 #include "Core/Loaders.h"
 #include "Core/ELF/PBPReader.h"
 
-PBPReader::PBPReader(FileLoader *fileLoader) : file_(nullptr), header_(), isELF_(false) {
+PBPReader::PBPReader(FileLoader *fileLoader) {
 	if (!fileLoader->Exists()) {
-		ERROR_LOG(LOADER, "Failed to open PBP file %s", fileLoader->Path().c_str());
+		ERROR_LOG(Log::Loader, "Failed to open PBP file %s", fileLoader->GetPath().c_str());
 		return;
 	}
 
 	fileSize_ = (size_t)fileLoader->FileSize();
-	if (fileLoader->ReadAt(0, sizeof(header_), (u8 *)&header_) != sizeof(header_)) {
-		ERROR_LOG(LOADER, "PBP is too small to be valid: %s", fileLoader->Path().c_str());
+	if (fileLoader->ReadAt(0, sizeof(header_), &header_) != sizeof(header_)) {
+		ERROR_LOG(Log::Loader, "PBP is too small to be valid: %s", fileLoader->GetPath().c_str());
 		return;
 	}
 	if (memcmp(header_.magic, "\0PBP", 4) != 0) {
-		if (memcmp(header_.magic, "\nFLE", 4) != 0) {
-			VERBOSE_LOG(LOADER, "%s: File actually an ELF, not a PBP", fileLoader->Path().c_str());
+		// Split string so the \x7f escape doesn't swallow the E. This used to compare against
+		// "\nFLE", which is neither ELF's magic nor anything else - so every file that wasn't a PBP
+		// was reported as an ELF, and the error branch below was unreachable.
+		if (memcmp(header_.magic, "\x7f" "ELF", 4) == 0) {
+			VERBOSE_LOG(Log::Loader, "%s: File actually an ELF, not a PBP", fileLoader->GetPath().c_str());
 			isELF_ = true;
 		} else {
-			ERROR_LOG(LOADER, "Magic number in %s indicated no PBP: %s", fileLoader->Path().c_str(), header_.magic);
+			ERROR_LOG(Log::Loader, "Magic number in %s indicates neither PBP nor ELF: %02x %02x %02x %02x",
+				fileLoader->GetPath().c_str(), (u8)header_.magic[0], (u8)header_.magic[1], (u8)header_.magic[2], (u8)header_.magic[3]);
 		}
 		return;
 	}
 
-	VERBOSE_LOG(LOADER, "Loading PBP, version = %08x", header_.version);
+	VERBOSE_LOG(Log::Loader, "Loading PBP, version = %08x", header_.version);
 	file_ = fileLoader;
 }
 
-bool PBPReader::GetSubFile(PBPSubFile file, std::vector<u8> *out) {
+bool PBPReader::GetSubFile(PBPSubFile file, std::vector<u8> *out) const {
 	if (!file_) {
 		return false;
 	}
 
 	const size_t expected = GetSubFileSize(file);
+
+	// This is only used to get the PARAM.SFO, so let's have a strict 256MB file size limit for sanity.
+	if (expected > 256 * 1024 * 1024) {
+		ERROR_LOG(Log::Loader, "Bad subfile size: %d", (int)expected);
+		return false;
+	}
+
 	const u32 off = header_.offsets[(int)file];
 
 	out->resize(expected);
-	size_t bytes = file_->ReadAt(off, expected, &(*out)[0]);
+	if (expected == 0)
+		return true;
+	size_t bytes = file_->ReadAt(off, expected, out->data());
 	if (bytes != expected) {
-		ERROR_LOG(LOADER, "PBP file read truncated: %d -> %d", (int)expected, (int)bytes);
+		ERROR_LOG(Log::Loader, "PBP file read truncated: %d -> %d", (int)expected, (int)bytes);
 		if (bytes < expected) {
 			out->resize(bytes);
 		}
@@ -68,23 +79,42 @@ bool PBPReader::GetSubFile(PBPSubFile file, std::vector<u8> *out) {
 	return true;
 }
 
-void PBPReader::GetSubFileAsString(PBPSubFile file, std::string *out) {
+bool PBPReader::ReadSubFile(PBPSubFile file, u32 offset, size_t size, void *out) const {
+	if (!file_) {
+		return false;
+	}
+	const size_t subFileSize = GetSubFileSize(file);
+	if (offset > subFileSize || size > subFileSize - offset) {
+		return false;
+	}
+	return file_->ReadAt(header_.offsets[(int)file] + offset, size, out) == size;
+}
+
+bool PBPReader::GetSubFileAsString(PBPSubFile file, std::string *out) const {
 	if (!file_) {
 		out->clear();
-		return;
+		return false;
 	}
 
 	const size_t expected = GetSubFileSize(file);
+
+	// This is only used to get the PNG, AT3 etc, so let's have a strict 256MB file size limit for sanity.
+	if (expected > 256 * 1024 * 1024) {
+		ERROR_LOG(Log::Loader, "Bad subfile size: %d", (int)expected);
+		return false;
+	}
 	const u32 off = header_.offsets[(int)file];
 
 	out->resize(expected);
 	size_t bytes = file_->ReadAt(off, expected, (void *)out->data());
 	if (bytes != expected) {
-		ERROR_LOG(LOADER, "PBP file read truncated: %d -> %d", (int)expected, (int)bytes);
+		ERROR_LOG(Log::Loader, "PBP file read truncated: %d -> %d", (int)expected, (int)bytes);
 		if (bytes < expected) {
 			out->resize(bytes);
+			// should we still return true here?
 		}
 	}
+	return true;
 }
 
 PBPReader::~PBPReader() {

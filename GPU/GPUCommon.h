@@ -1,154 +1,209 @@
 #pragma once
 
+#include <vector>
+#include <list>
+
 #include "ppsspp_config.h"
 #include "Common/Common.h"
+#include "Common/Swap.h"
+#include "Core/MemMap.h"
 #include "Common/MemoryUtil.h"
-#include "GPU/GPUInterface.h"
-#include "GPU/GPUState.h"
+#include "GPU/GPU.h"
+#include "GPU/Debugger/Record.h"
+#include "GPU/Debugger/Breakpoints.h"
+#include "GPU/GPUDefinitions.h"
 #include "GPU/Common/GPUDebugInterface.h"
+#include "GPU/Debugger/Debugger.h"
+#include "GPU/ge_constants.h"
 
 #if defined(__ANDROID__)
 #include <atomic>
 #endif
 
-#if defined(_M_SSE)
-#include <emmintrin.h>
+// X11, sigh.
+#ifdef None
+#undef None
 #endif
 
 class FramebufferManagerCommon;
 class TextureCacheCommon;
+struct OutputParams;
 class DrawEngineCommon;
+class VertexDecoder;
 class GraphicsContext;
+struct PspGeListArgs;
+struct GEState;
+class PointerWrap;
+struct VirtualFramebuffer;
+
 namespace Draw {
-	class DrawContext;
+class DrawContext;
 }
 
-enum DrawType {
-	DRAW_UNKNOWN,
-	DRAW_PRIM,
-	DRAW_SPLINE,
-	DRAW_BEZIER,
-};
+class StringWriter;
+struct DisplayLayoutConfig;
 
-enum {
-	FLAG_FLUSHBEFORE = 1,
-	FLAG_FLUSHBEFOREONCHANGE = 2,
-	FLAG_EXECUTE = 4,
-	FLAG_EXECUTEONCHANGE = 8,
-	FLAG_READS_PC = 16,
-	FLAG_WRITES_PC = 32,
-	FLAG_DIRTYONCHANGE = 64,  // NOTE: Either this or FLAG_EXECUTE*, not both!
-};
+inline bool IsTrianglePrim(GEPrimitiveType prim) {
+	// TODO: KEEP_PREVIOUS is mistakenly treated as TRIANGLE here... This isn't new.
+	//
+	// Interesting optimization, but not confident in performance:
+	// static const bool p[8] = { false, false, false, true, true, true, false, true };
+	// 10111000 = 0xB8;
+	// return (0xB8U >> (u8)prim) & 1;
 
-struct TransformedVertex {
-	union {
-		struct {
-			float x, y, z, fog;     // in case of morph, preblend during decode
-		};
-		float pos[4];
-	};
-	union {
-		struct {
-			float u; float v; float w;   // scaled by uscale, vscale, if there
-		};
-		float uv[3];
-	};
-	union {
-		u8 color0[4];   // prelit
-		u32 color0_32;
-	};
-	union {
-		u8 color1[4];   // prelit
-		u32 color1_32;
-	};
-};
+	return prim > GE_PRIM_LINE_STRIP && prim != GE_PRIM_RECTANGLES;
+}
 
-class GPUCommon : public GPUInterface, public GPUDebugInterface {
+struct TransformStats;
+class GPUCommon {
 public:
+	GPUCommon(const GPUCommon &) = delete;
+	GPUCommon &operator=(const GPUCommon &) = delete;
+	// The constructor might run on the loader thread.
 	GPUCommon(GraphicsContext *gfxCtx, Draw::DrawContext *draw);
-	virtual ~GPUCommon();
+	virtual ~GPUCommon() = default;
 
-	Draw::DrawContext *GetDrawContext() override {
+	virtual void GetStats(StringWriter &w) = 0;
+	virtual std::vector<const VirtualFramebuffer *> GetFramebufferList() const = 0;
+		
+	// Needs to be called from the GPU thread, so on the same thread as a notification is fine.
+	// Calling from a separate thread (e.g. UI) may fail.
+	virtual bool GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes = -1) {
+		// False means unsupported.
+		return false;
+	}
+	virtual bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer) { return false; }
+	virtual bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer) { return false; }
+	virtual bool GetCurrentTexture(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) { return false; }
+	virtual bool GetCurrentClut(GPUDebugBuffer &buffer) { return false;}
+	virtual bool GetOutputFramebuffer(GPUDebugBuffer &buffer) { return false; }
+
+	bool GetCurrentDisplayList(DisplayList &list) const;
+	bool GetCurrentDrawAsDebugVertices(GECommand cmd, GEPrimitiveType prim, GEPrimitiveType *outPrim, int count, std::vector<GPUDebugVertex> *vertices, std::vector<u16> *indices, int *lowerIndexBound, TransformStats *stats, DebugVertexFlags flags) const;
+	int GetCurrentPrim(GEPrimitiveType *prim, GECommand *outCmd) const;  // Return value has the count.
+
+	// True while pipelines from the shader cache are still being created, in the background.
+	virtual bool IsLoadingShaderCache() const { return false; }
+
+	Draw::DrawContext *GetDrawContext() {
 		return draw_;
 	}
-	virtual void CheckGPUFeatures() = 0;
 
-	void UpdateCmdInfo();
+	virtual void DeviceLost() = 0;
+	virtual void DeviceRestore(Draw::DrawContext *draw) = 0;
 
-	bool IsReady() override {
-		return true;
-	}
-	void CancelReady() override {
-	}
-	void Reinitialize() override;
+	virtual u32 CheckGPUFeatures() const = 0;
 
-	void BeginHostFrame() override;
-	void EndHostFrame() override;
+	virtual void UpdateCmdInfo() = 0;
 
-	void InterruptStart(int listid) override;
-	void InterruptEnd(int listid) override;
-	void SyncEnd(GPUSyncType waitType, int listid, bool wokeThreads) override;
-	void EnableInterrupts(bool enable) override {
+	virtual void Reinitialize();
+
+	virtual void BeginHostFrame(const DisplayLayoutConfig &config);
+	virtual void EndHostFrame();
+
+	void InterruptStart(int listid);
+	void WaitForSubmittedDepth();
+	void InterruptEnd(int listid);
+	void SyncEnd(GPUSyncType waitType, int listid, bool wokeThreads);
+	void EnableInterrupts(bool enable) {
 		interruptsEnabled_ = enable;
 	}
 
-	void Resized() override;
-	void DumpNextFrame() override;
+	virtual void CheckDisplayResized() = 0;
+	virtual void CheckConfigChanged(const DisplayLayoutConfig &config) = 0;
 
-	void ExecuteOp(u32 op, u32 diff) override;
-	void PreExecuteOp(u32 op, u32 diff) override;
+	virtual void NotifyDisplayResized();
+	virtual void NotifyRenderResized(const DisplayLayoutConfig &config);
+	virtual void NotifyConfigChanged();
 
-	bool InterpretList(DisplayList &list) override;
-	void ProcessDLQueue();
-	u32  UpdateStall(int listid, u32 newstall) override;
-	u32  EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<PspGeListArgs> args, bool head) override;
-	u32  DequeueList(int listid) override;
-	int  ListSync(int listid, int mode) override;
-	u32  DrawSync(int mode) override;
-	int  GetStack(int index, u32 stackPtr) override;
-	void DoState(PointerWrap &p) override;
-	bool BusyDrawing() override;
-	u32  Continue() override;
-	u32  Break(int mode) override;
-	void ReapplyGfxState() override;
+	void DumpNextFrame();
 
-	void CopyDisplayToOutput(bool reallyDirty) override = 0;
-	void InitClear() override = 0;
-	bool PerformMemoryCopy(u32 dest, u32 src, int size) override;
-	bool PerformMemorySet(u32 dest, u8 v, int size) override;
-	bool PerformMemoryDownload(u32 dest, int size) override;
-	bool PerformMemoryUpload(u32 dest, int size) override;
+	virtual void PreExecuteOp(u32 op, u32 diff) {}
 
-	void InvalidateCache(u32 addr, int size, GPUInvalidationType type) override;
-	void NotifyVideoUpload(u32 addr, int size, int width, int format) override;
-	bool PerformStencilUpload(u32 dest, int size) override;
+	DLResult ProcessDLQueue();
+
+	u32 UpdateStall(int listid, u32 newstall, bool *runList);
+	u32 EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<PspGeListArgs> args, bool head, bool *runList);
+	u32 DequeueList(int listid);
+	virtual int ListSync(int listid, int mode);
+	virtual u32 DrawSync(int mode);
+	int GetStack(int index, u32 stackPtr);
+	virtual bool GetMatrix24(GEMatrixType type, u32_le *result, u32 cmdbits);
+	virtual void ResetMatrices();
+	virtual void DoState(PointerWrap &p);
+	// Finishes drawing still queued for PSP memory (the software renderer can hold some past a stall).
+	virtual void FlushPendingDrawing() {}
+	bool BusyDrawing();
+	u32 Continue(bool *runList);
+	u32 Break(int mode);
+
+	virtual bool FramebufferDirty() = 0;
+	virtual bool FramebufferReallyDirty() = 0;
+
+	virtual void ReapplyGfxState();
+
+	// Returns true if we should split the call across GE execution.
+	// For example, a debugger is active.
+	bool ShouldSplitOverGe() const;
+
+	virtual uint32_t SetAddrTranslation(uint32_t value);
+	uint32_t GetAddrTranslation();
+
+	virtual void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) = 0;
+	virtual void SetCurFramebufferDirty(bool dirty) = 0;
+	virtual void PrepareCopyDisplayToOutput(const DisplayLayoutConfig &config) = 0;
+	virtual void CopyDisplayToOutput(const DisplayLayoutConfig &config) = 0;
+	virtual bool PresentedThisFrame() const = 0;
+	// Presents the display to another output than the primary one, until called with nullptr. Set it
+	// before PrepareCopyDisplayToOutput, which lays out for it.
+	virtual void SetPresentationOutput(const OutputParams *output) {}
+	// Whether the game goes to another output than the primary (SetPresentationOutput), like a TV.
+	virtual bool PresentsToOtherOutput() const { return false; }
+
+	// Invalidate any cached content sourced from the specified range.
+	// If size = -1, invalidate everything.
+	virtual void InvalidateCache(u32 addr, int size, GPUInvalidationType type) = 0;
+
+	// These return true if they handled the operation enough that the actual memory operation should be skipped. Not always a clear-cut case...
+	virtual bool PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags = GPUCopyFlag::NONE);
+	virtual bool PerformMemorySet(u32 dest, u8 v, int size);
+
+	virtual bool PerformReadbackToMemory(u32 dest, int size);
+	virtual bool PerformWriteColorFromMemory(u32 dest, int size);
+
+	// width is the stride. rectWidth, if set, is how many pixels of each row were written, which lets
+	// a write that starts partway into a framebuffer row be uploaded without clobbering the rest.
+	virtual void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format, int rectWidth = 0);
+	// The CPU has written a width x height rectangle of pixels at addr, rows stride pixels apart.
+	virtual void PerformWriteRectFromMemory(u32 addr, int stride, int width, int height, GEBufferFormat format);
+	virtual bool PerformWriteStencilFromMemory(u32 dest, int size, WriteStencil flags);
+	// Reads the stencil of whole framebuffer rows into the alpha bytes in RAM, leaving the color alone.
+	// For games that test stencil with the CPU. Only 8888 for now.
+	virtual bool PerformReadbackStencilToMemory(u32 dest, int size);
+
+	// Tells the texture cache that a block copy moved pixels, so it can carry "this is video" from
+	// the source to the destination. Cheap and safe to call for any copy.
+	void NotifyVideoCopy(u32 dest, u32 src, int size);
+
+	virtual void ExecuteOp(u32 op, u32 diff) = 0;
 
 	void Execute_OffsetAddr(u32 op, u32 diff);
 	void Execute_Vaddr(u32 op, u32 diff);
 	void Execute_Iaddr(u32 op, u32 diff);
 	void Execute_Origin(u32 op, u32 diff);
 	void Execute_Jump(u32 op, u32 diff);
-	void Execute_JumpFast(u32 op, u32 diff);
 	void Execute_BJump(u32 op, u32 diff);
 	void Execute_Call(u32 op, u32 diff);
-	void Execute_CallFast(u32 op, u32 diff);
 	void Execute_Ret(u32 op, u32 diff);
 	void Execute_End(u32 op, u32 diff);
 
-	void Execute_VertexType(u32 op, u32 diff);
-	void Execute_VertexTypeSkinning(u32 op, u32 diff);
-
-	void Execute_Prim(u32 op, u32 diff);
-	void Execute_Bezier(u32 op, u32 diff);
-	void Execute_Spline(u32 op, u32 diff);
 	void Execute_BoundingBox(u32 op, u32 diff);
-	void Execute_BlockTransferStart(u32 op, u32 diff);
 
-	void Execute_LoadClut(u32 op, u32 diff);
+	void Execute_MorphWeight(u32 op, u32 diff);
 
-	void Execute_TexSize0(u32 op, u32 diff);
-	void Execute_TexLevel(u32 op, u32 diff);
+	void Execute_ImmVertexAlphaPrim(u32 op, u32 diff);
 
+	// Matrix loads, with a fast path for the DATA commands following a NUM. SoftGPU has its own.
 	void Execute_WorldMtxNum(u32 op, u32 diff);
 	void Execute_WorldMtxData(u32 op, u32 diff);
 	void Execute_ViewMtxNum(u32 op, u32 diff);
@@ -160,16 +215,37 @@ public:
 	void Execute_BoneMtxNum(u32 op, u32 diff);
 	void Execute_BoneMtxData(u32 op, u32 diff);
 
-	void Execute_MorphWeight(u32 op, u32 diff);
-
-	void Execute_ImmVertexAlphaPrim(u32 op, u32 diff);
-
 	void Execute_Unknown(u32 op, u32 diff);
 
-	int EstimatePerVertexCost();
+	static int EstimatePerVertexCost();
+	// Fill time for a through-mode rectangle draw textured from a decoded video frame, or (when
+	// enabled) a clear. Zero for anything else. We don't model fill rate in general, but a movie
+	// player can be paced by it.
+	int EstimateFillCycles(GEPrimitiveType prim, const void *verts, const void *inds, int count, const VertexDecoder *dec, u32 vertType) const;
 
-	// Note: Not virtual!
-	void Flush();
+	// Memory a video decoder has written a frame into recently (PerformWriteFormattedFromMemory),
+	// or a copy of such a frame (NotifyVideoCopy). An entry ages out a few flips after its last write.
+	struct VideoInfo {
+		u32 addr;
+		u32 size;
+		int flips;
+		// How much of each row the frame covers from addr on, 0 if not known.
+		u32 rowBytes;
+	};
+	bool IsVideo(u32 addr) const;
+	// How many bytes of video frame there are from addr on, 0 if addr isn't in one.
+	u32 VideoBytesFrom(u32 addr) const;
+	// How much of the first row of a texture at addr the video frames written there cover, in bytes,
+	// counting from addr. 0 if not known.
+	u32 VideoRowBytesFrom(u32 addr, u32 rowBytes) const;
+	bool VideoIsPlaying() const {
+		return !videos_.empty();
+	}
+	const std::vector<VideoInfo> &Videos() const {
+		return videos_;
+	}
+
+	virtual void Flush();
 
 #ifdef USE_CRT_DBG
 #undef new
@@ -184,85 +260,101 @@ public:
 #define new DBG_NEW
 #endif
 
-	// From GPUDebugInterface.
-	bool GetCurrentDisplayList(DisplayList &list) override;
-	bool GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes) override;
-	bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer) override;
-	bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer) override;
-	bool GetCurrentTexture(GPUDebugBuffer &buffer, int level) override;
-	bool GetCurrentClut(GPUDebugBuffer &buffer) override;
-	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices) override;
-	bool GetOutputFramebuffer(GPUDebugBuffer &buffer) override;
+	virtual FramebufferManagerCommon *GetFramebufferManagerCommon() { return nullptr; }
+	virtual TextureCacheCommon *GetTextureCacheCommon() { return nullptr; }
+	const DrawEngineCommon *GetDrawEngineCommon() const { return drawEngineCommon_; }
 
-	std::vector<std::string> DebugGetShaderIDs(DebugShaderType shader) override { return std::vector<std::string>(); };
-	std::string DebugGetShaderString(std::string id, DebugShaderType shader, DebugShaderStringType stringType) override {
+	virtual std::vector<std::string> DebugGetShaderIDs(DebugShaderType shader) { return std::vector<std::string>(); };
+	virtual std::string DebugGetShaderString(std::string id, DebugShaderType shader, DebugShaderStringType stringType) {
 		return "N/A";
 	}
-	bool DescribeCodePtr(const u8 *ptr, std::string &name) override;
 
-	std::vector<DisplayList> ActiveDisplayLists() override;
-	void ResetListPC(int listID, u32 pc) override;
-	void ResetListStall(int listID, u32 stall) override;
-	void ResetListState(int listID, DisplayListState state) override;
+	virtual bool DescribeCodePtr(const u8 *ptr, std::string &name);
 
-	GPUDebugOp DissassembleOp(u32 pc, u32 op) override;
-	std::vector<GPUDebugOp> DissassembleOpRange(u32 startpc, u32 endpc) override;
+	std::vector<DisplayList> ActiveDisplayLists() const;
+	void ResetListPC(int listID, u32 pc);
+	void ResetListStall(int listID, u32 stall);
+	void ResetListState(int listID, DisplayListState state);
 
-	void NotifySteppingEnter() override;
-	void NotifySteppingExit() override;
+	GPUDebugOp DisassembleOp(u32 pc, u32 op);
+	std::vector<GPUDebugOp> DisassembleOpRange(u32 startpc, u32 endpc);
 
-	u32 GetRelativeAddress(u32 data) override;
-	u32 GetVertexAddress() override;
-	u32 GetIndexAddress() override;
-	GPUgstate GetGState() override;
-	void SetCmdValue(u32 op) override;
+	u32 GetRelativeAddress(u32 data);
+	u32 GetVertexAddress();
+	u32 GetIndexAddress();
+	const GEState &GetGState();
+	void SetCmdValue(u32 op);
 
-	void UpdateUVScaleOffset() {
-#ifdef _M_SSE
-		__m128i values = _mm_slli_epi32(_mm_load_si128((const __m128i *)&gstate.texscaleu), 8);
-		_mm_storeu_si128((__m128i *)&gstate_c.uv, values);
-#elif PPSSPP_PLATFORM(ARM_NEON)
-		const uint32x4_t values = vshlq_n_u32(vld1q_u32(&gstate.texscaleu), 8);
-		vst1q_u32(&gstate_c.uv, values);
-#else
-		gstate_c.uv.uScale = getFloat24(gstate.texscaleu);
-		gstate_c.uv.vScale = getFloat24(gstate.texscalev);
-		gstate_c.uv.uOff = getFloat24(gstate.texoffsetu);
-		gstate_c.uv.vOff = getFloat24(gstate.texoffsetv);
-#endif
-	}
-
-	DisplayList* getList(int listid) override {
+	DisplayList* getList(int listid) {
 		return &dls[listid];
 	}
+	bool IsValidListId(int listid) const {
+		return listid >= 0 && listid < DisplayListMaxCount;
+	}
 
-	const std::list<int>& GetDisplayLists() override {
+	const std::list<int> &GetDisplayListQueue() {
 		return dlQueue;
 	}
-	std::vector<FramebufferInfo> GetFramebufferList() override;
-	void ClearShaderCache() override {}
-	void CleanupBeforeUI() override {}
+	const DisplayList &GetDisplayList(int index) {
+		return dls[index];
+	}
 
-	s64 GetListTicks(int listid) override {
+	s64 GetListTicks(int listid) const {
 		if (listid >= 0 && listid < DisplayListMaxCount) {
-			return dls[listid].waitTicks;
+			return dls[listid].waitUntilTicks;
 		}
 		return -1;
 	}
 
-	bool FramebufferDirty() override;
-	bool FramebufferReallyDirty() override;
-
-	typedef void (GPUCommon::*CmdFunc)(u32 op, u32 diff);
-
-	void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) override {
+	virtual void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) const {
 		primaryInfo = reportingPrimaryInfo_;
 		fullInfo = reportingFullInfo_;
 	}
 
+	void PSPFrame();
+
+	GPURecord::Recorder *GetRecorder() {
+		return &recorder_;
+	}
+	GPUBreakpoints *GetBreakpoints() {
+		return &breakpoints_;
+	}
+
+	void ClearBreakNext();
+	void SetBreakNext(GPUDebug::BreakNext next);
+	void SetBreakCount(int c, bool relative = false);
+	GPUDebug::BreakNext GetBreakNext() const {
+		return breakNext_;
+	}
+	int GetBreakCount() const {
+		return breakAtCount_;
+	}
+	bool SetRestrictPrims(std::string_view rule);
+	std::string_view GetRestrictPrims() {
+		return restrictPrimRule_;
+	}
+
+	int PrimsThisFrame() const {
+		return primsThisFrame_;
+	}
+	int PrimsLastFrame() const {
+		return primsLastFrame_;
+	}
+
+	void NotifyFlush();
+
 protected:
-	void DeviceLost() override;
-	void DeviceRestore() override;
+	// While debugging is active, these may block.
+	void NotifyDisplay(u32 framebuf, u32 stride, int format);
+
+	void UpdateMatrixProducts();
+
+	bool NeedsSlowInterpreter() const;
+	GPUDebug::NotifyResult NotifyCommand(u32 pc, GPUBreakpoints *breakpoints);
+
+	virtual void ClearCacheNextFrame() {}
+
+	virtual void CheckRenderResized(const DisplayLayoutConfig &config) {}
 
 	void SetDrawType(DrawType type, GEPrimitiveType prim) {
 		if (type != lastDraw_) {
@@ -272,57 +364,50 @@ protected:
 		}
 		// Prim == RECTANGLES can cause CanUseHardwareTransform to flip, so we need to dirty.
 		// Also, culling may be affected so dirty the raster state.
-		if ((prim == GE_PRIM_RECTANGLES) != (lastPrim_ == GE_PRIM_RECTANGLES)) {
+		if (IsTrianglePrim(prim) != IsTrianglePrim(lastPrim_)) {
 			Flush();
 			gstate_c.Dirty(DIRTY_RASTER_STATE | DIRTY_VERTEXSHADER_STATE);
 			lastPrim_ = prim;
 		}
 	}
 
-	void BeginFrame() override;
-	void UpdateVsyncInterval(bool force);
+	virtual void CheckDepthUsage(VirtualFramebuffer *vfb) {}
+	virtual void FastRunLoop(DisplayList &list) = 0;
 
-	virtual void FastRunLoop(DisplayList &list);
-
-	void SlowRunLoop(DisplayList &list);
+	bool SlowRunLoop(DisplayList &list);  // Returns false on breakpoint.
+	// Counts the cycles of the commands run since the last update, up to currentPC, and continues at newPC: the
+	// commands between are skipped (a jump), not run. Commands consumed by hand go before currentPC.
 	void UpdatePC(u32 currentPC, u32 newPC);
 	void UpdateState(GPURunState state);
-	void PopDLQueue();
-	void CheckDrawSync();
-	int  GetNextListIndex();
-	virtual void FastLoadBoneMatrix(u32 target);
-
-	// TODO: Unify this.
-	virtual void FinishDeferred() {}
-
+	void FastLoadBoneMatrix(u32 target);
+	void FlushImm();
 	void DoBlockTransfer(u32 skipDrawReason);
-	void DoExecuteCall(u32 target);
-
-	void AdvanceVerts(u32 vertType, int count, int bytesRead) {
-		if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
-			int indexShift = ((vertType & GE_VTYPE_IDX_MASK) >> GE_VTYPE_IDX_SHIFT) - 1;
-			gstate_c.indexAddr += count << indexShift;
-		} else {
-			gstate_c.vertexAddr += bytesRead;
-		}
+	// Does a block transfer's copy itself and returns true, when the backend needs to.
+	virtual bool CopyBlockTransfer(u32 srcBasePtr, u32 srcStride, int srcX, int srcY, u32 dstBasePtr, u32 dstStride, int dstX, int dstY, int width, int height, int bpp) {
+		return false;
 	}
 
-	size_t FormatGPUStatsCommon(char *buf, size_t size);
+	// TODO: Unify this. Vulkan and OpenGL are different due to how they buffer data.
+	virtual void FinishDeferred() {}
 
-	FramebufferManagerCommon *framebufferManager_ = nullptr;
-	TextureCacheCommon *textureCache_ = nullptr;
-	DrawEngineCommon *drawEngineCommon_ = nullptr;
-	ShaderManagerCommon *shaderManager_ = nullptr;
+	virtual void BuildReportingInfo() = 0;
 
-	GraphicsContext *gfxCtx_;
-	Draw::DrawContext *draw_;
+	virtual void UpdateMSAALevel(Draw::DrawContext *draw) {}
 
-	struct CommandInfo {
-		uint64_t flags;
-		GPUCommon::CmdFunc func;
+	enum {
+		DisplayListMaxCount = 64
 	};
 
-	static CommandInfo cmdInfo_[256];
+	DrawEngineCommon *drawEngineCommon_ = nullptr;
+
+	// TODO: These should live in GPUCommonHW.
+	FramebufferManagerCommon *framebufferManager_ = nullptr;
+	TextureCacheCommon *textureCache_ = nullptr;
+
+	bool flushOnParams_ = true;
+
+	GraphicsContext *gfxCtx_;
+	Draw::DrawContext *draw_ = nullptr;
 
 	typedef std::list<int> DisplayListQueue;
 
@@ -333,20 +418,29 @@ protected:
 
 	bool interruptRunning = false;
 	GPURunState gpuState = GPUSTATE_RUNNING;
-	bool isbreak;
+	bool isbreak;  // This doesn't mean debugger breakpoints.
 	u64 drawCompleteTicks;
 	u64 busyTicks;
+
+	void NoteVideoRange(u32 addr, u32 size, u32 rowBytes = 0);
+	void DecimateVideos();
+	std::vector<VideoInfo> videos_;
 
 	int downcount;
 	u64 startingTicks;
 	u32 cycleLastPC;
 	int cyclesExecuted;
+	// For the 30fps limit: when the last list started. Not saved.
+	u64 paceListStartTicks_ = 0;
 
+	bool resumingFromDebugBreak_ = false;
 	bool dumpNextFrame_ = false;
 	bool dumpThisFrame_ = false;
-	bool debugRecording_;
-	bool interruptsEnabled_;
-	bool resized_ = false;
+	bool useFastRunLoop_ = false;
+	bool interruptsEnabled_ = false;
+	bool displayResized_ = false;
+	bool renderResized_ = false;
+	bool configChanged_ = false;
 	DrawType lastDraw_ = DRAW_UNKNOWN;
 	GEPrimitiveType lastPrim_ = GE_PRIM_INVALID;
 
@@ -359,25 +453,52 @@ protected:
 
 	TransformedVertex immBuffer_[MAX_IMMBUFFER_SIZE];
 	int immCount_ = 0;
-	GEPrimitiveType immPrim_;
+	GEPrimitiveType immPrim_ = GE_PRIM_INVALID;
+	uint32_t immFlags_ = 0;
+	bool immFirstSent_ = false;
+
+	uint32_t edramTranslation_ = 0x400;
+
+	// When matrix data overflows, the CPU visible values wrap and bleed between matrices.
+	// But this doesn't actually change the values used by rendering.
+	// The CPU visible values affect the GPU when list contexts are restored.
+	// Note: not maintained by all backends, here for save stating.
+	union {
+		struct {
+			u32 bone[12 * 8];
+			u32 world[12];
+			u32 view[12];
+			u32 proj[16];
+			u32 tgen[12];
+		};
+		u32 all[12 * 8 + 12 + 12 + 16 + 12];
+	} matrixVisible;
 
 	std::string reportingPrimaryInfo_;
 	std::string reportingFullInfo_;
 
+	// Debugging state
+	bool debugRecording_ = false;
+
+	GPURecord::Recorder recorder_;
+	GPUBreakpoints breakpoints_;
+
+	GPUDebug::BreakNext breakNext_ = GPUDebug::BreakNext::NONE;
+	int breakAtCount_ = -1;
+
+	int primsLastFrame_ = 0;
+	int primsThisFrame_ = 0;
+	int thisFlipNum_ = 0;
+
+	bool primAfterDraw_ = false;
+
+	uint32_t skipPcOnce_ = 0;
+
+	std::vector<std::pair<int, int>> restrictPrimRanges_;
+	std::string restrictPrimRule_;
+
 private:
-	void FlushImm();
-	// Debug stats.
-	double timeSteppingStarted_;
-	double timeSpentStepping_;
-	int lastVsync_ = -1;
+	void DoExecuteCall(u32 target);
+	void PopDLQueue();
+	void CompleteFailedList(DisplayList &list);
 };
-
-struct CommonCommandTableEntry {
-	uint8_t cmd;
-	uint8_t flags;
-	uint64_t dirty;
-	GPUCommon::CmdFunc func;
-};
-
-extern const CommonCommandTableEntry commonCommandTable[];
-extern size_t commonCommandTableSize;

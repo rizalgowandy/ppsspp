@@ -17,13 +17,15 @@
 
 #include <algorithm>
 #include <mutex>
-#include "Common/LogManager.h"
+#include "Common/Log/LogManager.h"
+#include "Common/StringUtils.h"
+#include "Common/TimeUtil.h"
 #include "Core/Debugger/WebSocket/LogBroadcaster.h"
 #include "Core/Debugger/WebSocket/WebSocketUtils.h"
 
-class DebuggerLogListener : public LogListener {
+class DebuggerLogListener {
 public:
-	void Log(const LogMessage &msg) override {
+	void Log(const LogMessage &msg) {
 		std::lock_guard<std::mutex> guard(lock_);
 		messages_[nextMessage_] = msg;
 		nextMessage_++;
@@ -36,18 +38,44 @@ public:
 		std::lock_guard<std::mutex> guard(lock_);
 		int splitPoint;
 		int readCount;
+		// A source that logs faster than this listener gets polled (WebSocket.cpp's event loop,
+		// up to 1000Hz under high activity) - a log-only breakpoint hit thousands of times in a
+		// tight loop is a real example, see docs/VSHBootInvestigation.md - can wrap the ring
+		// buffer before GetMessages() ever reads the oldest entries, silently losing them. That
+		// used to just look like "my breakpoint only logged a few hits" from the client's side,
+		// indistinguishable from the breakpoint genuinely not firing - synthesize a warning
+		// message reporting exactly how many were lost instead of staying silent about it.
+		int droppedCount = 0;
 		if (read_ + BUFFER_SIZE < count_) {
 			// We'll start with our oldest then.
+			droppedCount = (count_ - BUFFER_SIZE) - read_;
 			splitPoint = nextMessage_;
 			readCount = Count();
 		} else {
-			splitPoint = read_;
+			// read_ counts messages ever read, so it has to be wrapped to index the ring - the
+			// overflow branch above starts from nextMessage_, which already is an index. Without
+			// the modulo this went wrong the moment a session logged BUFFER_SIZE messages: with
+			// splitPoint >= BUFFER_SIZE the first copy loop below is empty, so the second one
+			// handed back messages_[0..readCount-1] - the oldest entries in the buffer, not the
+			// new ones - and every later poll stayed that far out of step. High-volume sources
+			// (a log-only breakpoint in a hot loop) hit it within seconds, and the result looked
+			// like the tail of the log going missing rather than being wrong.
+			splitPoint = read_ % BUFFER_SIZE;
 			readCount = count_ - read_;
 		}
 
 		read_ = count_;
 
 		std::vector<LogMessage> results;
+		if (droppedCount > 0) {
+			LogMessage dropped;
+			dropped.level = LogLevel::LWARNING;
+			dropped.log = "Debugger";
+			GetCurrentTimeFormatted(dropped.timestamp);
+			truncate_cpy(dropped.header, "LogBroadcaster: ring buffer overflow");
+			dropped.msg = StringFromFormat("%d log message(s) dropped - loop polling too slow for this volume\n", droppedCount);
+			results.push_back(dropped);
+		}
 		int splitEnd = std::min(splitPoint + readCount, (int)BUFFER_SIZE);
 		for (int i = splitPoint; i < splitEnd; ++i) {
 			results.push_back(messages_[i]);
@@ -73,15 +101,21 @@ private:
 	int read_ = 0;
 };
 
+static void BroadcastCallback(const LogMessage &message, void *userdata) {
+	DebuggerLogListener *listener = (DebuggerLogListener *)userdata;
+	listener->Log(message);
+}
+
 LogBroadcaster::LogBroadcaster() {
 	listener_ = new DebuggerLogListener();
-	if (LogManager::GetInstance())
-		LogManager::GetInstance()->AddListener(listener_);
+	// One of these exists per open connection, so it registers alongside any other client's
+	// rather than replacing it - see AddExternalLogCallback().
+	callbackHandle_ = g_logManager.AddExternalLogCallback(&BroadcastCallback, (void *)listener_);
 }
 
 LogBroadcaster::~LogBroadcaster() {
-	if (LogManager::GetInstance())
-		LogManager::GetInstance()->RemoveListener(listener_);
+	// Returns only once no log call is inside our callback, so the listener is safe to delete.
+	g_logManager.RemoveExternalLogCallback(callbackHandle_);
 	delete listener_;
 }
 
@@ -95,7 +129,7 @@ struct DebuggerLogEvent {
 		j.writeString("timestamp", l.timestamp);
 		j.writeString("header", l.header);
 		j.writeString("message", l.msg);
-		j.writeInt("level", l.level);
+		j.writeInt("level", (int)l.level);
 		j.writeString("channel", l.log);
 		j.end();
 		return j.str();

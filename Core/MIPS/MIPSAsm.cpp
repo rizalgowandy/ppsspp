@@ -1,28 +1,17 @@
 #include <cstdarg>
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "Common/CommonTypes.h"
 #include "ext/armips/Core/Assembler.h"
-
-#include "Common/Data/Encoding/Utf8.h"
+#include "ext/armips/Core/FileManager.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/MemMapHelpers.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/MIPSAsm.h"
 
-namespace MIPSAsm
-{	
-	static std::wstring errorText;
-
-std::wstring GetAssembleError()
-{
-	return errorText;
-}
-
-class PspAssemblerFile: public AssemblerFile
-{
+class PspAssemblerFile : public AssemblerFile {
 public:
 	PspAssemblerFile() {
 		address = 0;
@@ -31,15 +20,14 @@ public:
 	bool open(bool onlyCheck) override{ return true; };
 	void close() override { };
 	bool isOpen() override { return true; };
-	bool write(void* data, size_t length) override {
+	bool write(void *data, size_t length) override {
 		if (!Memory::IsValidAddress((u32)(address+length-1)))
 			return false;
 
 		Memory::Memcpy((u32)address, data, (u32)length, "Debugger");
 		
 		// In case this is a delay slot or combined instruction, clear cache above it too.
-		if (MIPSComp::jit)
-			MIPSComp::jit->InvalidateCacheAt((u32)(address - 4),(int)length+4);
+		mipsr4k.InvalidateICacheRangeDeferred((u32)(address - 4), (int)length + 4);
 
 		address += length;
 		return true;
@@ -54,22 +42,21 @@ public:
 		return true;
 	}
 	bool seekPhysical(int64_t physicalAddress) override { return seekVirtual(physicalAddress); }
-	const std::wstring &getFileName() override { return dummyWFilename_; }
+	const fs::path &getFileName() override { return dummyFilename_; }
 private:
 	u64 address;
-	std::wstring dummyWFilename_;
+	fs::path dummyFilename_;
 };
 
-bool MipsAssembleOpcode(const char* line, DebugInterface* cpu, u32 address)
-{
-	StringList errors;
+bool MipsAssembleOpcode(std::string_view line, DebugInterface *cpu, u32 address, std::string *error) {
+	std::vector<std::string> errors;
 
-	wchar_t str[64];
-	swprintf(str,64,L".psp\n.org 0x%08X\n",address);
+	char str[64];
+	snprintf(str, 64, ".psp\n.org 0x%08X\n", address);
 
 	ArmipsArguments args;
 	args.mode = ArmipsMode::MEMORY;
-	args.content = str + ConvertUTF8ToWString(line);
+	args.content = str + std::string(line);
 	args.silent = true;
 	args.memoryFile.reset(new PspAssemblerFile());
 	args.errorsResult = &errors;
@@ -78,14 +65,12 @@ bool MipsAssembleOpcode(const char* line, DebugInterface* cpu, u32 address)
 		g_symbolMap->GetLabels(args.labels);
 	}
 
-	errorText = L"";
-	if (!runArmips(args))
-	{
-		for (size_t i = 0; i < errors.size(); i++)
-		{
-			errorText += errors[i];
-			if (i != errors.size()-1)
-				errorText += L"\n";
+	error->clear();
+	if (!runArmips(args)) {
+		for (size_t i = 0; i < errors.size(); i++) {
+			(*error) += errors[i];
+			if (i != errors.size() - 1)
+				error->push_back('\n');
 		}
 
 		return false;
@@ -93,5 +78,3 @@ bool MipsAssembleOpcode(const char* line, DebugInterface* cpu, u32 address)
 
 	return true;
 }
-
-}  // namespace

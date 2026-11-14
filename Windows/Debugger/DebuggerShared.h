@@ -2,8 +2,6 @@
 #include "Common/CommonWindows.h"
 #include "Core/Debugger/DebugInterface.h"
 
-extern HMENU g_hPopupMenus;
-
 enum { WM_DEB_GOTOWPARAM = WM_USER+2,
 	WM_DEB_GOTOADDRESSEDIT,
 	WM_DEB_MAPLOADED,
@@ -11,7 +9,8 @@ enum { WM_DEB_GOTOWPARAM = WM_USER+2,
 	WM_DEB_SETDEBUGLPARAM,
 	WM_DEB_UPDATE,
 	WM_DEB_SETSTATUSBARTEXT,
-	WM_DEB_GOTOHEXEDIT
+	WM_DEB_GOTOHEXEDIT,
+	WM_DEB_AFTERSTEP,
 };
 
 bool executeExpressionWindow(HWND hwnd, DebugInterface* cpu, u32& dest);

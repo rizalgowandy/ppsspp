@@ -16,18 +16,24 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
+#include <vector>
 
 #include "ppsspp_config.h"
 
 #include "Common/System/System.h"
+#include "Common/System/Request.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/sceUsbCam.h"
 #include "Core/HLE/sceUsbMic.h"
+#include "Core/CoreTiming.h"
 #include "Core/HW/Camera.h"
 #include "Core/MemMapHelpers.h"
+#include "ext/jpge/jpgd.h"
+#include "ext/jpge/jpge.h"
 
 #if defined(_WIN32) && !PPSSPP_PLATFORM(UWP) && !defined(__LIBRETRO__)
 #define HAVE_WIN32_CAMERA
@@ -42,6 +48,8 @@ Camera::Config *config;
 
 unsigned int videoBufferLength = 0;
 unsigned int nextVideoFrame = 0;
+// When video capture started, which the frame clock counts from. Not saved in states, it only sets the phase.
+static u64 videoStartUs = 0;
 uint8_t *videoBuffer;
 std::mutex videoBufferMutex;
 
@@ -57,15 +65,28 @@ void __UsbCamInit() {
 }
 
 void __UsbCamDoState(PointerWrap &p) {
+	const bool wasCapturing = config->mode == Camera::Mode::Video;
 	auto s = p.Section("sceUsbCam", 0, 1);
 	if (!s) {
+		if (p.mode == p.MODE_READ) {
+			// Older states didn't save the camera, so leave it off.
+			if (wasCapturing) {
+				Camera::stopCapture();
+			}
+			config->mode = Camera::Mode::Unused;
+			config->type = Camera::ConfigType::CfNone;
+		}
 		return;
 	}
 
 	Do(p, *config);
-	if (config->mode == Camera::Mode::Video) { // stillImage? TBD
-		Camera::stopCapture();
-		Camera::startCapture();
+	if (p.mode == p.MODE_READ) {
+		if (config->mode == Camera::Mode::Video) { // stillImage? TBD
+			Camera::stopCapture();
+			Camera::startCapture();
+		} else if (wasCapturing) {
+			Camera::stopCapture();
+		}
 	}
 }
 
@@ -73,6 +94,8 @@ void __UsbCamShutdown() {
 	if (config->mode == Camera::Mode::Video) { // stillImage? TBD
 		Camera::stopCapture();
 	}
+	// Capture can still deliver a frame after stopCapture(), on its own thread.
+	std::lock_guard<std::mutex> lock(videoBufferMutex);
 	delete[] videoBuffer;
 	videoBuffer = nullptr;
 	delete config;
@@ -113,40 +136,41 @@ static int getCameraResolution(Camera::ConfigType type, int *width, int *height)
 
 
 static int sceUsbCamSetupMic(u32 paramAddr, u32 workareaAddr, int wasize) {
-	INFO_LOG(HLE, "sceUsbCamSetupMic");
-	if (Memory::IsValidRange(paramAddr, sizeof(PspUsbCamSetupMicParam))) {
-		Memory::ReadStruct(paramAddr, &config->micParam);
+	auto param = PSPPointer<PspUsbCamSetupMicParam>::Create(paramAddr);
+	if (param.IsValid()) {
+		config->micParam = *param;
+		param.NotifyRead("UsbCamSetupMic");
 	}
-	return 0;
+	return hleLogInfo(Log::sceMisc, 0);
 }
 
 static int sceUsbCamStartMic() {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamStartMic");
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamStartMic");
 	return 0;
 }
 
 static int sceUsbCamStopMic() {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamStopMic");
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamStopMic");
 	return 0;
 }
 
 static int sceUsbCamReadMicBlocking(u32 bufAddr, u32 size) {
 	if (!Memory::IsValidAddress(bufAddr)) {
-		ERROR_LOG(HLE,"sceUsbCamReadMicBlocking(%08x, %d): invalid addresses", bufAddr, size);
+		ERROR_LOG(Log::HLE,"sceUsbCamReadMicBlocking(%08x, %d): invalid addresses", bufAddr, size);
 		return -1;
 	}
 
-	INFO_LOG(HLE, "sceUsbCamReadMicBlocking: size: %d", size);
+	INFO_LOG(Log::HLE, "sceUsbCamReadMicBlocking: size: %d", size);
 	return __MicInput(size >> 1, config->micParam.frequency, bufAddr, CAMERAMIC);
 }
 
 static int sceUsbCamReadMic(u32 bufAddr, u32 size) {
 	if (!Memory::IsValidAddress(bufAddr)) {
-		ERROR_LOG(HLE, "sceUsbCamReadMic(%08x, %d): invalid addresses", bufAddr, size);
+		ERROR_LOG(Log::HLE, "sceUsbCamReadMic(%08x, %d): invalid addresses", bufAddr, size);
 		return -1;
 	}
 
-	INFO_LOG(HLE, "sceUsbCamReadMic: size: %d", size);
+	INFO_LOG(Log::HLE, "sceUsbCamReadMic: size: %d", size);
 	return __MicInput(size >> 1, config->micParam.frequency, bufAddr, CAMERAMIC, false);
 }
 
@@ -155,16 +179,20 @@ static int sceUsbCamGetMicDataLength() {
 }
 
 static int sceUsbCamSetupVideo(u32 paramAddr, u32 workareaAddr, int wasize) {
-	if (Memory::IsValidRange(paramAddr, sizeof(PspUsbCamSetupVideoParam))) {
-		Memory::ReadStruct(paramAddr, &config->videoParam);
+	auto param = PSPPointer<PspUsbCamSetupVideoParam>::Create(paramAddr);
+	if (param.IsValid()) {
+		config->videoParam = *param;
+		param.NotifyRead("UsbCamSetupVideo");
 	}
 	config->type = Camera::ConfigType::CfVideo;
 	return 0;
 }
 
 static int sceUsbCamSetupVideoEx(u32 paramAddr, u32 workareaAddr, int wasize) {
-	if (Memory::IsValidRange(paramAddr, sizeof(PspUsbCamSetupVideoExParam))) {
-		Memory::ReadStruct(paramAddr, &config->videoExParam);
+	auto param = PSPPointer<PspUsbCamSetupVideoExParam>::Create(paramAddr);
+	if (param.IsValid()) {
+		config->videoExParam = *param;
+		param.NotifyRead("UsbCamSetupVideoEx");
 	}
 	config->type = Camera::ConfigType::CfVideoEx;
 	return 0;
@@ -187,6 +215,7 @@ static int sceUsbCamStartVideo() {
 		jpegData = nullptr;
 	}
 
+	videoStartUs = CoreTiming::GetGlobalTimeUs();
 	Camera::startCapture();
 	return 0;
 }
@@ -196,13 +225,29 @@ static int sceUsbCamStopVideo() {
 	return 0;
 }
 
+// How often the camera delivers a frame, from the framerate in the setup params
+// (PSPSDK's PSP_USBCAM_FRAMERATE_*: 3.75, 5, 7.5, 10, 15, 20, 30 and 60 fps).
+static int getFrameIntervalUs() {
+	static const int intervalsUs[] = { 266667, 200000, 133333, 100000, 66667, 50000, 33333, 16667 };
+	int framerate = config->type == Camera::ConfigType::CfVideoEx ? config->videoExParam.framerate : config->videoParam.framerate;
+	if (framerate < 0 || framerate >= (int)ARRAY_SIZE(intervalsUs)) {
+		framerate = 6;  // 30 fps
+	}
+	return intervalsUs[framerate];
+}
+
 static int sceUsbCamReadVideoFrameBlocking(u32 bufAddr, u32 size) {
 	std::lock_guard<std::mutex> lock(videoBufferMutex);
 	u32 transferSize = std::min(videoBufferLength, size);
 	if (Memory::IsValidRange(bufAddr, size)) {
 		Memory::Memcpy(bufAddr, videoBuffer, transferSize);
 	}
-	return transferSize;
+	// This blocks until the camera's next frame. Returning at once lets a high-priority capture thread
+	// (Go!Edit's bhCameraGetJpeg) spin in its read loop and starve the rest of the game.
+	const int intervalUs = getFrameIntervalUs();
+	const u64 sinceStartUs = CoreTiming::GetGlobalTimeUs() - videoStartUs;
+	const int waitUs = intervalUs - (int)(sinceStartUs % intervalUs);
+	return hleDelayResult(hleLogDebug(Log::HLE, transferSize), "camera frame", waitUs);
 }
 
 static int sceUsbCamReadVideoFrame(u32 bufAddr, u32 size) {
@@ -216,40 +261,44 @@ static int sceUsbCamReadVideoFrame(u32 bufAddr, u32 size) {
 }
 
 static int sceUsbCamPollReadVideoFrameEnd() {
-	VERBOSE_LOG(HLE, "UNIMPL sceUsbCamPollReadVideoFrameEnd: %d", nextVideoFrame);
+	VERBOSE_LOG(Log::HLE, "UNIMPL sceUsbCamPollReadVideoFrameEnd: %d", nextVideoFrame);
 	return nextVideoFrame;
 }
 
 static int sceUsbCamSetupStill(u32 paramAddr) {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamSetupStill");
-	if (Memory::IsValidRange(paramAddr, sizeof(PspUsbCamSetupStillParam))) {
-		Memory::ReadStruct(paramAddr, &config->stillParam);
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamSetupStill");
+	auto param = PSPPointer<PspUsbCamSetupStillParam>::Create(paramAddr);
+	if (param.IsValid()) {
+		config->stillParam = *param;
+		param.NotifyRead("UsbCamSetupStill");
 	}
 	config->type = Camera::ConfigType::CfStill;
 	return 0;
 }
 
 static int sceUsbCamSetupStillEx(u32 paramAddr) {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamSetupStillEx");
-	if (Memory::IsValidRange(paramAddr, sizeof(PspUsbCamSetupStillExParam))) {
-		Memory::ReadStruct(paramAddr, &config->stillExParam);
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamSetupStillEx");
+	auto param = PSPPointer<PspUsbCamSetupStillExParam>::Create(paramAddr);
+	if (param.IsValid()) {
+		config->stillExParam = *param;
+		param.NotifyRead("UsbCamSetupStillEx");
 	}
 	config->type = Camera::ConfigType::CfStillEx;
 	return 0;
 }
 
 static int sceUsbCamAutoImageReverseSW(int on) {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamAutoImageReverseSW: %d", on);
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamAutoImageReverseSW: %d", on);
 	return 0;
 }
 
 static int sceUsbCamGetLensDirection() {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamGetLensDirection");
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamGetLensDirection");
 	return 0;
 }
 
 static int sceUsbCamSetReverseMode(int reverseflags) {
-	INFO_LOG(HLE, "UNIMPL sceUsbCamSetReverseMode %d", reverseflags);
+	INFO_LOG(Log::HLE, "UNIMPL sceUsbCamSetReverseMode %d", reverseflags);
 	return 0;
 }
 
@@ -314,64 +363,55 @@ const HLEFunction sceUsbCam[] =
 
 void Register_sceUsbCam()
 {
-	RegisterModule("sceUsbCam", ARRAY_SIZE(sceUsbCam), sceUsbCam);
+	RegisterHLEModule("sceUsbCam", ARRAY_SIZE(sceUsbCam), sceUsbCam);
 }
 
 std::vector<std::string> Camera::getDeviceList() {
-	#ifdef HAVE_WIN32_CAMERA
-		if (winCamera) {
-			return winCamera->getDeviceList();
-		}
-	#elif PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS)
-		return __cameraGetDeviceList();
-	#elif defined(USING_QT_UI) // Qt:macOS / Qt:Linux
-		return __qt_getDeviceList();
-	#elif PPSSPP_PLATFORM(LINUX) // SDL:Linux
-		return __v4l_getDeviceList();
-	#endif
-	return std::vector<std::string>();
+#ifdef HAVE_WIN32_CAMERA
+	if (winCamera) {
+		return winCamera->getDeviceList();
+	} else {
+		return std::vector<std::string>();
+	}
+#else
+	return System_GetCameraDeviceList();
+#endif
 }
 
 int Camera::startCapture() {
 	int width, height;
 	getCameraResolution(config->type, &width, &height);
-	INFO_LOG(HLE, "%s resolution: %dx%d", __FUNCTION__, width, height);
+	INFO_LOG(Log::HLE, "%s resolution: %dx%d", __FUNCTION__, width, height);
 
 	config->mode = Camera::Mode::Video;
 	#ifdef HAVE_WIN32_CAMERA
 		if (winCamera) {
 			if (winCamera->isShutDown()) {
 				delete winCamera;
-				winCamera = new WindowsCaptureDevice(CAPTUREDEVIDE_TYPE::VIDEO);
-				winCamera->sendMessage({ CAPTUREDEVIDE_COMMAND::INITIALIZE, nullptr });
+				winCamera = new WindowsCaptureDevice(CAPTUREDEVICE_TYPE::VIDEO);
 			}
 			void* resolution = static_cast<void*>(new std::vector<int>({ width, height }));
-			winCamera->sendMessage({ CAPTUREDEVIDE_COMMAND::START, resolution });
+			winCamera->sendMessage({ CAPTUREDEVICE_COMMAND::START, resolution });
 		}
-	#elif PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS) || defined(USING_QT_UI)
+	#elif PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS)
 		char command[40] = {0};
 		snprintf(command, sizeof(command), "startVideo_%dx%d", width, height);
-		System_SendMessage("camera_command", command);
-	#elif PPSSPP_PLATFORM(LINUX)
-		__v4l_startCapture(width, height);
-	#else
-		ERROR_LOG(HLE, "%s not implemented", __FUNCTION__);
+		System_CameraCommand(command);
+		ERROR_LOG(Log::HLE, "%s not implemented", __FUNCTION__);
 	#endif
 	return 0;
 }
 
 int Camera::stopCapture() {
-	INFO_LOG(HLE, "%s", __FUNCTION__);
+	INFO_LOG(Log::HLE, "%s", __FUNCTION__);
 	#ifdef HAVE_WIN32_CAMERA
 		if (winCamera) {
-			winCamera->sendMessage({ CAPTUREDEVIDE_COMMAND::STOP, nullptr });
+			winCamera->sendMessage({ CAPTUREDEVICE_COMMAND::STOP, nullptr });
 		}
-	#elif PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS) || defined(USING_QT_UI)
-		System_SendMessage("camera_command", "stopVideo");
-	#elif PPSSPP_PLATFORM(LINUX)
-		__v4l_stopCapture();
+	#elif PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS)
+		System_CameraCommand("stopVideo");
 	#else
-		ERROR_LOG(HLE, "%s not implemented", __FUNCTION__);
+		ERROR_LOG(Log::HLE, "%s not implemented", __FUNCTION__);
 	#endif
 	config->mode = Camera::Mode::Unused;
 	return 0;
@@ -384,7 +424,73 @@ void Camera::onCameraDeviceChange() {
 	}
 }
 
+// Called from the capture thread.
+int Camera::getMaxFrameSize() {
+	std::lock_guard<std::mutex> lock(videoBufferMutex);
+	int framesize = 0;
+	if (config) {
+		if (config->type == Camera::ConfigType::CfVideoEx) {
+			framesize = config->videoExParam.framesize;
+		} else if (config->type == Camera::ConfigType::CfVideo) {
+			framesize = config->videoParam.framesize;
+		}
+	}
+	if (framesize <= 0 || framesize > VIDEO_BUFFER_SIZE) {
+		return VIDEO_BUFFER_SIZE;
+	}
+	return framesize;
+}
+
+// The JPEG quality that fit the last frame. Frames of one scene are similar in size, so it's usually
+// right first time. Only the capture thread uses it, but atomic in case a platform has several.
+static std::atomic<int> g_jpegQuality{ 80 };
+
+int Camera::encodeToFit(int maxSize, const std::function<int(int quality)> &encode) {
+	int quality = g_jpegQuality;
+	int size = encode(quality);
+	while ((size < 0 || size > maxSize) && quality > 10) {
+		quality = std::max(10, quality - 10);
+		size = encode(quality);
+	}
+	// Way under the limit: try a better quality next time.
+	if (size >= 0 && size < maxSize / 2 && quality < 90) {
+		quality += 10;
+	}
+	g_jpegQuality = quality;
+	return size;
+}
+
+// Re-encodes a frame until it fits maxSize, like the PSP camera compresses to the game's framesize.
+// Most platforms' capture code encodes at a fixed quality, so this is the common fallback.
+static bool RecompressToFit(const unsigned char *image, long long length, int maxSize, std::vector<uint8_t> *out) {
+	int width = 0, height = 0, comps = 0;
+	unsigned char *rgb = jpgd::decompress_jpeg_image_from_memory(image, (int)length, &width, &height, &comps, 3);
+	if (!rgb) {
+		return false;
+	}
+	out->resize(width * height * 3 + 1024);
+	int size = Camera::encodeToFit(maxSize, [&](int quality) {
+		jpge::params params;
+		params.m_quality = quality;
+		int outSize = (int)out->size();
+		return jpge::compress_image_to_jpeg_file_in_memory(out->data(), outSize, width, height, 3, rgb, params) ? outSize : -1;
+	});
+	free(rgb);
+	if (size < 0 || size > maxSize) {
+		return false;
+	}
+	out->resize(size);
+	return true;
+}
+
 void Camera::pushCameraImage(long long length, unsigned char* image) {
+	std::vector<uint8_t> recompressed;
+	const int maxSize = getMaxFrameSize();
+	if (length > maxSize && RecompressToFit(image, length, maxSize, &recompressed)) {
+		image = recompressed.data();
+		length = (long long)recompressed.size();
+	}
+
 	std::lock_guard<std::mutex> lock(videoBufferMutex);
 	if (!videoBuffer) {
 		return;
@@ -392,7 +498,7 @@ void Camera::pushCameraImage(long long length, unsigned char* image) {
 	memset(videoBuffer, 0, VIDEO_BUFFER_SIZE);
 	if (length > VIDEO_BUFFER_SIZE) {
 		videoBufferLength = 0;
-		ERROR_LOG(HLE, "pushCameraImage: length error: %lld > %d", length, VIDEO_BUFFER_SIZE);
+		ERROR_LOG(Log::HLE, "pushCameraImage: length error: %lld > %d", length, VIDEO_BUFFER_SIZE);
 	} else {
 		videoBufferLength = length;
 		memcpy(videoBuffer, image, length);

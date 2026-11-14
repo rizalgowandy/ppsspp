@@ -2,13 +2,8 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
-#include <string>
-
 #include "Core/WaveFile.h"
 #include "Common/Log.h"
-#include "Core/Config.h"
-
-constexpr size_t WaveFileWriter::BUFFER_SIZE;
 
 WaveFileWriter::WaveFileWriter() {}
 
@@ -17,17 +12,17 @@ WaveFileWriter::~WaveFileWriter()
 	Stop();
 }
 
-bool WaveFileWriter::Start(const std::string& filename, unsigned int HLESampleRate)
+bool WaveFileWriter::Start(const Path &filename, unsigned int HLESampleRate)
 {
 	// Check if the file is already open
 	if (file) {
-		ERROR_LOG(SYSTEM, "The file %s was already open, the file header will not be written.", filename.c_str());
+		ERROR_LOG(Log::System, "The file %s was already open, the file header will not be written.", filename.c_str());
 		return false;
 	}
 
 	file.Open(filename, "wb");
 	if (!file) {
-		ERROR_LOG(IO, "The file %s could not be opened for writing. Please check if it's already opened by another program.", filename.c_str());
+		ERROR_LOG(Log::IO, "The file %s could not be opened for writing. Please check if it's already opened by another program.", filename.c_str());
 		return false;
 	}
 
@@ -80,10 +75,15 @@ void WaveFileWriter::Write4(const char* ptr)
 	file.WriteBytes(ptr, 4);
 }
 
+// count is the number of stereo frames, so 4 bytes each.
 void WaveFileWriter::AddStereoSamples(const short* sample_data, uint32_t count)
 {
-	_assert_msg_(file, "WaveFileWriter - file not open.");
-	_assert_msg_(count <= BUFFER_SIZE * 2, "WaveFileWriter - buffer too small (count = %u).", count);
+	if (!file) {
+		// Callers are supposed to check that Start() succeeded, but this used to assert - which
+		// isn't compiled out in release builds, so a file we couldn't open crashed the emulator.
+		ERROR_LOG(Log::System, "WaveFileWriter - file not open.");
+		return;
+	}
 
 	if (skip_silence)
 	{

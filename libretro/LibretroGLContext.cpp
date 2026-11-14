@@ -7,8 +7,8 @@
 
 #include "libretro/LibretroGLContext.h"
 
-bool LibretroGLContext::Init() {
-	if (!LibretroHWRenderContext::Init(true))
+bool LibretroGLContext::InitAPI(void *wnd, std::string *deviceName, std::string *error_message) {
+	if (!LibretroHWRenderContext::InitHW(false))
 		return false;
 
 	g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
@@ -31,14 +31,17 @@ void LibretroGLContext::CreateDrawContext() {
 #endif
 
     CheckGLExtensions();
-    draw_ = Draw::T3DCreateGLContext();
+    draw_ = Draw::T3DCreateGLContext(false);
     renderManager_ = (GLRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
     renderManager_->SetInflightFrames(g_Config.iInflightFrames);
     SetGPUBackend(GPUBackend::OPENGL);
-    draw_->CreatePresets();
 }
 
 void LibretroGLContext::DestroyDrawContext() {
 	LibretroHWRenderContext::DestroyDrawContext();
 	renderManager_ = nullptr;
+}
+
+void LibretroGLContext::NotifyEmuThreadExit() {
+   renderManager_->NotifyEmuThreadExit();
 }

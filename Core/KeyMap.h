@@ -18,24 +18,28 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <map>
 #include <vector>
 #include <set>
-#include "Common/Input/InputState.h" // KeyDef
+
+#include "Common/Input/InputState.h" // InputMapping
 #include "Common/Input/KeyCodes.h"     // keyboard keys
-#include "../Core/HLE/sceCtrl.h"   // psp keys
+#include "Common/Data/Collections/TinySet.h"
+#include "Core/KeyMapDefaults.h"
 
 #define KEYMAP_ERROR_KEY_ALREADY_USED -1
 #define KEYMAP_ERROR_UNKNOWN_KEY 0
 
-enum {
+// Don't change any of these - it'll break backwards compatibility with configs.
+enum VirtKey : u32 {
 	VIRTKEY_FIRST = 0x40000001,
 	VIRTKEY_AXIS_X_MIN = 0x40000001,
 	VIRTKEY_AXIS_Y_MIN = 0x40000002,
 	VIRTKEY_AXIS_X_MAX = 0x40000003,
 	VIRTKEY_AXIS_Y_MAX = 0x40000004,
 	VIRTKEY_RAPID_FIRE = 0x40000005,
-	VIRTKEY_UNTHROTTLE = 0x40000006,
+	VIRTKEY_FASTFORWARD = 0x40000006,
 	VIRTKEY_PAUSE = 0x40000007,
 	VIRTKEY_SPEED_TOGGLE = 0x40000008,
 	VIRTKEY_AXIS_RIGHT_X_MIN = 0x40000009,
@@ -48,7 +52,7 @@ enum {
 	VIRTKEY_NEXT_SLOT = 0x40000010,
 	VIRTKEY_TOGGLE_FULLSCREEN = 0x40000011,
 	VIRTKEY_ANALOG_LIGHTLY = 0x40000012,
-	VIRTKEY_AXIS_SWAP = 0x40000013,
+	VIRTKEY_AXIS_SWAP_TOGGLE = 0x40000013,
 	VIRTKEY_DEVMENU = 0x40000014,
 	VIRTKEY_FRAME_ADVANCE = 0x40000015,
 	VIRTKEY_RECORD = 0x40000016,
@@ -61,24 +65,27 @@ enum {
 	VIRTKEY_OPENCHAT = 0x4000001D,
 	VIRTKEY_ANALOG_ROTATE_CW = 0x4000001E,
 	VIRTKEY_ANALOG_ROTATE_CCW = 0x4000001F,
+	VIRTKEY_SCREEN_ROTATION_VERTICAL = 0x40000020,
+	VIRTKEY_SCREEN_ROTATION_VERTICAL180 = 0x40000021,
+	VIRTKEY_SCREEN_ROTATION_HORIZONTAL = 0x40000022,
+	VIRTKEY_SCREEN_ROTATION_HORIZONTAL180 = 0x40000023,
+	VIRTKEY_SPEED_ANALOG = 0x40000024,
+	VIRTKEY_VR_CAMERA_ADJUST = 0x40000025,
+	VIRTKEY_VR_CAMERA_RESET = 0x40000026,
+	VIRTKEY_PREVIOUS_SLOT = 0x40000027,
+	VIRTKEY_TOGGLE_WLAN = 0x40000028,
+	VIRTKEY_EXIT_APP = 0x40000029,
+	VIRTKEY_TOGGLE_MOUSE = 0x40000030,
+	VIRTKEY_TOGGLE_TOUCH_CONTROLS =  0x40000031,
+	VIRTKEY_RESET_EMULATION = 0x40000032,
+	VIRTKEY_TOGGLE_DEBUGGER = 0x40000033,
+	VIRTKEY_PAUSE_NO_MENU = 0x40000034,
+	VIRTKEY_TOGGLE_TILT = 0x40000035,
+	VIRTKEY_AXIS_SWAP_HOLD = 0x40000036,
+	VIRTKEY_CREATE_FRAME_DUMP = 0x40000037,
 	VIRTKEY_LAST,
 	VIRTKEY_COUNT = VIRTKEY_LAST - VIRTKEY_FIRST
 };
-
-enum DefaultMaps {
-	DEFAULT_MAPPING_KEYBOARD,
-	DEFAULT_MAPPING_PAD,
-	DEFAULT_MAPPING_X360,
-	DEFAULT_MAPPING_SHIELD,
-	DEFAULT_MAPPING_OUYA,
-	DEFAULT_MAPPING_XPERIA_PLAY,
-	DEFAULT_MAPPING_MOQI_I7S,
-};
-
-const float AXIS_BIND_THRESHOLD = 0.75f;
-const float AXIS_BIND_THRESHOLD_MOUSE = 0.01f;
-
-typedef std::map<int, std::vector<KeyDef>> KeyMapping;
 
 struct MappedAnalogAxis {
 	int axisId;
@@ -105,9 +112,57 @@ struct MappedAnalogAxes {
 class IniFile;
 
 namespace KeyMap {
-	extern KeyMapping g_controllerMap;
-	extern int g_controllerMapGeneration;
+	// Combo of InputMappings.
+	struct MultiInputMapping {
+		MultiInputMapping() {}
+		explicit MultiInputMapping(const InputMapping &mapping) {
+			mappings.push_back(mapping);
+		}
+		
+		static MultiInputMapping FromConfigString(std::string_view str);
+		std::string ToConfigString() const;
+		std::string ToVisualString() const;
 
+		bool operator <(const MultiInputMapping &other) {
+			for (size_t i = 0; i < mappings.capacity(); i++) {
+				// If one ran out of entries, the other wins.
+				if (mappings.size() == i && other.mappings.size() > i) return true;
+				if (mappings.size() >= i && other.mappings.size() == i) return false;
+				if (mappings[i] < other.mappings[i]) return true;
+				if (mappings[i] > other.mappings[i]) return false;
+			}
+			return false;
+		}
+
+		bool operator ==(const MultiInputMapping &other) const {
+			return mappings == other.mappings;
+		}
+
+		bool EqualsSingleMapping(const InputMapping &other) const {
+			return mappings.size() == 1 && mappings[0] == other;
+		}
+
+		bool empty() const {
+			return mappings.empty();
+		}
+
+		bool HasMouse() const {
+			for (auto &m : mappings) {
+				return m.deviceId == DEVICE_ID_MOUSE;
+			}
+			return false;
+		}
+
+		FixedVec<InputMapping, 3> mappings;
+	};
+
+	typedef std::map<int, std::vector<MultiInputMapping>> KeyMapping;
+
+	// Once the multimappings are inserted here, they must not be empty.
+	// If one would be, delete the whole entry from the map instead.
+	// This is automatically handled by SetInputMapping.
+	extern std::set<InputDeviceID> g_seenDeviceIds;
+	extern int g_controllerMapGeneration;
 	// Key & Button names
 	struct KeyMap_IntStrPair {
 		int key;
@@ -115,52 +170,74 @@ namespace KeyMap {
 	};
 
 	// Use if you need to display the textual name
-	std::string GetKeyName(int keyCode);
-	std::string GetKeyOrAxisName(int keyCode);
+	std::string GetKeyName(InputKeyCode keyCode);
+	std::string GetKeyOrAxisName(const InputMapping &mapping);
 	std::string GetAxisName(int axisId);
 	std::string GetPspButtonName(int btn);
+	const char *GetPspButtonNameCharPointer(int btn);
 
-	std::vector<KeyMap_IntStrPair> GetMappableKeys();
+	const KeyMap_IntStrPair *GetMappableKeys(size_t *count);
 
-	// Use to translate KeyMap Keys to PSP
-	// buttons. You should have already translated
-	// your platform's keys to KeyMap keys.
-	bool KeyToPspButton(int deviceId, int key, std::vector<int> *pspKeys);
-	bool KeyFromPspButton(int btn, std::vector<KeyDef> *keys, bool ignoreMouse);
+	// Use to translate input mappings to and from PSP buttons. You should have already translated
+	// your platform's keys to InputMapping keys.
 
-	int TranslateKeyCodeToAxis(int keyCode, int &direction);
-	int TranslateKeyCodeFromAxis(int axisId, int direction);
+	// Note that this one does not handle combos, since there's only one input.
+	bool InputMappingToPspButton(const InputMapping &mapping, std::vector<int> *pspButtons);
+	bool InputMappingsFromPspButton(int btn, std::vector<MultiInputMapping> *keys, bool ignoreMouse);
 
-	// Configure the key mapping.
+	// Careful with these.
+	bool InputMappingsFromPspButtonNoLock(int btn, std::vector<MultiInputMapping> *keys, bool ignoreMouse);
+	// Collects every mapping that consists of more than one input, ie. a combo.
+	void GetAllComboMappingsNoLock(std::vector<MultiInputMapping> *combos);
+	void LockMappings();
+	void UnlockMappings();
+
+	// Simplified check.
+	bool PspButtonHasMappings(int btn);
+
+	// Configure the key or axis mapping.
 	// Any configuration will be saved to the Core config.
-	void SetKeyMapping(int psp_key, KeyDef key, bool replace);
+	void SetInputMapping(int psp_key, const MultiInputMapping &key, bool replace);
+	// Return false if bind was a duplicate and got removed
+	bool ReplaceSingleKeyMapping(int btn, int index, const MultiInputMapping &key);
 
-	// Configure an axis mapping, saves the configuration.
-	// Direction is negative or positive.
-	void SetAxisMapping(int btn, int deviceId, int axisId, int direction, bool replace);
-
-	bool AxisToPspButton(int deviceId, int axisId, int direction, std::vector<int> *pspKeys);
-	bool AxisFromPspButton(int btn, int *deviceId, int *axisId, int *direction);
-	MappedAnalogAxes MappedAxesForDevice(int deviceId);
+	MappedAnalogAxes MappedAxesForDevice(InputDeviceID deviceId);
 
 	void LoadFromIni(IniFile &iniFile);
 	void SaveToIni(IniFile &iniFile);
+	void ClearAllMappings();
+	void DeleteNthMapping(int key, int number);
 
 	void SetDefaultKeyMap(DefaultMaps dmap, bool replace);
 
 	void RestoreDefault();
 
-	void SwapAxis();
 	void UpdateNativeMenuKeys();
 
-	void NotifyPadConnected(const std::string &name);
-	bool IsNvidiaShield(const std::string &name);
-	bool IsNvidiaShieldTV(const std::string &name);
-	bool IsXperiaPlay(const std::string &name);
-	bool IsOuya(const std::string &name);
-	bool IsMOQII7S(const std::string &name);
-	bool HasBuiltinController(const std::string &name);
+	void NotifyPadConnected(InputDeviceID deviceId, std::string_view name);
+	void NotifyPadDisconnected(InputDeviceID deviceId);
+
+	bool IsNvidiaShield(std::string_view name);
+	bool IsNvidiaShieldTV(std::string_view name);
+	bool IsXperiaPlay(std::string_view name);
+	bool IsMOQII7S(std::string_view name);
+	bool IsRetroid(std::string_view name);
+	bool HasBuiltinController(std::string_view name);
 
 	const std::set<std::string> &GetSeenPads();
-	void AutoConfForPad(const std::string &name);
-}
+	std::string PadName(InputDeviceID deviceId);
+	void AutoConfForPad(std::string_view name);
+
+	bool IsKeyMapped(InputDeviceID device, int key);
+
+	bool HasChanged(int &prevGeneration);
+
+	// Used for setting thresholds. Technically we could allow a setting per axis, but this is a reasonable compromise.
+	enum class AxisType {
+		TRIGGER,
+		STICK,
+		OTHER,
+	};
+
+	AxisType GetAxisType(InputAxis axis);
+}  // namespace KeyMap

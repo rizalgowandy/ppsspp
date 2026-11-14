@@ -15,18 +15,12 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#ifdef __MINGW32__
-#include <unistd.h>
-#ifndef _POSIX_THREAD_SAFE_FUNCTIONS
-#define _POSIX_THREAD_SAFE_FUNCTIONS 200112L
-#endif
-#endif
-
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <vector>
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Log.h"
 #include "Common/File/FileUtil.h"
 #include "Common/StringUtils.h"
@@ -57,7 +51,7 @@ enum class ReplayState {
 // File data formats below.
 #pragma pack(push, 1)
 
-static const char *REPLAY_MAGIC = "PPREPLAY";
+static const char * const REPLAY_MAGIC = "PPREPLAY";
 static const int REPLAY_VERSION_MIN = 1;
 static const int REPLAY_VERSION_CURRENT = 1;
 
@@ -116,7 +110,7 @@ struct ReplayFileInfo {
 
 struct ReplayItem {
 	ReplayItemHeader info;
-	std::vector<u8> data;
+	std::vector<uint8_t> data;
 
 	ReplayItem(ReplayItemHeader h) : info(h) {
 	}
@@ -136,14 +130,23 @@ static uint8_t lastAnalog[2][2]{};
 static size_t replayDiskPos = 0;
 static bool diskFailed = false;
 
-void ReplayExecuteBlob(const std::vector<u8> &data) {
+bool ReplayExecuteBlob(int version, const std::vector<uint8_t> &data) {
+	if (version < REPLAY_VERSION_MIN || version > REPLAY_VERSION_CURRENT) {
+		ERROR_LOG(Log::System, "Bad replay data version: %d", version);
+		return false;
+	}
+	if (data.size() == 0) {
+		ERROR_LOG(Log::System, "Empty replay data");
+		return false;
+	}
+
 	ReplayAbort();
 
 	// Rough estimate.
 	replayItems.reserve(data.size() / sizeof(ReplayItemHeader));
 	for (size_t i = 0, sz = data.size(); i < sz; ) {
 		if (i + sizeof(ReplayItemHeader) > sz) {
-			ERROR_LOG(SYSTEM, "Truncated replay data at %lld during item header", (long long)i);
+			ERROR_LOG(Log::System, "Truncated replay data at %lld during item header", (long long)i);
 			break;
 		}
 		ReplayItemHeader *info = (ReplayItemHeader *)&data[i];
@@ -151,8 +154,10 @@ void ReplayExecuteBlob(const std::vector<u8> &data) {
 		i += sizeof(ReplayItemHeader);
 
 		if ((int)item.info.action & (int)ReplayAction::MASK_SIDEDATA) {
-			if (i + item.info.size > sz) {
-				ERROR_LOG(SYSTEM, "Truncated replay data at %lld during side data", (long long)i);
+			// Subtraction-based check (rather than i + item.info.size > sz) avoids
+			// wraparound on platforms where size_t is 32-bit. Bound checking because memcpy.
+			if (item.info.size > sz - i) {
+				ERROR_LOG(Log::System, "Truncated replay data at %lld during side data", (long long)i);
 				break;
 			}
 			if (item.info.size != 0) {
@@ -166,50 +171,55 @@ void ReplayExecuteBlob(const std::vector<u8> &data) {
 	}
 
 	replayState = ReplayState::EXECUTE;
-	INFO_LOG(SYSTEM, "Executing replay with %lld items", (long long)replayItems.size());
+	INFO_LOG(Log::System, "Executing replay with %lld items", (long long)replayItems.size());
+	return true;
 }
 
-bool ReplayExecuteFile(const std::string &filename) {
+bool ReplayExecuteFile(const Path &filename) {
 	ReplayAbort();
 
 	FILE *fp = File::OpenCFile(filename, "rb");
 	if (!fp) {
-		DEBUG_LOG(SYSTEM, "Failed to open replay file: %s", filename.c_str());
+		DEBUG_LOG(Log::System, "Failed to open replay file: %s", filename.c_str());
 		return false;
 	}
 
-	std::vector<u8> data;
+	int version = -1;
+	std::vector<uint8_t> data;
 	auto loadData = [&]() {
 		// TODO: Maybe stream instead.
 		size_t sz = File::GetFileSize(fp);
 		if (sz <= sizeof(ReplayFileHeader)) {
-			ERROR_LOG(SYSTEM, "Empty replay data");
+			ERROR_LOG(Log::System, "Empty replay data");
 			return false;
 		}
 
 		ReplayFileHeader fh;
 		if (fread(&fh, sizeof(fh), 1, fp) != 1) {
-			ERROR_LOG(SYSTEM, "Could not read replay file header");
+			ERROR_LOG(Log::System, "Could not read replay file header");
 			return false;
 		}
 		sz -= sizeof(fh);
 
 		if (memcmp(fh.magic, REPLAY_MAGIC, sizeof(fh.magic)) != 0) {
-			ERROR_LOG(SYSTEM, "Replay header corrupt");
+			ERROR_LOG(Log::System, "Replay header corrupt");
 			return false;
 		}
 
 		if (fh.version < REPLAY_VERSION_MIN) {
-			ERROR_LOG(SYSTEM, "Replay version %d unsupported", fh.version);
+			ERROR_LOG(Log::System, "Replay version %d unsupported", fh.version);
 			return false;
 		} else if (fh.version > REPLAY_VERSION_CURRENT) {
-			WARN_LOG(SYSTEM, "Replay version %d scary and futuristic, trying anyway", fh.version);
+			WARN_LOG(Log::System, "Replay version %d scary and futuristic, trying anyway", fh.version);
 		}
+
+		RtcSetBaseTime((int32_t)fh.rtcBaseSeconds, 0);
+		version = fh.version;
 
 		data.resize(sz);
 
 		if (fread(&data[0], sz, 1, fp) != 1) {
-			ERROR_LOG(SYSTEM, "Could not read replay data");
+			ERROR_LOG(Log::System, "Could not read replay data");
 			return false;
 		}
 
@@ -218,7 +228,7 @@ bool ReplayExecuteFile(const std::string &filename) {
 
 	if (loadData()) {
 		fclose(fp);
-		ReplayExecuteBlob(data);
+		ReplayExecuteBlob(version, data);
 		return true;
 	}
 
@@ -243,7 +253,7 @@ void ReplayBeginSave() {
 	replayState = ReplayState::SAVE;
 }
 
-void ReplayFlushBlob(std::vector<u8> *data) {
+void ReplayFlushBlob(std::vector<uint8_t> *data) {
 	size_t sz = replayItems.size() * sizeof(ReplayItemHeader);
 	// Add in any side data.
 	for (const auto &item : replayItems) {
@@ -269,10 +279,10 @@ void ReplayFlushBlob(std::vector<u8> *data) {
 	replayItems.clear();
 }
 
-bool ReplayFlushFile(const std::string &filename) {
+bool ReplayFlushFile(const Path &filename) {
 	FILE *fp = File::OpenCFile(filename, replaySaveWroteHeader ? "ab" : "wb");
 	if (!fp) {
-		ERROR_LOG(SYSTEM, "Failed to open replay file: %s", filename.c_str());
+		ERROR_LOG(Log::System, "Failed to open replay file: %s", filename.c_str());
 		return false;
 	}
 
@@ -289,7 +299,7 @@ bool ReplayFlushFile(const std::string &filename) {
 	size_t c = replayItems.size();
 	if (success && c != 0) {
 		// TODO: Maybe stream instead.
-		std::vector<u8> data;
+		std::vector<uint8_t> data;
 		ReplayFlushBlob(&data);
 
 		success = fwrite(&data[0], data.size(), 1, fp) == 1;
@@ -297,11 +307,15 @@ bool ReplayFlushFile(const std::string &filename) {
 	fclose(fp);
 
 	if (success) {
-		DEBUG_LOG(SYSTEM, "Flushed %lld replay items", (long long)c);
+		DEBUG_LOG(Log::System, "Flushed %lld replay items", (long long)c);
 	} else {
-		ERROR_LOG(SYSTEM, "Could not write %lld replay items (disk full?)", (long long)c);
+		ERROR_LOG(Log::System, "Could not write %lld replay items (disk full?)", (long long)c);
 	}
 	return success;
+}
+
+int ReplayVersion() {
+	return REPLAY_VERSION_CURRENT;
 }
 
 void ReplayAbort() {
@@ -317,6 +331,14 @@ void ReplayAbort() {
 
 	replayDiskPos = 0;
 	diskFailed = false;
+}
+
+bool ReplayIsExecuting() {
+	return replayState == ReplayState::EXECUTE;
+}
+
+bool ReplayIsSaving() {
+	return replayState == ReplayState::SAVE;
 }
 
 static void ReplaySaveCtrl(uint32_t &buttons, uint8_t analog[2][2], uint64_t t) {
@@ -461,8 +483,11 @@ uint32_t ReplayApplyDiskRead(void *data, uint32_t readSize, uint32_t dataSize, b
 	{
 		auto item = ReplayNextDisk(ReplayAction::FILE_READ, t);
 		if (item && item->data.size() <= dataSize) {
-			memcpy(data, &item->data[0], item->data.size());
-			return item->info.result;
+			if (!item->data.empty()) {
+				memcpy(data, item->data.data(), item->data.size());
+			}
+			// The game sizes its next steps by this, so don't claim more than was copied.
+			return std::min((uint32_t)item->info.result, (uint32_t)item->data.size());
 		}
 		return readSize;
 	}
@@ -471,7 +496,9 @@ uint32_t ReplayApplyDiskRead(void *data, uint32_t readSize, uint32_t dataSize, b
 	{
 		ReplayItem item = ReplayItemHeader(ReplayAction::FILE_READ, t, readSize);
 		item.data.resize(readSize);
-		memcpy(&item.data[0], data, readSize);
+		if (readSize) {
+			memcpy(item.data.data(), data, readSize);
+		}
 		replayItems.push_back(item);
 		return readSize;
 	}
@@ -512,7 +539,7 @@ static void ConvertToTm(struct tm *t, int64_t sec) {
 
 ReplayFileInfo ConvertFileInfo(const PSPFileInfo &data) {
 	ReplayFileInfo info;
-	truncate_cpy(info.filename, data.name.c_str());
+	truncate_cpy(info.filename, data.name);
 	info.size = data.size;
 	info.access = (uint16_t)data.access;
 	info.exists = data.exists ? 1 : 0;

@@ -16,15 +16,17 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
+
 #if PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
 
-#include <emmintrin.h>
-
+#include <cfloat>
 #include "Common/CPUDetect.h"
+#include "Common/Data/Convert/ColorConv.h"
+#include "Common/Math/SIMDHeaders.h"
 #include "Core/Config.h"
-#include "Core/Reporting.h"
 #include "GPU/GPUState.h"
 #include "GPU/Common/VertexDecoderCommon.h"
+#include "GPU/Common/VertexDecoderHandwritten.h"
 
 // We start out by converting the active matrices into 4x4 which are easier to multiply with
 // using SSE / NEON and store them here.
@@ -61,6 +63,8 @@ static const X64Reg tempReg3 = R10;
 static const X64Reg srcReg = RCX;
 static const X64Reg dstReg = RDX;
 static const X64Reg counterReg = R8;
+static const X64Reg uvScalePtrReg = R9;  // only used during init
+static const X64Reg alphaReg = R11;
 #else
 static const X64Reg tempReg1 = RAX;
 static const X64Reg tempReg2 = R9;
@@ -68,6 +72,8 @@ static const X64Reg tempReg3 = R10;
 static const X64Reg srcReg = RDI;
 static const X64Reg dstReg = RSI;
 static const X64Reg counterReg = RDX;
+static const X64Reg uvScalePtrReg = RCX;  // only used during init
+static const X64Reg alphaReg = R11;
 #endif
 #else
 static const X64Reg tempReg1 = EAX;
@@ -76,6 +82,7 @@ static const X64Reg tempReg3 = EDX;
 static const X64Reg srcReg = ESI;
 static const X64Reg dstReg = EDI;
 static const X64Reg counterReg = ECX;
+static const X64Reg uvScalePtrReg = EDX;  // only used during init
 #endif
 
 // XMM0-XMM5 are volatile on Windows X64
@@ -94,15 +101,9 @@ static const X64Reg fpScratchReg4 = XMM4;
 // on the interpreter if the compiler fails.
 
 static const JitLookup jitLookup[] = {
-	{&VertexDecoder::Step_WeightsU8, &VertexDecoderJitCache::Jit_WeightsU8},
-	{&VertexDecoder::Step_WeightsU16, &VertexDecoderJitCache::Jit_WeightsU16},
-	{&VertexDecoder::Step_WeightsFloat, &VertexDecoderJitCache::Jit_WeightsFloat},
 	{&VertexDecoder::Step_WeightsU8Skin, &VertexDecoderJitCache::Jit_WeightsU8Skin},
 	{&VertexDecoder::Step_WeightsU16Skin, &VertexDecoderJitCache::Jit_WeightsU16Skin},
 	{&VertexDecoder::Step_WeightsFloatSkin, &VertexDecoderJitCache::Jit_WeightsFloatSkin},
-
-	{&VertexDecoder::Step_WeightsU8ToFloat, &VertexDecoderJitCache::Jit_WeightsU8ToFloat},
-	{&VertexDecoder::Step_WeightsU16ToFloat, &VertexDecoderJitCache::Jit_WeightsU16ToFloat},
 
 	{&VertexDecoder::Step_TcFloat, &VertexDecoderJitCache::Jit_TcFloat},
 	{&VertexDecoder::Step_TcU8ToFloat, &VertexDecoderJitCache::Jit_TcU8ToFloat},
@@ -138,7 +139,7 @@ static const JitLookup jitLookup[] = {
 
 	{&VertexDecoder::Step_PosS8Through, &VertexDecoderJitCache::Jit_PosS8Through},
 	{&VertexDecoder::Step_PosS16Through, &VertexDecoderJitCache::Jit_PosS16Through},
-	{&VertexDecoder::Step_PosFloatThrough, &VertexDecoderJitCache::Jit_PosFloat},
+	{&VertexDecoder::Step_PosFloatThrough, &VertexDecoderJitCache::Jit_PosFloatThrough},
 
 	{&VertexDecoder::Step_PosS8, &VertexDecoderJitCache::Jit_PosS8},
 	{&VertexDecoder::Step_PosS16, &VertexDecoderJitCache::Jit_PosS16},
@@ -164,8 +165,24 @@ static const JitLookup jitLookup[] = {
 
 JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int32_t *jittedSize) {
 	dec_ = &dec;
-	BeginWrite();
+	BeginWrite(4096);
 	const u8 *start = this->AlignCode16();
+
+	bool prescaleStep = false;
+	// Look for prescaled texcoord steps
+	for (int i = 0; i < dec.numSteps_; i++) {
+		if (dec.steps_[i] == &VertexDecoder::Step_TcU8Prescale ||
+			dec.steps_[i] == &VertexDecoder::Step_TcU16Prescale ||
+			dec.steps_[i] == &VertexDecoder::Step_TcFloatPrescale) {
+			prescaleStep = true;
+		}
+		if (dec.steps_[i] == &VertexDecoder::Step_TcU8PrescaleMorph ||
+			dec.steps_[i] == &VertexDecoder::Step_TcU16PrescaleMorph ||
+			dec.steps_[i] == &VertexDecoder::Step_TcFloatPrescaleMorph) {
+			prescaleStep = true;
+		}
+	}
+
 
 #if PPSSPP_ARCH(X86)
 	// Store register values
@@ -179,6 +196,7 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int
 	MOV(32, R(srcReg), MDisp(ESP, 16 + offset + 0));
 	MOV(32, R(dstReg), MDisp(ESP, 16 + offset + 4));
 	MOV(32, R(counterReg), MDisp(ESP, 16 + offset + 8));
+	MOV(32, R(uvScalePtrReg), MDisp(ESP, 16 + offset + 12));
 
 	const uint8_t STACK_FIXED_ALLOC = 64;
 #else
@@ -202,51 +220,18 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int
 	MOVUPS(MDisp(ESP, 80), XMM9);
 #endif
 
-	bool prescaleStep = false;
-	// Look for prescaled texcoord steps
-	for (int i = 0; i < dec.numSteps_; i++) {
-		if (dec.steps_[i] == &VertexDecoder::Step_TcU8Prescale ||
-			dec.steps_[i] == &VertexDecoder::Step_TcU16Prescale ||
-			dec.steps_[i] == &VertexDecoder::Step_TcFloatPrescale) {
-			prescaleStep = true;
-		}
-		if (dec.steps_[i] == &VertexDecoder::Step_TcU8PrescaleMorph ||
-			dec.steps_[i] == &VertexDecoder::Step_TcU16PrescaleMorph ||
-			dec.steps_[i] == &VertexDecoder::Step_TcFloatPrescaleMorph) {
-			prescaleStep = true;
-		}
+	// Initialize alpha reg.
+#if PPSSPP_ARCH(AMD64)
+	if (dec.col) {
+		MOV(32, R(alphaReg), Imm32(1));
 	}
-
-	// Add code to convert matrices to 4x4.
-	// Later we might want to do this when the matrices are loaded instead.
-	if (dec.weighttype && g_Config.bSoftwareSkinning) {
-		MOV(PTRBITS, R(tempReg1), ImmPtr(&threeMasks));
-		MOVAPS(XMM4, MatR(tempReg1));
-		MOV(PTRBITS, R(tempReg1), ImmPtr(&aOne));
-		MOVUPS(XMM5, MatR(tempReg1));
-		MOV(PTRBITS, R(tempReg1), ImmPtr(gstate.boneMatrix));
-		MOV(PTRBITS, R(tempReg2), ImmPtr(bones));
-		for (int i = 0; i < dec.nweights; i++) {
-			MOVUPS(XMM0, MDisp(tempReg1, (12 * i) * 4));
-			MOVUPS(XMM1, MDisp(tempReg1, (12 * i + 3) * 4));
-			MOVUPS(XMM2, MDisp(tempReg1, (12 * i + 3 * 2) * 4));
-			MOVUPS(XMM3, MDisp(tempReg1, (12 * i + 3 * 3) * 4));
-			ANDPS(XMM0, R(XMM4));
-			ANDPS(XMM1, R(XMM4));
-			ANDPS(XMM2, R(XMM4));
-			ANDPS(XMM3, R(XMM4));
-			ORPS(XMM3, R(XMM5));
-			MOVAPS(MDisp(tempReg2, (16 * i) * 4), XMM0);
-			MOVAPS(MDisp(tempReg2, (16 * i + 4) * 4), XMM1);
-			MOVAPS(MDisp(tempReg2, (16 * i + 8) * 4), XMM2);
-			MOVAPS(MDisp(tempReg2, (16 * i + 12) * 4), XMM3);
-		}
-	}
+#endif
 
 	// Keep the scale/offset in a few fp registers if we need it.
+	// TODO: Read it from an argument pointer instead of gstate_c.uv.
 	if (prescaleStep) {
-		MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.uv));
-		MOVUPS(fpScaleOffsetReg, MatR(tempReg1));
+		// uvScalePtrReg should point to gstate_c.uv, or wherever the UV scale we want to use is located.
+		MOVUPS(fpScaleOffsetReg, MatR(uvScalePtrReg));
 		if ((dec.VertexType() & GE_VTYPE_TC_MASK) == GE_VTYPE_TC_8BIT) {
 			MOV(PTRBITS, R(tempReg2), ImmPtr(&by128_11));
 			MULPS(fpScaleOffsetReg, MatR(tempReg2));
@@ -256,13 +241,43 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int
 		}
 	}
 
+	// Add code to convert matrices to 4x4.
+	// Later we might want to do this when the matrices are loaded instead.
+	// Can't touch fpScaleOffsetReg (XMM0) in here!
+	if (dec.skinInDecode) {
+		MOV(PTRBITS, R(tempReg1), ImmPtr(&threeMasks));
+		MOVAPS(XMM5, MatR(tempReg1));
+		MOV(PTRBITS, R(tempReg1), ImmPtr(&aOne));
+		MOVUPS(XMM6, MatR(tempReg1));
+		MOV(PTRBITS, R(tempReg1), ImmPtr(gstate.boneMatrix));
+		MOV(PTRBITS, R(tempReg2), ImmPtr(bones));
+		for (int i = 0; i < dec.nweights; i++) {
+			MOVUPS(XMM1, MDisp(tempReg1, (12 * i) * 4));
+			MOVUPS(XMM2, MDisp(tempReg1, (12 * i + 3) * 4));
+			MOVUPS(XMM3, MDisp(tempReg1, (12 * i + 3 * 2) * 4));
+			MOVUPS(XMM4, MDisp(tempReg1, (12 * i + 3 * 3) * 4));
+			ANDPS(XMM1, R(XMM5));
+			ANDPS(XMM2, R(XMM5));
+			ANDPS(XMM3, R(XMM5));
+			ANDPS(XMM4, R(XMM5));
+			ORPS(XMM4, R(XMM6));
+			MOVAPS(MDisp(tempReg2, (16 * i) * 4), XMM1);
+			MOVAPS(MDisp(tempReg2, (16 * i + 4) * 4), XMM2);
+			MOVAPS(MDisp(tempReg2, (16 * i + 8) * 4), XMM3);
+			MOVAPS(MDisp(tempReg2, (16 * i + 12) * 4), XMM4);
+		}
+	}
+
 	// Let's not bother with a proper stack frame. We just grab the arguments and go.
-	JumpTarget loopStart = GetCodePtr();
+	JumpTarget loopStart = NopAlignCode16();
 	for (int i = 0; i < dec.numSteps_; i++) {
 		if (!CompileStep(dec, i)) {
 			EndWrite();
 			// Reset the code ptr and return zero to indicate that we failed.
 			ResetCodePtr(GetOffset(start));
+			char temp[256]{};
+			dec.ToString(temp, sizeof(temp), true);
+			WARN_LOG(Log::G3D, "Could not compile vertex decoder, failed at step %s: %s", GetStepFunctionName(dec.steps_[i]), temp);
 			return 0;
 		}
 	}
@@ -271,6 +286,21 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int
 	ADD(PTRBITS, R(dstReg), Imm32(dec.decFmt.stride));
 	SUB(32, R(counterReg), Imm8(1));
 	J_CC(CC_NZ, loopStart, true);
+
+	// Writeback alpha reg
+#if PPSSPP_ARCH(AMD64)
+	if (dec.col) {
+		CMP(32, R(alphaReg), Imm32(1));
+		FixupBranch alphaJump = J_CC(CC_E, false);
+		if (RipAccessible(&gstate_c.vertexFullAlpha)) {
+			MOV(8, M(&gstate_c.vertexFullAlpha), Imm8(0));  // rip accessible
+		} else {
+			MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.vertexFullAlpha));
+			MOV(8, MatR(tempReg1), Imm8(0));  // rip accessible
+		}
+		SetJumpTarget(alphaJump);
+	}
+#endif
 
 	MOVUPS(XMM4, MDisp(ESP, 0));
 	MOVUPS(XMM5, MDisp(ESP, 16));
@@ -295,175 +325,6 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int
 	*jittedSize = GetCodePtr() - start;
 	EndWrite();
 	return (JittedVertexDecoder)start;
-}
-
-void VertexDecoderJitCache::Jit_WeightsU8() {
-	switch (dec_->nweights) {
-	case 1:
-		MOVZX(32, 8, tempReg1, MDisp(srcReg, dec_->weightoff));
-		break;
-	case 2:
-		MOVZX(32, 16, tempReg1, MDisp(srcReg, dec_->weightoff));
-		break;
-	case 3:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		AND(32, R(tempReg1), Imm32(0x00FFFFFF));
-		break;
-	case 4:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		break;
-	case 5:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOVZX(32, 8, tempReg2, MDisp(srcReg, dec_->weightoff + 4));
-		break;
-	case 6:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOVZX(32, 16, tempReg2, MDisp(srcReg, dec_->weightoff + 4));
-		break;
-	case 7:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOV(32, R(tempReg2), MDisp(srcReg, dec_->weightoff + 4));
-		AND(32, R(tempReg2), Imm32(0x00FFFFFF));
-		break;
-	case 8:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOV(32, R(tempReg2), MDisp(srcReg, dec_->weightoff + 4));
-		break;
-	}
-
-	if (dec_->nweights <= 4) {
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-	} else {
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w1off), R(tempReg2));
-	}
-}
-
-void VertexDecoderJitCache::Jit_WeightsU16() {
-	switch (dec_->nweights) {
-	case 1:
-		MOVZX(32, 16, tempReg1, MDisp(srcReg, dec_->weightoff));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off + 4), Imm32(0));
-		return;
-
-	case 2:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off + 4), Imm32(0));
-		return;
-
-	case 3:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOVZX(32, 16, tempReg2, MDisp(srcReg, dec_->weightoff + 4));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off + 4), R(tempReg2));
-		return;
-
-	case 4:
-		// Anything above 4 will do 4 here, and then the rest after.
-	case 5:
-	case 6:
-	case 7:
-	case 8:
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff));
-		MOV(32, R(tempReg2), MDisp(srcReg, dec_->weightoff + 4));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.w0off + 4), R(tempReg2));
-		break;
-	}
-
-	// Basic implementation - a short at a time. TODO: Optimize
-	int j;
-	for (j = 4; j < dec_->nweights; j++) {
-		MOV(16, R(tempReg1), MDisp(srcReg, dec_->weightoff + j * 2));
-		MOV(16, MDisp(dstReg, dec_->decFmt.w0off + j * 2), R(tempReg1));
-	}
-	while (j & 3) {
-		MOV(16, MDisp(dstReg, dec_->decFmt.w0off + j * 2), Imm16(0));
-		j++;
-	}
-}
-
-void VertexDecoderJitCache::Jit_WeightsU8ToFloat() {
-	if (dec_->nweights >= 4) {
-		Jit_AnyU8ToFloat(dec_->weightoff, 32);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		if (dec_->nweights > 4) {
-			Jit_AnyU8ToFloat(dec_->weightoff + 4, (dec_->nweights - 4) * 8);
-			MOVUPS(MDisp(dstReg, dec_->decFmt.w1off), XMM3);
-		}
-	} else {
-		Jit_AnyU8ToFloat(dec_->weightoff, dec_->nweights * 8);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-	}
-}
-
-void VertexDecoderJitCache::Jit_WeightsU16ToFloat() {
-	if (dec_->nweights >= 4) {
-		Jit_AnyU16ToFloat(dec_->weightoff, 64);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		if (dec_->nweights > 4) {
-			Jit_AnyU16ToFloat(dec_->weightoff + 4 * 2, (dec_->nweights - 4) * 16);
-			MOVUPS(MDisp(dstReg, dec_->decFmt.w1off), XMM3);
-		}
-	} else {
-		Jit_AnyU16ToFloat(dec_->weightoff, dec_->nweights * 16);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-	}
-}
-
-void VertexDecoderJitCache::Jit_WeightsFloat() {
-	int j;
-	switch (dec_->nweights) {
-	case 1:
-		// MOVSS: When the source operand is a memory location and destination operand is an XMM register, the three high-order doublewords of the destination operand are cleared to all 0s.
-		MOVSS(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		break;
-
-	case 2:
-		MOVQ_xmm(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		break;
-
-	case 4:
-		MOVUPS(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		break;
-
-	case 5:
-		MOVUPS(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVSS(XMM4, MDisp(srcReg, dec_->weightoff + 16));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off + 16), XMM4);
-		break;
-
-	case 6:
-		MOVUPS(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVQ_xmm(XMM4, MDisp(srcReg, dec_->weightoff + 16));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off + 16), XMM4);
-		break;
-
-	case 8:
-		MOVUPS(XMM3, MDisp(srcReg, dec_->weightoff));
-		MOVUPS(XMM4, MDisp(srcReg, dec_->weightoff + 16));
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off), XMM3);
-		MOVUPS(MDisp(dstReg, dec_->decFmt.w0off + 16), XMM4);
-		break;
-
-	default:
-		for (j = 0; j < dec_->nweights; j++) {
-			MOV(32, R(tempReg1), MDisp(srcReg, dec_->weightoff + j * 4));
-			MOV(32, MDisp(dstReg, dec_->decFmt.w0off + j * 4), R(tempReg1));
-		}
-		while (j & 3) {  // Zero additional weights rounding up to 4.
-			MOV(32, MDisp(dstReg, dec_->decFmt.w0off + j * 4), Imm32(0));
-			j++;
-		}
-		break;
-	}
 }
 
 void VertexDecoderJitCache::Jit_WeightsU8Skin() {
@@ -751,6 +612,8 @@ void VertexDecoderJitCache::Jit_TcU8Prescale() {
 	CVTSI2SS(fpScratchReg, R(tempReg1));
 	CVTSI2SS(fpScratchReg2, R(tempReg2));
 	UNPCKLPS(fpScratchReg, R(fpScratchReg2));
+	// TODO: These are a lot of nasty consecutive dependencies. Can probably be made faster
+	// if we can spare another register to avoid the shuffle, like on ARM.
 	MULPS(fpScratchReg, R(fpScaleOffsetReg));
 	SHUFPS(fpScaleOffsetReg, R(fpScaleOffsetReg), _MM_SHUFFLE(1, 0, 3, 2));
 	ADDPS(fpScratchReg, R(fpScaleOffsetReg));
@@ -828,6 +691,10 @@ void VertexDecoderJitCache::Jit_TcAnyMorph(int bits) {
 			first = false;
 		}
 	}
+
+	// The steps sum onto +0, which turns a sum of -0s into +0. Adding +0 at the end does the same.
+	XORPS(fpScratchReg2, R(fpScratchReg2));
+	ADDPS(fpScratchReg, R(fpScratchReg2));
 }
 
 void VertexDecoderJitCache::Jit_TcU8MorphToFloat() {
@@ -907,10 +774,11 @@ void VertexDecoderJitCache::Jit_TcU16ThroughToFloat() {
 		SetJumpTarget(skip);
 	};
 	// TODO: Can this actually be fast?  Hmm, floats aren't better.
-	updateSide(tempReg1, CC_GE, offsetof(KnownVertexBounds, minU));
-	updateSide(tempReg1, CC_LE, offsetof(KnownVertexBounds, maxU));
-	updateSide(tempReg2, CC_GE, offsetof(KnownVertexBounds, minV));
-	updateSide(tempReg2, CC_LE, offsetof(KnownVertexBounds, maxV));
+	// The bounds are unsigned, so unsigned conditions.
+	updateSide(tempReg1, CC_AE, offsetof(KnownVertexBounds, minU));
+	updateSide(tempReg1, CC_BE, offsetof(KnownVertexBounds, maxU));
+	updateSide(tempReg2, CC_AE, offsetof(KnownVertexBounds, minV));
+	updateSide(tempReg2, CC_BE, offsetof(KnownVertexBounds, maxV));
 }
 
 void VertexDecoderJitCache::Jit_TcFloatThrough() {
@@ -931,12 +799,17 @@ void VertexDecoderJitCache::Jit_Color8888() {
 
 	CMP(32, R(tempReg1), Imm32(0xFF000000));
 	FixupBranch skip = J_CC(CC_AE, false);
+#if PPSSPP_ARCH(AMD64)
+	// Would like to use CMOV or SetCC but CMOV doesn't take immediates and SetCC isn't right. So...
+	XOR(32, R(alphaReg), R(alphaReg));
+#else
 	if (RipAccessible(&gstate_c.vertexFullAlpha)) {
 		MOV(8, M(&gstate_c.vertexFullAlpha), Imm8(0));  // rip accessible
 	} else {
 		MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.vertexFullAlpha));
 		MOV(8, MatR(tempReg1), Imm8(0));
 	}
+#endif
 	SetJumpTarget(skip);
 }
 
@@ -966,12 +839,16 @@ void VertexDecoderJitCache::Jit_Color4444() {
 
 	CMP(32, R(tempReg1), Imm32(0xFF000000));
 	FixupBranch skip = J_CC(CC_AE, false);
+#if PPSSPP_ARCH(AMD64)
+	XOR(32, R(alphaReg), R(alphaReg));
+#else
 	if (RipAccessible(&gstate_c.vertexFullAlpha)) {
 		MOV(8, M(&gstate_c.vertexFullAlpha), Imm8(0));  // rip accessible
 	} else {
 		MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.vertexFullAlpha));
 		MOV(8, MatR(tempReg1), Imm8(0));
 	}
+#endif
 	SetJumpTarget(skip);
 }
 
@@ -1022,39 +899,39 @@ void VertexDecoderJitCache::Jit_Color5551() {
 	SHL(32, R(tempReg3), Imm8(3));
 	OR(32, R(tempReg2), R(tempReg3));
 
-	MOV(32, R(tempReg3), R(tempReg1));
-	AND(32, R(tempReg3), Imm32(0x00007C00));
-	SHL(32, R(tempReg3), Imm8(6));
-	OR(32, R(tempReg2), R(tempReg3));
+	// This mask intentionally keeps alpha, but it's all the same bit so we can keep it.
+	AND(32, R(tempReg1), Imm32(0x0000FC00));
+	SHL(32, R(tempReg1), Imm8(6));
+	// At this point, 0x003F1F1F are potentially set in tempReg2.
+	OR(32, R(tempReg2), R(tempReg1));
 
-	// Expand 5 -> 8.  After this is just A.
+	// Expand 5 -> 8.  After this is just expanding A.
 	MOV(32, R(tempReg3), R(tempReg2));
 	SHL(32, R(tempReg2), Imm8(3));
 	SHR(32, R(tempReg3), Imm8(2));
-	// Chop off the bits that were shifted out.
+	// Chop off the bits that were shifted out (and also alpha.)
 	AND(32, R(tempReg3), Imm32(0x00070707));
 	OR(32, R(tempReg2), R(tempReg3));
 
-	// For A, we shift it to a single bit, and then subtract and XOR.
-	// That's probably the simplest way to expand it...
-	SHR(32, R(tempReg1), Imm8(15));
-	// If it was 0, it's now -1, otherwise it's 0.  Easy.
-	SUB(32, R(tempReg1), Imm8(1));
-	XOR(32, R(tempReg1), Imm32(0xFF000000));
-	AND(32, R(tempReg1), Imm32(0xFF000000));
+	// For A, use sign extend to repeat the bit.  B is still here, but it's the same bits.
+	SHL(32, R(tempReg1), Imm8(10));
+	SAR(32, R(tempReg1), Imm8(7));
 	OR(32, R(tempReg2), R(tempReg1));
 
 	MOV(32, MDisp(dstReg, dec_->decFmt.c0off), R(tempReg2));
 
-	CMP(32, R(tempReg2), Imm32(0xFF000000));
-	FixupBranch skip = J_CC(CC_AE, false);
+	// Let's AND to avoid a branch, tempReg1 has alpha only in the top 8 bits, and they're all equal.
+	SHR(32, R(tempReg1), Imm8(24));
+#if PPSSPP_ARCH(AMD64)
+	AND(8, R(alphaReg), R(tempReg1));
+#else
 	if (RipAccessible(&gstate_c.vertexFullAlpha)) {
-		MOV(8, M(&gstate_c.vertexFullAlpha), Imm8(0));  // rip accessible
+		AND(8, M(&gstate_c.vertexFullAlpha), R(tempReg1));  // rip accessible
 	} else {
-		MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.vertexFullAlpha));
-		MOV(8, MatR(tempReg1), Imm8(0));
+		MOV(PTRBITS, R(tempReg3), ImmPtr(&gstate_c.vertexFullAlpha));
+		AND(8, MatR(tempReg3), R(tempReg1));
 	}
-	SetJumpTarget(skip);
+#endif
 }
 
 void VertexDecoderJitCache::Jit_Color8888Morph() {
@@ -1122,12 +999,12 @@ void VertexDecoderJitCache::Jit_Color4444Morph() {
 		}
 
 		CVTDQ2PS(reg, R(reg));
-		MULPS(reg, R(XMM6));
 
-		// And now the weight.
+		// The weight goes on before the scale, same order as the steps (it rounds differently).
 		MOVSS(fpScratchReg3, MDisp(tempReg1, n * sizeof(float)));
 		SHUFPS(fpScratchReg3, R(fpScratchReg3), _MM_SHUFFLE(0, 0, 0, 0));
 		MULPS(reg, R(fpScratchReg3));
+		MULPS(reg, R(XMM6));
 
 		if (!first) {
 			ADDPS(fpScratchReg, R(fpScratchReg2));
@@ -1177,12 +1054,12 @@ void VertexDecoderJitCache::Jit_Color565Morph() {
 		MOVSS(reg, R(fpScratchReg2));
 
 		CVTDQ2PS(reg, R(reg));
-		MULPS(reg, R(XMM6));
 
-		// And now the weight.
+		// The weight goes on before the scale, same order as the steps (it rounds differently).
 		MOVSS(fpScratchReg2, MDisp(tempReg1, n * sizeof(float)));
 		SHUFPS(fpScratchReg2, R(fpScratchReg2), _MM_SHUFFLE(0, 0, 0, 0));
 		MULPS(reg, R(fpScratchReg2));
+		MULPS(reg, R(XMM6));
 
 		if (!first) {
 			ADDPS(fpScratchReg, R(fpScratchReg3));
@@ -1235,12 +1112,12 @@ void VertexDecoderJitCache::Jit_Color5551Morph() {
 		MOVSS(reg, R(fpScratchReg2));
 
 		CVTDQ2PS(reg, R(reg));
-		MULPS(reg, R(XMM6));
 
-		// And now the weight.
+		// The weight goes on before the scale, same order as the steps (it rounds differently).
 		MOVSS(fpScratchReg2, MDisp(tempReg1, n * sizeof(float)));
 		SHUFPS(fpScratchReg2, R(fpScratchReg2), _MM_SHUFFLE(0, 0, 0, 0));
 		MULPS(reg, R(fpScratchReg2));
+		MULPS(reg, R(XMM6));
 
 		if (!first) {
 			ADDPS(fpScratchReg, R(fpScratchReg3));
@@ -1253,8 +1130,8 @@ void VertexDecoderJitCache::Jit_Color5551Morph() {
 }
 
 void VertexDecoderJitCache::Jit_WriteMorphColor(int outOff, bool checkAlpha) {
-	// Pack back into a u32, with saturation.
-	CVTPS2DQ(fpScratchReg, R(fpScratchReg));
+	// Pack back into a u32, with saturation. Truncate like the other color paths.
+	CVTTPS2DQ(fpScratchReg, R(fpScratchReg));
 	PACKSSDW(fpScratchReg, R(fpScratchReg));
 	PACKUSWB(fpScratchReg, R(fpScratchReg));
 	MOVD_xmm(R(tempReg1), fpScratchReg);
@@ -1263,12 +1140,16 @@ void VertexDecoderJitCache::Jit_WriteMorphColor(int outOff, bool checkAlpha) {
 	if (checkAlpha) {
 		CMP(32, R(tempReg1), Imm32(0xFF000000));
 		FixupBranch skip = J_CC(CC_AE, false);
+#if PPSSPP_ARCH(AMD64)
+		XOR(32, R(alphaReg), R(alphaReg));
+#else
 		if (RipAccessible(&gstate_c.vertexFullAlpha)) {
 			MOV(8, M(&gstate_c.vertexFullAlpha), Imm8(0));  // rip accessible
 		} else {
 			MOV(PTRBITS, R(tempReg2), ImmPtr(&gstate_c.vertexFullAlpha));
 			MOV(8, MatR(tempReg2), Imm8(0));
 		}
+#endif
 		SetJumpTarget(skip);
 	} else {
 		// Force alpha to full if we're not checking it.
@@ -1349,11 +1230,9 @@ void VertexDecoderJitCache::Jit_NormalFloatSkin() {
 
 // Through expands into floats, always. Might want to look at changing this.
 void VertexDecoderJitCache::Jit_PosS8Through() {
-	DEBUG_LOG_REPORT_ONCE(vertexS8Through, G3D, "Using S8 positions in throughmode");
 	// SIMD doesn't really matter since this isn't useful on hardware.
+	XORPS(fpScratchReg, R(fpScratchReg));
 	for (int i = 0; i < 3; i++) {
-		MOVSX(32, 8, tempReg1, MDisp(srcReg, dec_->posoff + i));
-		CVTSI2SS(fpScratchReg, R(tempReg1));
 		MOVSS(MDisp(dstReg, dec_->decFmt.posoff + i * 4), fpScratchReg);
 	}
 }
@@ -1381,6 +1260,35 @@ void VertexDecoderJitCache::Jit_PosS16Through() {
 	}
 }
 
+void VertexDecoderJitCache::Jit_PosFloatThrough() {
+	PXOR(fpScratchReg2, R(fpScratchReg2));
+	if (cpu_info.Mode64bit) {
+		MOV(64, R(tempReg1), MDisp(srcReg, dec_->posoff));
+		MOVSS(fpScratchReg, MDisp(srcReg, dec_->posoff + 8));
+		MOV(64, MDisp(dstReg, dec_->decFmt.posoff), R(tempReg1));
+	} else {
+		MOV(32, R(tempReg1), MDisp(srcReg, dec_->posoff));
+		MOV(32, R(tempReg2), MDisp(srcReg, dec_->posoff + 4));
+		MOVSS(fpScratchReg, MDisp(srcReg, dec_->posoff + 8));
+		MOV(32, MDisp(dstReg, dec_->decFmt.posoff), R(tempReg1));
+		MOV(32, MDisp(dstReg, dec_->decFmt.posoff + 4), R(tempReg2));
+	}
+
+	CVTTPS2DQ(fpScratchReg, R(fpScratchReg));
+	// Use pack to saturate to 0,65535.
+	if (cpu_info.bSSE4_1) {
+		PACKUSDW(fpScratchReg, R(fpScratchReg));
+	} else {
+		PSLLD(fpScratchReg, 16);
+		PSRAD(fpScratchReg, 16);
+		PACKSSDW(fpScratchReg, R(fpScratchReg));
+	}
+	PUNPCKLWD(fpScratchReg, R(fpScratchReg2));
+	CVTDQ2PS(fpScratchReg, R(fpScratchReg));
+
+	MOVSS(MDisp(dstReg, dec_->decFmt.posoff + 8), fpScratchReg);
+}
+
 void VertexDecoderJitCache::Jit_PosS8() {
 	Jit_AnyS8ToFloat(dec_->posoff);
 	MOVUPS(MDisp(dstReg, dec_->decFmt.posoff), XMM3);
@@ -1391,21 +1299,25 @@ void VertexDecoderJitCache::Jit_PosS16() {
 	MOVUPS(MDisp(dstReg, dec_->decFmt.posoff), XMM3);
 }
 
-// Just copy 12 bytes.
 void VertexDecoderJitCache::Jit_PosFloat() {
-	if (cpu_info.Mode64bit) {
-		MOV(64, R(tempReg1), MDisp(srcReg, dec_->posoff));
-		MOV(32, R(tempReg3), MDisp(srcReg, dec_->posoff + 8));
-		MOV(64, MDisp(dstReg, dec_->decFmt.posoff), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.posoff + 8), R(tempReg3));
+	// Load the constants we need.
+	alignas(16) static const float fltMax[4] = {FLT_MAX, FLT_MAX, FLT_MAX, FLT_MAX,};
+	alignas(16) static const float fltMaxNeg[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX,};
+	if (RipAccessible(&fltMax)) {
+		MOVAPS(fpScratchReg2, M(&fltMax));  // rip accessible
+		MOVAPS(fpScratchReg3, M(&fltMaxNeg));
 	} else {
-		MOV(32, R(tempReg1), MDisp(srcReg, dec_->posoff));
-		MOV(32, R(tempReg2), MDisp(srcReg, dec_->posoff + 4));
-		MOV(32, R(tempReg3), MDisp(srcReg, dec_->posoff + 8));
-		MOV(32, MDisp(dstReg, dec_->decFmt.posoff), R(tempReg1));
-		MOV(32, MDisp(dstReg, dec_->decFmt.posoff + 4), R(tempReg2));
-		MOV(32, MDisp(dstReg, dec_->decFmt.posoff + 8), R(tempReg3));
+		MOV(PTRBITS, R(tempReg1), ImmPtr(&fltMax));
+		MOVAPS(fpScratchReg2, MatR(tempReg1));
+		MOV(PTRBITS, R(tempReg1), ImmPtr(&fltMaxNeg));
+		MOVAPS(fpScratchReg3, MatR(tempReg1));
 	}
+
+	MOVUPS(fpScratchReg, MDisp(srcReg, dec_->posoff));
+	MINPS(fpScratchReg, R(fpScratchReg2));
+	MAXPS(fpScratchReg, R(fpScratchReg3));
+	// Just store 4 floats. We'll overwrite the last one with other components or the next vertex.
+	MOVUPS(MDisp(dstReg, dec_->decFmt.posoff), fpScratchReg);
 }
 
 void VertexDecoderJitCache::Jit_PosS8Skin() {
@@ -1419,21 +1331,18 @@ void VertexDecoderJitCache::Jit_PosS16Skin() {
 }
 
 void VertexDecoderJitCache::Jit_PosFloatSkin() {
+	// TODO: Should clean inf/nan here.
 	MOVUPS(XMM3, MDisp(srcReg, dec_->posoff));
 	Jit_WriteMatrixMul(dec_->decFmt.posoff, true);
 }
 
 void VertexDecoderJitCache::Jit_AnyS8ToFloat(int srcoff) {
-	if (!cpu_info.bSSE4_1) {
-		PXOR(XMM3, R(XMM3));
-	}
 	MOVD_xmm(XMM1, MDisp(srcReg, srcoff));
 	if (cpu_info.bSSE4_1) {
 		PMOVSXBD(XMM1, R(XMM1));
 	} else {
-		PUNPCKLBW(XMM1, R(XMM3));
-		PUNPCKLWD(XMM1, R(XMM3));
-		PSLLD(XMM1, 24);
+		PUNPCKLBW(XMM1, R(XMM1));
+		PUNPCKLWD(XMM1, R(XMM1));
 		PSRAD(XMM1, 24);
 	}
 	CVTDQ2PS(XMM3, R(XMM1));
@@ -1446,15 +1355,11 @@ void VertexDecoderJitCache::Jit_AnyS8ToFloat(int srcoff) {
 }
 
 void VertexDecoderJitCache::Jit_AnyS16ToFloat(int srcoff) {
-	if (!cpu_info.bSSE4_1) {
-		PXOR(XMM3, R(XMM3));
-	}
 	MOVQ_xmm(XMM1, MDisp(srcReg, srcoff));
 	if (cpu_info.bSSE4_1) {
 		PMOVSXWD(XMM1, R(XMM1));
 	} else {
-		PUNPCKLWD(XMM1, R(XMM3));
-		PSLLD(XMM1, 16);
+		PUNPCKLWD(XMM1, R(XMM1));
 		PSRAD(XMM1, 16);
 	}
 	CVTDQ2PS(XMM3, R(XMM1));
@@ -1531,16 +1436,14 @@ void VertexDecoderJitCache::Jit_AnyU16ToFloat(int srcoff, u32 bits) {
 }
 
 void VertexDecoderJitCache::Jit_AnyS8Morph(int srcoff, int dstoff) {
-	MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.morphWeights[0]));
-	if (!cpu_info.bSSE4_1) {
-		PXOR(fpScratchReg4, R(fpScratchReg4));
-	}
 	if (RipAccessible(&by128)) {
 		MOVAPS(XMM5, M(&by128));  // rip accessible
 	} else {
 		MOV(PTRBITS, R(tempReg1), ImmPtr(&by128));
 		MOVAPS(XMM5, MatR(tempReg1));
 	}
+	// After the constant, which may need tempReg1 to get at.
+	MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.morphWeights[0]));
 
 	// Sum into fpScratchReg.
 	bool first = true;
@@ -1551,9 +1454,8 @@ void VertexDecoderJitCache::Jit_AnyS8Morph(int srcoff, int dstoff) {
 		if (cpu_info.bSSE4_1) {
 			PMOVSXBD(reg, R(reg));
 		} else {
-			PUNPCKLBW(reg, R(fpScratchReg4));
-			PUNPCKLWD(reg, R(fpScratchReg4));
-			PSLLD(reg, 24);
+			PUNPCKLBW(reg, R(reg));
+			PUNPCKLWD(reg, R(reg));
 			PSRAD(reg, 24);
 		}
 		CVTDQ2PS(reg, R(reg));
@@ -1571,20 +1473,21 @@ void VertexDecoderJitCache::Jit_AnyS8Morph(int srcoff, int dstoff) {
 		}
 	}
 
+	// The steps sum onto +0, which turns a sum of -0s into +0. Adding +0 at the end does the same.
+	XORPS(fpScratchReg2, R(fpScratchReg2));
+	ADDPS(fpScratchReg, R(fpScratchReg2));
 	MOVUPS(MDisp(dstReg, dstoff), fpScratchReg);
 }
 
 void VertexDecoderJitCache::Jit_AnyS16Morph(int srcoff, int dstoff) {
-	MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.morphWeights[0]));
-	if (!cpu_info.bSSE4_1) {
-		PXOR(fpScratchReg4, R(fpScratchReg4));
-	}
 	if (RipAccessible(&by32768)) {
 		MOVAPS(XMM5, M(&by32768));  // rip accessible
 	} else {
 		MOV(PTRBITS, R(tempReg1), ImmPtr(&by32768));
 		MOVAPS(XMM5, MatR(tempReg1));
 	}
+	// After the constant, which may need tempReg1 to get at.
+	MOV(PTRBITS, R(tempReg1), ImmPtr(&gstate_c.morphWeights[0]));
 
 	// Sum into fpScratchReg.
 	bool first = true;
@@ -1595,8 +1498,7 @@ void VertexDecoderJitCache::Jit_AnyS16Morph(int srcoff, int dstoff) {
 		if (cpu_info.bSSE4_1) {
 			PMOVSXWD(reg, R(reg));
 		} else {
-			PUNPCKLWD(reg, R(fpScratchReg4));
-			PSLLD(reg, 16);
+			PUNPCKLWD(reg, R(reg));
 			PSRAD(reg, 16);
 		}
 		CVTDQ2PS(reg, R(reg));
@@ -1614,6 +1516,9 @@ void VertexDecoderJitCache::Jit_AnyS16Morph(int srcoff, int dstoff) {
 		}
 	}
 
+	// The steps sum onto +0, which turns a sum of -0s into +0. Adding +0 at the end does the same.
+	XORPS(fpScratchReg2, R(fpScratchReg2));
+	ADDPS(fpScratchReg, R(fpScratchReg2));
 	MOVUPS(MDisp(dstReg, dstoff), fpScratchReg);
 }
 
@@ -1635,6 +1540,9 @@ void VertexDecoderJitCache::Jit_AnyFloatMorph(int srcoff, int dstoff) {
 		}
 	}
 
+	// The steps sum onto +0, which turns a sum of -0s into +0. Adding +0 at the end does the same.
+	XORPS(fpScratchReg2, R(fpScratchReg2));
+	ADDPS(fpScratchReg, R(fpScratchReg2));
 	MOVUPS(MDisp(dstReg, dstoff), fpScratchReg);
 }
 

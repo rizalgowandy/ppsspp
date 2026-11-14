@@ -1,11 +1,11 @@
 #pragma once
 
 #include <cstdint>
+
+#include "Common/CommonWindows.h"
 #include <d3d11.h>
 
 #include "Common/GPU/thin3d.h"
-
-// TODO: Do this more progressively. No need to compute the entire state if the entire state hasn't changed.
 
 struct D3D11BlendKey {
 	union {
@@ -65,7 +65,7 @@ struct D3D11StateKeys {
 struct D3D11DynamicState {
 	int topology;
 	bool useBlendColor;
-	uint32_t blendColor;
+	float blendColor[4];
 	bool useStencil;
 	uint8_t stencilRef;
 	Draw::Viewport viewport;

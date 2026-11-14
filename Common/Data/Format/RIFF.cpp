@@ -21,11 +21,12 @@ RIFFReader::~RIFFReader() {
 }
 
 int RIFFReader::ReadInt() {
+	int value = 0;
 	if (data_ && pos_ < eof_ - 3) {
 		pos_ += 4;
-		return *(int *)(data_ + pos_ - 4);
+		memcpy(&value, data_ + pos_ - 4, 4);
 	}
-	return 0;
+	return value;
 }
 
 bool RIFFReader::Descend(uint32_t intoId) {
@@ -45,8 +46,16 @@ bool RIFFReader::Descend(uint32_t intoId) {
 		int length = ReadInt();
 		int startLocation = pos_;
 
-		if (pos_ + length > fileSize_) {
-			ERROR_LOG(IO, "Block extends outside of RIFF file - failing descend");
+		// length is a raw 4-byte value from the file. Validate in 64-bit to avoid
+		// pos_ + length overflowing a 32-bit int (which could wrap negative and
+		// bypass this check for a length near INT_MAX), and reject negative lengths
+		// outright here - the mismatch branch below already checks length > 0 before
+		// advancing pos_, but a *matched* chunk with a negative length used to reach
+		// stack[depth_].length unchecked, and from there GetCurrentChunkSize() and
+		// its callers (e.g. a std::vector::resize() sized from it).
+		if (length < 0 || (int64_t)pos_ + length > fileSize_) {
+			// This should already catch the case where the file is truncated, but we also check for it in ReadData just in case.
+			ERROR_LOG(Log::IO, "Block extends outside of RIFF file - failing descend");
 			pos_ = stack[depth_].parentStartLocation;
 			return false;
 		}
@@ -61,7 +70,7 @@ bool RIFFReader::Descend(uint32_t intoId) {
 			if (length > 0) {
 				pos_ += length; // try next block
 			} else {
-				ERROR_LOG(IO, "Bad data in RIFF file : block length %d. Not descending.", length);
+				ERROR_LOG(Log::IO, "Bad data in RIFF file : block length %d. Not descending.", length);
 				pos_ = stack[depth_].parentStartLocation;
 				return false;
 			}
@@ -88,14 +97,30 @@ void RIFFReader::Ascend() {
 	eof_ = stack[depth_].parentEOF;
 }
 
-void RIFFReader::ReadData(void *what, int count) {
-	memcpy(what, data_ + pos_, count);
+bool RIFFReader::ReadData(void *what, int count) {
+	bool success = true;
+	if (count > 0) {
+		int available = pos_ < fileSize_ ? fileSize_ - pos_ : 0;
+		int toRead = count < available ? count : available;
+		if (toRead > 0) {
+			memcpy(what, data_ + pos_, toRead);
+		}
+		if (toRead < count) {
+			// Truncated/corrupt file - don't read past the buffer. Zero the rest so
+			// callers don't read uninitialized data, but also return false.
+			// However, reaching this is probably impossible due to the check in Descend.
+			ERROR_LOG(Log::IO, "RIFFReader::ReadData: wanted %d bytes but only %d available", count, toRead);
+			memset((uint8_t *)what + toRead, 0, count - toRead);
+			success = false;
+		}
+	}
 	pos_ += count;
 	count &= 3;
 	if (count) {
 		count = 4 - count;
 		pos_ += count;
 	}
+	return success;
 }
 
 int RIFFReader::GetCurrentChunkSize() {
@@ -104,4 +129,3 @@ int RIFFReader::GetCurrentChunkSize() {
 	else
 		return 0;
 }
-

@@ -27,10 +27,6 @@
 
 // Slow freaking thing but works (eventually) :)
 
-BlockAllocator::BlockAllocator(int grain) : bottom_(NULL), top_(NULL), grain_(grain)
-{
-}
-
 BlockAllocator::~BlockAllocator()
 {
 	Shutdown();
@@ -61,7 +57,7 @@ u32 BlockAllocator::AllocAligned(u32 &size, u32 sizeGrain, u32 grain, bool fromT
 {
 	// Sanity check
 	if (size == 0 || size > rangeSize_) {
-		ERROR_LOG(SCEKERNEL, "Clearly bogus size: %08x - failing allocation", size);
+		ERROR_LOG(Log::sceKernel, "Clearly bogus size: %08x - failing allocation", size);
 		return -1;
 	}
 
@@ -138,8 +134,8 @@ u32 BlockAllocator::AllocAligned(u32 &size, u32 sizeGrain, u32 grain, bool fromT
 	}
 
 	//Out of memory :(
-	ListBlocks();
-	ERROR_LOG(SCEKERNEL, "Block Allocator (%08x-%08x) failed to allocate %i (%08x) bytes of contiguous memory", rangeStart_, rangeStart_ + rangeSize_, size, size);
+	ListBlocks(LogLevel::LINFO);
+	ERROR_LOG(Log::sceKernel, "Block Allocator (%08x-%08x) failed to allocate %i (%08x) bytes of contiguous memory", rangeStart_, rangeStart_ + rangeSize_, size, size);
 	return -1;
 }
 
@@ -153,7 +149,7 @@ u32 BlockAllocator::AllocAt(u32 position, u32 size, const char *tag)
 {
 	CheckBlocks();
 	if (size > rangeSize_) {
-		ERROR_LOG(SCEKERNEL, "Clearly bogus size: %08x - failing allocation", size);
+		ERROR_LOG(Log::sceKernel, "Clearly bogus size: %08x - failing allocation", size);
 		return -1;
 	}
 
@@ -161,7 +157,7 @@ u32 BlockAllocator::AllocAt(u32 position, u32 size, const char *tag)
 	u32 alignedPosition = position;
 	u32 alignedSize = size;
 	if (position & (grain_ - 1)) {
-		DEBUG_LOG(SCEKERNEL, "Position %08x does not align to grain.", position);
+		DEBUG_LOG(Log::sceKernel, "Position %08x does not align to grain.", position);
 		alignedPosition &= ~(grain_ - 1);
 
 		// Since the position was decreased, size must increase.
@@ -179,7 +175,7 @@ u32 BlockAllocator::AllocAt(u32 position, u32 size, const char *tag)
 		Block &b = *bp;
 		if (b.taken)
 		{
-			ERROR_LOG(SCEKERNEL, "Block allocator AllocAt failed, block taken! %08x, %i", position, size);
+			ERROR_LOG(Log::sceKernel, "Block allocator AllocAt failed, block taken! %08x, %i", position, size);
 			return -1;
 		}
 		else
@@ -187,7 +183,7 @@ u32 BlockAllocator::AllocAt(u32 position, u32 size, const char *tag)
 			// Make sure the block is big enough to split.
 			if (b.start + b.size < alignedPosition + alignedSize)
 			{
-				ERROR_LOG(SCEKERNEL, "Block allocator AllocAt failed, not enough contiguous space %08x, %i", position, size);
+				ERROR_LOG(Log::sceKernel, "Block allocator AllocAt failed, not enough contiguous space %08x, %i", position, size);
 				return -1;
 			}
 			//good to go
@@ -214,24 +210,24 @@ u32 BlockAllocator::AllocAt(u32 position, u32 size, const char *tag)
 	}
 	else
 	{
-		ERROR_LOG(SCEKERNEL, "Block allocator AllocAt failed :( %08x, %i", position, size);
+		ERROR_LOG(Log::sceKernel, "Block allocator AllocAt failed :( %08x, %i", position, size);
 	}
 
 
 	//Out of memory :(
-	ListBlocks();
-	ERROR_LOG(SCEKERNEL, "Block Allocator (%08x-%08x) failed to allocate %i (%08x) bytes of contiguous memory", rangeStart_, rangeStart_ + rangeSize_, alignedSize, alignedSize);
+	ListBlocks(LogLevel::LINFO);
+	ERROR_LOG(Log::sceKernel, "Block Allocator (%08x-%08x) failed to allocate %i (%08x) bytes of contiguous memory", rangeStart_, rangeStart_ + rangeSize_, alignedSize, alignedSize);
 	return -1;
 }
 
 void BlockAllocator::MergeFreeBlocks(Block *fromBlock)
 {
-	DEBUG_LOG(SCEKERNEL, "Merging Blocks");
+	VERBOSE_LOG(Log::sceKernel, "Merging Blocks");
 
 	Block *prev = fromBlock->prev;
 	while (prev != NULL && prev->taken == false)
 	{
-		DEBUG_LOG(SCEKERNEL, "Block Alloc found adjacent free blocks - merging");
+		VERBOSE_LOG(Log::sceKernel, "Block Alloc found adjacent free blocks - merging");
 		prev->size += fromBlock->size;
 		if (fromBlock->next == NULL)
 			top_ = prev;
@@ -251,7 +247,7 @@ void BlockAllocator::MergeFreeBlocks(Block *fromBlock)
 	Block *next = fromBlock->next;
 	while (next != NULL && next->taken == false)
 	{
-		DEBUG_LOG(SCEKERNEL, "Block Alloc found adjacent free blocks - merging");
+		VERBOSE_LOG(Log::sceKernel, "Block Alloc found adjacent free blocks - merging");
 		fromBlock->size += next->size;
 		fromBlock->next = next->next;
 		delete next;
@@ -276,7 +272,7 @@ bool BlockAllocator::Free(u32 position)
 	}
 	else
 	{
-		ERROR_LOG(SCEKERNEL, "BlockAllocator : invalid free %08x", position);
+		ERROR_LOG(Log::sceKernel, "BlockAllocator : invalid free %08x", position);
 		return false;
 	}
 }
@@ -293,7 +289,7 @@ bool BlockAllocator::FreeExact(u32 position)
 	}
 	else
 	{
-		ERROR_LOG(SCEKERNEL, "BlockAllocator : invalid free %08x", position);
+		ERROR_LOG(Log::sceKernel, "BlockAllocator : invalid free %08x", position);
 		return false;
 	}
 }
@@ -331,21 +327,30 @@ void BlockAllocator::CheckBlocks() const
 	{
 		const Block &b = *bp;
 		if (b.start > 0xc0000000) {  // probably free'd debug values
-			ERROR_LOG_REPORT(HLE, "Bogus block in allocator");
+			ERROR_LOG_REPORT(Log::HLE, "Bogus block in allocator");
 		}
 		// Outside the valid range, probably logic bug in allocation.
 		if (b.start + b.size > rangeStart_ + rangeSize_ || b.start < rangeStart_) {
-			ERROR_LOG_REPORT(HLE, "Bogus block in allocator");
+			ERROR_LOG_REPORT(Log::HLE, "Bogus block in allocator");
 		}
 	}
 }
 
 const char *BlockAllocator::GetBlockTag(u32 addr) const {
 	const Block *b = GetBlockFromAddress(addr);
-	return b->tag;
+	// Unlike the other accessors here, this used to dereference a possibly-null
+	// block unconditionally. Callers (e.g. NetAdhocCommon.cpp) pass the result
+	// straight into strcmp() against an expected tag as part of recovering from a
+	// stale address left over from an old/corrupt savestate, so return "" rather
+	// than nullptr - it simply won't match, correctly triggering their recovery
+	// path instead of crashing in strcmp().
+	return b ? b->tag : "";
 }
 
-inline BlockAllocator::Block *BlockAllocator::GetBlockFromAddress(u32 addr)
+// Not inline: IsBlockFree() in the header calls this, so it has to have external linkage.
+// (An inline definition in a .cpp is only usable within that .cpp - MSVC happens to emit a
+// linkable COMDAT anyway, but clang follows the standard and the Android unittest link fails.)
+BlockAllocator::Block *BlockAllocator::GetBlockFromAddress(u32 addr)
 {
 	for (Block *bp = bottom_; bp != NULL; bp = bp->next)
 	{
@@ -391,15 +396,14 @@ u32 BlockAllocator::GetBlockSizeFromAddress(u32 addr) const
 		return -1;
 }
 
-void BlockAllocator::ListBlocks() const
-{
-	DEBUG_LOG(SCEKERNEL,"-----------");
+void BlockAllocator::ListBlocks(LogLevel level) const {
+	GENERIC_LOG(Log::sceKernel, level, "-----------");
 	for (const Block *bp = bottom_; bp != NULL; bp = bp->next)
 	{
 		const Block &b = *bp;
-		DEBUG_LOG(SCEKERNEL, "Block: %08x - %08x size %08x taken=%i tag=%s", b.start, b.start+b.size, b.size, b.taken ? 1:0, b.tag);
+		GENERIC_LOG(Log::sceKernel, level, "Block: %08x - %08x size %08x taken=%i tag=%s", b.start, b.start+b.size, b.size, b.taken ? 1:0, b.tag);
 	}
-	DEBUG_LOG(SCEKERNEL,"-----------");
+	GENERIC_LOG(Log::sceKernel, level, "-----------");
 }
 
 u32 BlockAllocator::GetLargestFreeBlockSize() const
@@ -415,7 +419,7 @@ u32 BlockAllocator::GetLargestFreeBlockSize() const
 		}
 	}
 	if (maxFreeBlock & (grain_ - 1))
-		WARN_LOG_REPORT(HLE, "GetLargestFreeBlockSize: free size %08x does not align to grain %08x.", maxFreeBlock, grain_);
+		WARN_LOG_REPORT(Log::HLE, "GetLargestFreeBlockSize: free size %08x does not align to grain %08x.", maxFreeBlock, grain_);
 	return maxFreeBlock;
 }
 
@@ -431,33 +435,51 @@ u32 BlockAllocator::GetTotalFreeBytes() const
 		}
 	}
 	if (sum & (grain_ - 1))
-		WARN_LOG_REPORT(HLE, "GetTotalFreeBytes: free size %08x does not align to grain %08x.", sum, grain_);
+		WARN_LOG_REPORT(Log::HLE, "GetTotalFreeBytes: free size %08x does not align to grain %08x.", sum, grain_);
 	return sum;
 }
 
 void BlockAllocator::DoState(PointerWrap &p)
 {
-	auto s = p.Section("BlockAllocator", 1);
+	// v2: compact per-block form — no per-block Section and no per-save tag
+	// re-zeroing (tags are zero-padded at write time now). v1 states still
+	// load through the old form.
+	auto s = p.Section("BlockAllocator", 1, 2);
 	if (!s)
 		return;
 
+	const bool compact = s >= 2;
 	int count = 0;
 
+	// An allocator that was never Init'd (or has been Shutdown) has no blocks, which is a valid
+	// state to save, so a zero block count here is normal rather than corrupt.
 	if (p.mode == p.MODE_READ)
 	{
 		Shutdown();
 		Do(p, count);
 
-		bottom_ = new Block(0, 0, false, NULL, NULL);
-		bottom_->DoState(p);
-		--count;
+		// A corrupt/malicious savestate could claim an enormous block count. Each
+		// block needs at least sizeof(start)+sizeof(size)+sizeof(taken)+sizeof(tag)
+		// bytes in the stream. Reject totally outlandish values.
+		const size_t maxBlocks = p.Remaining() / (sizeof(u32) + sizeof(u32) + 1 + 32);
+		if (count < 0) {
+			count = 0;
+			p.SetError(PointerWrap::ERROR_FAILURE);
+		} else if ((size_t)count > maxBlocks) {
+			count = (int)maxBlocks;
+			p.SetError(PointerWrap::ERROR_FAILURE);
+		}
 
-		top_ = bottom_;
 		for (int i = 0; i < count; ++i)
 		{
-			top_->next = new Block(0, 0, false, top_, NULL);
-			top_->next->DoState(p);
-			top_ = top_->next;
+			Block *block = new Block(0, 0, false, top_, NULL);
+			if (top_) {
+				top_->next = block;
+			} else {
+				bottom_ = block;
+			}
+			top_ = block;
+			block->DoState(p, compact);
 		}
 	}
 	else
@@ -466,15 +488,8 @@ void BlockAllocator::DoState(PointerWrap &p)
 			++count;
 		Do(p, count);
 
-		bottom_->DoState(p);
-		--count;
-
-		Block *last = bottom_;
-		for (int i = 0; i < count; ++i)
-		{
-			last->next->DoState(p);
-			last = last->next;
-		}
+		for (Block *bp = bottom_; bp != NULL; bp = bp->next)
+			bp->DoState(p, compact);
 	}
 
 	Do(p, rangeStart_);
@@ -485,19 +500,31 @@ void BlockAllocator::DoState(PointerWrap &p)
 BlockAllocator::Block::Block(u32 _start, u32 _size, bool _taken, Block *_prev, Block *_next)
 : start(_start), size(_size), taken(_taken), prev(_prev), next(_next)
 {
+	// Zero the whole tag up front so serialization can store it raw without
+	// a per-save strlen+memset (see the compact DoState form).
+	memset(tag, 0, sizeof(tag));
 	truncate_cpy(tag, "(untitled)");
 }
 
 void BlockAllocator::Block::SetAllocated(const char *_tag, bool suballoc) {
 	NotifyMemInfo(suballoc ? MemBlockFlags::SUB_ALLOC : MemBlockFlags::ALLOC, start, size, _tag ? _tag : "");
+	memset(tag, 0, sizeof(tag));
 	if (_tag)
 		truncate_cpy(tag, _tag);
 	else
 		truncate_cpy(tag, "---");
 }
 
-void BlockAllocator::Block::DoState(PointerWrap &p)
+void BlockAllocator::Block::DoState(PointerWrap &p, bool compact)
 {
+	if (compact) {
+		Do(p, start);
+		Do(p, size);
+		Do(p, taken);
+		DoCString(p, tag);
+		return;
+	}
+
 	auto s = p.Section("Block", 1);
 	if (!s)
 		return;
@@ -508,7 +535,6 @@ void BlockAllocator::Block::DoState(PointerWrap &p)
 	// Since we use truncate_cpy, the empty space is not zeroed.  Zero it now.
 	// This avoids saving uninitialized memory.
 	size_t tagLen = strlen(tag);
-	if (tagLen != sizeof(tag))
-		memset(tag + tagLen, 0, sizeof(tag) - tagLen);
-	DoArray(p, tag, sizeof(tag));
+	memset(tag + tagLen, 0, sizeof(tag) - tagLen);
+	DoCString(p, tag);
 }

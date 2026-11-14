@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 #include "Common/Data/Text/Parsers.h"
@@ -173,6 +174,41 @@ bool DebuggerRequest::ParamU32(const char *name, uint32_t *out, bool allowFloatB
 	return false;
 }
 
+bool DebuggerRequest::ParamF64(const char *name, double *out, DebuggerParamType type) {
+	const bool required = type == DebuggerParamType::REQUIRED || type == DebuggerParamType::REQUIRED_LOOSE;
+
+	const JsonNode *node = data.get(name);
+	if (!node) {
+		if (required)
+			Fail(StringFromFormat("Missing '%s' parameter", name));
+		return !required;
+	}
+
+	const auto tag = node->value.getTag();
+	if (tag == JSON_NUMBER) {
+		*out = node->value.toNumber();
+		return true;
+	}
+	if (tag == JSON_STRING) {
+		// Same escape hatch as the integer params: a string for values a JSON number would mangle.
+		const char *s = node->value.toString();
+		char *end = nullptr;
+		const double val = strtod(s, &end);
+		if (end != s && *end == '\0') {
+			*out = val;
+			return true;
+		}
+		Fail(StringFromFormat("Could not parse '%s' parameter: number required", name));
+		return false;
+	}
+	if (tag == JSON_NULL && !required) {
+		return false;
+	}
+
+	Fail(StringFromFormat("Invalid '%s' parameter type", name));
+	return false;
+}
+
 bool DebuggerRequest::ParamBool(const char *name, bool *out, DebuggerParamType type) {
 	bool allowLoose = type == DebuggerParamType::REQUIRED_LOOSE || type == DebuggerParamType::OPTIONAL_LOOSE;
 	bool required = type == DebuggerParamType::REQUIRED || type == DebuggerParamType::REQUIRED_LOOSE;
@@ -216,7 +252,7 @@ bool DebuggerRequest::ParamBool(const char *name, bool *out, DebuggerParamType t
 		*out = true;
 		return true;
 	}
-	if (s == "0" || s == "false" || (s == "" && allowLoose)) {
+	if (s == "0" || s == "false" || (s.empty() && allowLoose)) {
 		*out = false;
 		return true;
 	}
@@ -262,7 +298,7 @@ bool DebuggerRequest::ParamString(const char *name, std::string *out, DebuggerPa
 		return true;
 	} else if (tag == JSON_NULL) {
 		if (required) {
-			*out = "";
+			out->clear();
 		}
 		return true;
 	} else if (tag == JSON_NUMBER) {

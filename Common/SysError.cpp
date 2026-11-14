@@ -38,6 +38,21 @@ std::string GetLastErrorMsg() {
 #endif
 }
 
+#ifndef _WIN32
+// Fun hack by Claude: Use function overloading to deal with the two competing
+// signatures of this poorly standardized function.
+
+// selected for GNU strerror_r
+static std::string StrErrorResult(char *result, const char *buf) {
+	return result ? result : "Unknown error";
+}
+
+// selected for XSI strerror_r
+static std::string StrErrorResult(int result, const char *buf) {
+	return result == 0 ? buf : "Unknown error";
+}
+#endif
+
 std::string GetStringErrorMsg(int errCode) {
 	static const size_t buff_size = 1023;
 
@@ -50,14 +65,17 @@ std::string GetStringErrorMsg(int errCode) {
 
 	char err_str[buff_size] = {};
 	snprintf(err_str, buff_size, "%s", ConvertWStringToUTF8(err_strw).c_str());
-	return std::string(err_str);
+
+	std::string err_string = err_str;
+	// Trim the trailing line breaks which can mess up the logs
+	while (!err_string.empty() && (err_string.back() == '\n' || err_string.back() == '\r')) {
+		err_string.pop_back();
+	}
+	return err_string;
 #else
 	char err_str[buff_size] = {};
 
-	// Thread safe (XSI-compliant)
-	if (strerror_r(errCode, err_str, buff_size) == 0) {
-		return "Unknown error";
-	}
-	return err_str;
+	// See comment for StrErrorResult above.
+	return StrErrorResult(strerror_r(errCode, err_str, buff_size), err_str);
 #endif
 }

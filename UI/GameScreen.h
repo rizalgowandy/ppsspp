@@ -17,10 +17,21 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <vector>
 
-#include "UI/MiscScreens.h"
+#include "UI/BaseScreens.h"
 #include "Common/UI/UIScreen.h"
+#include "Common/File/Path.h"
+#include "UI/GameInfoCache.h"
+#include "Core/HLE/Plugins.h"
+#include "Core/Util/PkgUnpack.h"
+#include "UI/SimpleDialogScreen.h"
+
+
+class NoticeView;
 
 // Game screen: Allows you to start a game, delete saves, delete the game,
 // set game specific settings, etc.
@@ -28,52 +39,77 @@
 // Uses GameInfoCache heavily to implement the functionality.
 // Should possibly merge this with the PauseScreen.
 
-class GameScreen : public UIDialogScreenWithGameBackground {
+class GameScreen : public UITwoPaneBaseDialogScreen {
 public:
-	GameScreen(const std::string &gamePath);
+	GameScreen(const Path &gamePath, bool inGame);
 	~GameScreen();
 
-	void render() override;
+	void update() override;
 
-	std::string tag() const override { return "game"; }
+	const char *tag() const override { return "Game"; }
+
+	// The game was deleted or removed from recents, so the screen we return to should refresh.
+	bool GameRemoved() const { return gameRemoved_; }
 
 protected:
-	void CreateViews() override;
-	void CallbackDeleteConfig(bool yes);
-	void CallbackDeleteSaveData(bool yes);
-	void CallbackDeleteGame(bool yes);
-	bool isRecentGame(const std::string &gamePath);
+	void BeforeCreateViews() override;
+	void CreateContentViews(UI::ViewGroup *parent) override;
+	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateContextMenu(UI::ViewGroup *parent) override;
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+
+	std::string_view GetTitle() const override;
+	// The progress bar of a pack running in the background.
+	void DrawForeground(UIContext &dc) override;
 
 private:
-	UI::Choice *AddOtherChoice(UI::Choice *choice);
-
 	// Event handlers
-	UI::EventReturn OnPlay(UI::EventParams &e);
-	UI::EventReturn OnGameSettings(UI::EventParams &e);
-	UI::EventReturn OnDeleteSaveData(UI::EventParams &e);
-	UI::EventReturn OnDeleteGame(UI::EventParams &e);
-	UI::EventReturn OnSwitchBack(UI::EventParams &e);
-	UI::EventReturn OnCreateShortcut(UI::EventParams &e);
-	UI::EventReturn OnRemoveFromRecent(UI::EventParams &e);
-	UI::EventReturn OnShowInFolder(UI::EventParams &e);
-	UI::EventReturn OnCreateConfig(UI::EventParams &e);
-	UI::EventReturn OnDeleteConfig(UI::EventParams &e);
-	UI::EventReturn OnCwCheat(UI::EventParams &e);
-	UI::EventReturn OnSetBackground(UI::EventParams &e);
+	void OnGameSettings(UI::EventParams &e);
+	void OnDeleteSaveData(UI::EventParams &e);
+	void OnDeleteGame(UI::EventParams &e);
+	void OnCreateConfig(UI::EventParams &e);
+	void OnDeleteConfig(UI::EventParams &e);
+	void OnSetBackground(UI::EventParams &e);
+	void OnDeleteGameUpdate(UI::EventParams &e);
 
-	// As we load metadata in the background, we need to be able to update these after the fact.
-	UI::TextView *tvTitle_;
-	UI::TextView *tvGameSize_;
-	UI::TextView *tvSaveDataSize_;
-	UI::TextView *tvInstallDataSize_;
-	UI::TextView *tvRegion_;
-	UI::TextView *tvCRC_;
+	// What's known about the game from outside its file: an installed update, plugins, and whether
+	// the installed firmware can play it. All disk access, so it's looked up on a worker thread,
+	// and the views are recreated when it's in.
+	struct Lookups {
+		bool hasInstalledUpdate = false;
+		InstalledGameUpdate installedUpdate;
+		std::vector<HLEPlugins::PluginInfo> plugins;
+		Path umdVideoVSHPath;
+		bool firmwareRunsPS1Discs = false;
+	};
+	struct LookupTask {
+		std::atomic<bool> done{};
+		Lookups result;
+	};
+	void StartLookups();
 
-	UI::Choice *btnGameSettings_;
-	UI::Choice *btnCreateGameConfig_;
-	UI::Choice *btnDeleteGameConfig_;
-	UI::Choice *btnDeleteSaveData_;
-	UI::Choice *btnSetBackground_;
-	std::vector<UI::Choice *> otherChoices_;
-	std::vector<std::string> saveDirs;
+	std::string CRC32string;
+
+	bool isHomebrew_ = false;
+	bool inGame_ = false;
+	bool gameRemoved_ = false;
+	bool finishRequested_ = false;
+
+	// Keep track of progressive loading of metadata.
+	GameInfoFlags knownFlags_ = GameInfoFlags::EMPTY;
+
+	bool knownHasCRC_ = false;
+
+	// GamePacker state the views were made for.
+	int packGeneration_ = 0;
+	bool packBarShown_ = false;
+
+	// installedUpdate is a game update in PSP/GAME/<DISC_ID>, which is what actually runs when there is one.
+	Lookups lookups_;
+	std::shared_ptr<LookupTask> lookupTask_;  // While one runs.
+	bool lookupsStarted_ = false;
+	bool lookupsPending_ = false;
+
+	std::shared_ptr<GameInfo> info_;
+	mutable std::string titleCache_;
 };

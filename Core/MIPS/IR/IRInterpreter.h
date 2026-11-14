@@ -1,23 +1,36 @@
 #pragma once
 
 #include "Common/CommonTypes.h"
+#include "Core/Core.h"
+#include "Core/MemMap.h"
 
 class MIPSState;
 struct IRInst;
 
-inline static u32 ReverseBits32(u32 v) {
-	// http://graphics.stanford.edu/~seander/bithacks.html#ReverseParallel
-	// swap odd and even bits
-	v = ((v >> 1) & 0x55555555) | ((v & 0x55555555) << 1);
-	// swap consecutive pairs
-	v = ((v >> 2) & 0x33333333) | ((v & 0x33333333) << 2);
-	// swap nibbles ...
-	v = ((v >> 4) & 0x0F0F0F0F) | ((v & 0x0F0F0F0F) << 4);
-	// swap bytes
-	v = ((v >> 8) & 0x00FF00FF) | ((v & 0x00FF00FF) << 8);
-	// swap 2-byte long pairs
-	v = ( v >> 16             ) | ( v               << 16);
-	return v;
-}
+u32 IRRunBreakpoint(u32 pc);
+u32 IRRunMemCheck(u32 pc, u32 addr);
+// A LoadKernel*/StoreKernel* (op) to an address the native JITs don't access directly: a hardware
+// register, or not memory at all.
+u32 IRRunKernelLoad(MIPSState *mips, u32 addr, u32 op);
+void IRRunKernelStore(MIPSState *mips, u32 addr, u32 value, u32 op);
 
-u32 IRInterpret(MIPSState *ms, const IRInst *inst, int count);
+template <uint32_t alignment>
+u32 RunValidateAddress(u32 pc, u32 addr, u32 isWrite) {
+	static_assert(alignment <= 16);
+	const auto toss = [&](MemoryExceptionType t) {
+		Core_MemoryException(addr, alignment, pc, t);
+		return coreState != CORE_RUNNING_CPU ? 1 : 0;
+	};
+
+	if (!Memory::IsValidNAlignedAddress<alignment>(addr)) {
+		MemoryExceptionType t = isWrite == 1 ? MemoryExceptionType::WRITE_WORD : MemoryExceptionType::READ_WORD;
+		if constexpr (alignment > 4)
+			t = isWrite ? MemoryExceptionType::WRITE_BLOCK : MemoryExceptionType::READ_BLOCK;
+		return toss(t);
+	}
+
+	if constexpr (alignment > 1)
+		if ((addr & (alignment - 1)) != 0)
+			return toss(MemoryExceptionType::ALIGNMENT);
+	return 0;
+}

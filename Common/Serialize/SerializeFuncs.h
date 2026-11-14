@@ -18,6 +18,7 @@
 #pragma once
 
 // Templates for save state serialization.  See Serializer.h.
+#include <algorithm>
 #include <string>
 #include <type_traits>
 #include "Common/Serialize/Serializer.h"
@@ -33,11 +34,7 @@ void Do(PointerWrap &p, tm &t);
 
 // This makes it a compile error if you forget to define DoState() on non-POD.
 // Which also can be a problem, for example struct tm is non-POD on linux, for whatever reason...
-#ifdef _MSC_VER
-template<typename T, bool isPOD = std::is_pod<T>::value, bool isPointer = std::is_pointer<T>::value>
-#else
-template<typename T, bool isPOD = __is_pod(T), bool isPointer = std::is_pointer<T>::value>
-#endif
+template<typename T, bool isPOD = std::is_standard_layout<T>::value && std::is_trivial<T>::value, bool isPointer = std::is_pointer<T>::value>
 struct DoHelper_ {
 	static void DoArray(PointerWrap &p, T *x, int count) {
 		for (int i = 0; i < count; ++i)
@@ -68,9 +65,23 @@ void DoClass(PointerWrap &p, T &x) {
 template<class T>
 void DoClass(PointerWrap &p, T *&x) {
 	if (p.mode == PointerWrap::MODE_READ) {
+		delete x;
+		x = new T();
+	} else if (p.mode == PointerWrap::MODE_NOOP && !x) {
+		// A load that failed partway leaves the rest of a container unfilled.
+		return;
+	}
+	x->DoState(p);
+}
+
+template<class T, class S, typename... Args>
+void DoSubClass(PointerWrap &p, T *&x, Args... args) {
+	if (p.mode == PointerWrap::MODE_READ) {
 		if (x != nullptr)
 			delete x;
-		x = new T();
+		x = new S(args...);
+	} else if (p.mode == PointerWrap::MODE_NOOP && !x) {
+		return;
 	}
 	x->DoState(p);
 }
@@ -78,6 +89,33 @@ void DoClass(PointerWrap &p, T *&x) {
 template<class T>
 void DoArray(PointerWrap &p, T *x, int count) {
 	DoHelper_<T>::DoArray(p, x, count);
+}
+
+// For a fixed-size string inside a struct that was just loaded whole. Nothing makes a savestate
+// terminate it, and these get used as C strings.
+template<size_t N>
+void TerminateLoadedCString(PointerWrap &p, char (&str)[N]) {
+	if (p.mode == PointerWrap::MODE_READ) {
+		str[N - 1] = '\0';
+	}
+}
+
+// A fixed-size string, serialized like DoArray, and always terminated after loading.
+template<size_t N>
+void DoCString(PointerWrap &p, char (&str)[N]) {
+	p.DoVoid(str, (int)N);
+	TerminateLoadedCString(p, str);
+}
+
+// Lower bound on the bytes one element of a serialized container takes up, used to sanity check
+// element counts read from a savestate against how much buffer is actually left.
+// sizeof(T) is only valid for the types DoHelper_ writes out raw - the same condition as its
+// specialization above. Anything with its own Do()/DoState() (a string, a pointer to a class, a
+// nested container) routinely serializes far fewer bytes than it occupies in memory, and using
+// sizeof(T) for those rejects perfectly good savestates.
+template<class T>
+constexpr size_t SerializeMinElemSize() {
+	return std::is_standard_layout<T>::value && std::is_trivial<T>::value && !std::is_pointer<T>::value ? sizeof(T) : 1;
 }
 
 template<class T>
@@ -89,13 +127,41 @@ template<class T>
 void DoVector(PointerWrap &p, std::vector<T> &x, T &default_val) {
 	u32 vec_size = (u32)x.size();
 	Do(p, vec_size);
-	x.resize(vec_size, default_val);
+	// Guard against an attacker-controlled size that would both resize the
+	// vector hugely and read past the end of the buffer.
+	if (p.mode == PointerWrap::MODE_READ || p.mode == PointerWrap::MODE_VERIFY) {
+		if (vec_size > p.Remaining() / SerializeMinElemSize<T>()) {
+			p.SetError(PointerWrap::ERROR_FAILURE);
+			return;
+		}
+	}
+	// Elements that aren't stored raw can serialize to a few bytes but be much bigger in memory, so
+	// the check above still lets a corrupt state ask for gigabytes. Grow as the data arrives instead.
+	if (p.mode == PointerWrap::MODE_READ && sizeof(T) > SerializeMinElemSize<T>()) {
+		x.clear();
+		for (u32 done = 0; done < vec_size && !p.Failed(); ) {
+			const u32 n = std::min(vec_size - done, (u32)1024);
+			x.resize(done + n, default_val);
+			DoArray(p, &x[done], n);
+			done += n;
+		}
+		return;
+	}
+	if (vec_size != x.size())
+		x.resize(vec_size, default_val);
 	if (vec_size > 0)
 		DoArray(p, &x[0], vec_size);
 }
 
 template<class T>
 void Do(PointerWrap &p, std::vector<T *> &x) {
+	if (p.mode == PointerWrap::MODE_READ) {
+		// The elements are owned (DoClass replaces them), and a shorter vector would drop the rest.
+		for (T *elem : x) {
+			delete elem;
+		}
+		x.clear();
+	}
 	T *dv = nullptr;
 	DoVector(p, x, dv);
 }

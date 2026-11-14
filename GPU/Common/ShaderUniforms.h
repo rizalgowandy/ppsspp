@@ -3,82 +3,82 @@
 #include <cstdint>
 
 #include "ShaderCommon.h"
+#include "Common/Math/math_util.h"
+#include "GPU/GPUState.h"
 
 // Used by the "modern" backends that use uniform buffers. They can share this without issue.
 
 enum : uint64_t {
 	DIRTY_BASE_UNIFORMS =
-	DIRTY_WORLDMATRIX | DIRTY_PROJTHROUGHMATRIX | DIRTY_VIEWMATRIX | DIRTY_TEXMATRIX | DIRTY_ALPHACOLORREF |
-	DIRTY_PROJMATRIX | DIRTY_FOGCOLOR | DIRTY_FOGCOEF | DIRTY_TEXENV | DIRTY_STENCILREPLACEVALUE |
-	DIRTY_ALPHACOLORMASK | DIRTY_SHADERBLEND | DIRTY_COLORWRITEMASK | DIRTY_UVSCALEOFFSET | DIRTY_TEXCLAMP | DIRTY_DEPTHRANGE | DIRTY_MATAMBIENTALPHA |
-	DIRTY_BEZIERSPLINE | DIRTY_DEPAL,
+	DIRTY_WORLDMATRIX | DIRTY_FRAMEBUFFER_DIM | DIRTY_VIEWMATRIX | DIRTY_TEXMATRIX | DIRTY_ALPHACOLORREF |
+	DIRTY_PROJMATRIX | DIRTY_FOGCOLOR | DIRTY_FOGCOEF | DIRTY_TEXENV | DIRTY_TEX_ALPHA_MUL | DIRTY_STENCILREPLACEVALUE |
+	DIRTY_ALPHACOLORMASK | DIRTY_SHADERBLEND | DIRTY_COLORWRITEMASK | DIRTY_UVSCALEOFFSET | DIRTY_TEXCLAMP | DIRTY_MATAMBIENTALPHA |
+	DIRTY_DEPAL | DIRTY_VIEWPORT_UNIFORMS | DIRTY_RASTER_OFFSET | DIRTY_MIPBIAS,
 	DIRTY_LIGHT_UNIFORMS =
-	DIRTY_LIGHT0 | DIRTY_LIGHT1 | DIRTY_LIGHT2 | DIRTY_LIGHT3 |
+	DIRTY_LIGHT_CONTROL | DIRTY_LIGHT0 | DIRTY_LIGHT1 | DIRTY_LIGHT2 | DIRTY_LIGHT3 |
 	DIRTY_MATDIFFUSE | DIRTY_MATSPECULAR | DIRTY_MATEMISSIVE | DIRTY_AMBIENT,
 };
 
-// TODO: Split into two structs, one for software transform and one for hardware transform, to save space.
-// Currently 512 bytes. Probably can't get to 256 (nVidia's UBO alignment).
+// Currently 480 bytes.
 // Every line here is a 4-float.
-struct UB_VS_FS_Base {
+struct alignas(16) UB_VS_FS_Base {
 	float proj[16];
-	float proj_through[16];
 	float view[12];
 	float world[12];
 	float tex[12];
+	float xywh[4];  // later, we could invert w and h here to avoid division.
+	float vpScale[3]; float NaN;
+	float vpOffset[3]; float padding2;
+	float rasterOffset[2]; float minZmaxZ[2];
 	float uvScaleOffset[4];
-	float depthRange[4];
-	float fogCoef[2];	float stencil; float pad0;
 	float matAmbient[4];
-	float cullRangeMin[4];
-	float cullRangeMax[4];
-	uint32_t spline_counts; uint32_t depal_mask_shift_off_fmt;  // 4 params packed into one.
-	uint32_t colorWriteMask; int pad3;
+	uint32_t padding3; uint32_t depal_mask_shift_off_fmt;  // 4 params packed into one.
+	uint32_t colorWriteMask; float mipBias;
 	// Fragment data
-	float fogColor[4];
-	float texEnvColor[4];
-	int alphaColorRef[4];
-	int colorTestMask[4];
-	float blendFixA[4];
-	float blendFixB[4];
+	float texNoAlpha; float texMul; float texClampOffset[2];;  // this vec4 will hold ubershader stuff. We won't use integer flags in the fragment shader.
+	float fogCoef[2]; float texLodBias; float padding4;
+	float fogColor[3]; uint32_t alphaColorRef;
+	float texEnvColor[3]; uint32_t colorTestMask;
 	float texClamp[4];
-	float texClampOffset[4];
+	float blendFixA[3]; float stencilReplaceValue;
+	float blendFixB[3]; float rotation;
+	// VR stuff is to go here, later. For normal drawing, we can then get away
+	// with just uploading the first X bytes of the struct (up to and including fogCoef).
 };
+static_assert(sizeof(UB_VS_FS_Base) <= 432, "UB_VS_FS_Base should be 432 bytes");
 
-static const char *ub_baseStr =
+static const char * const ub_baseStr =
 R"(  mat4 u_proj;
-  mat4 u_proj_through;
   mat3x4 u_view;
   mat3x4 u_world;
   mat3x4 u_texmtx;
+  vec4 u_xywh;
+  vec3 u_vpScale; float u_NaN;
+  vec4 u_vpOffset;
+  vec2 u_rasterOffset; vec2 u_minZmaxZ;
   vec4 u_uvscaleoffset;
-  vec4 u_depthRange;
-  vec2 u_fogcoef;
-  float u_stencilReplaceValue;
   vec4 u_matambientalpha;
-  vec4 u_cullRangeMin;
-  vec4 u_cullRangeMax;
-  uint u_spline_counts;
+  uint pad0;
   uint u_depal_mask_shift_off_fmt;
   uint u_colorWriteMask;
-  int u_pad3;
-  vec3 u_fogcolor;
-  vec3 u_texenv;
-  ivec4 u_alphacolorref;
-  ivec4 u_alphacolormask;
-  vec3 u_blendFixA;
-  vec3 u_blendFixB;
+  float u_mipBias;
+  vec2 u_texNoAlphaMul; vec2 u_texclampoff;
+  vec2 u_fogcoef; float u_texLodBias; float pad2;
+  vec3 u_fogcolor;  uint u_alphacolorref;
+  vec3 u_texenv;    uint u_alphacolormask;
   vec4 u_texclamp;
-  vec2 u_texclampoff;
+  vec3 u_blendFixA; float u_stencilReplaceValue;
+  vec3 u_blendFixB; float u_rotation;
 )";
 
 // 512 bytes. Would like to shrink more. Some colors only have 8-bit precision and we expand
 // them to float unnecessarily, could just as well expand in the shader.
-struct UB_VS_Lights {
+struct alignas(16) UB_VS_Lights {
 	float ambientColor[4];
 	float materialDiffuse[4];
 	float materialSpecular[4];
-	float materialEmissive[4];
+	float materialEmissive[3];
+	uint32_t lightControl;
 	float lpos[4][4];
 	float ldir[4][4];
 	float latt[4][4];
@@ -87,55 +87,71 @@ struct UB_VS_Lights {
 	float lightDiffuse[4][4];
 	float lightSpecular[4][4];
 };
+static_assert(sizeof(UB_VS_Lights) == 512);  // it's ok to optimize this, it's just an assumption check.
 
-static const char *ub_vs_lightsStr =
-R"(	vec4 u_ambient;
-	vec3 u_matdiffuse;
-	vec4 u_matspecular;
-	vec3 u_matemissive;
-	vec3 u_lightpos0;
-	vec3 u_lightpos1;
-	vec3 u_lightpos2;
-	vec3 u_lightpos3;
-	vec3 u_lightdir0;
-	vec3 u_lightdir1;
-	vec3 u_lightdir2;
-	vec3 u_lightdir3;
-	vec3 u_lightatt0;
-	vec3 u_lightatt1;
-	vec3 u_lightatt2;
-	vec3 u_lightatt3;
-	vec4 u_lightangle_spotCoef0;
-	vec4 u_lightangle_spotCoef1;
-	vec4 u_lightangle_spotCoef2;
-	vec4 u_lightangle_spotCoef3;
-	vec3 u_lightambient0;
-	vec3 u_lightambient1;
-	vec3 u_lightambient2;
-	vec3 u_lightambient3;
-	vec3 u_lightdiffuse0;
-	vec3 u_lightdiffuse1;
-	vec3 u_lightdiffuse2;
-	vec3 u_lightdiffuse3;
-	vec3 u_lightspecular0;
-	vec3 u_lightspecular1;
-	vec3 u_lightspecular2;
-	vec3 u_lightspecular3;
+static const char * const ub_vs_lightsStr =
+R"(  vec4 u_ambient;
+  vec3 u_matdiffuse;
+  vec4 u_matspecular;
+  vec3 u_matemissive;
+  uint u_lightControl;  // light ubershader control bits
+  vec3 u_lightpos[4];
+  vec3 u_lightdir[4];
+  vec3 u_lightatt[4];
+  vec4 u_lightangle_spotCoef[4];
+  vec3 u_lightambient[4];
+  vec3 u_lightdiffuse[4];
+  vec3 u_lightspecular[4];
 )";
 
-// With some cleverness, we could get away with uploading just half this when only the four or five first
-// bones are being used. This is 384b.
-struct UB_VS_Bones {
-	float bones[8][12];
+// VR (GPU_USE_VIRTUAL_REALITY) on Vulkan. Pushed right after UB_VS_FS_Base, as the end of the
+// vertex shader's base block, so other backends and non-VR drawing don't pay for it.
+struct alignas(16) UB_VS_VR {
+	float projLens[16];  // The headset's projection, with the game's signs.
+	float viewRight[12];  // The right eye's view. The left eye's (or the only one) is in the base view.
+	float scaleX; float scaleY; float padding[2];  // HUD scaling.
 };
+static_assert(sizeof(UB_VS_VR) == 128);
 
-static const char *ub_vs_bonesStr =
-R"(	mat3x4 u_bone0; mat3x4 u_bone1; mat3x4 u_bone2; mat3x4 u_bone3; mat3x4 u_bone4; mat3x4 u_bone5; mat3x4 u_bone6; mat3x4 u_bone7; mat3x4 u_bone8;
+static const char * const ub_vrStr =
+R"(  mat4 u_proj_lens;
+  mat3x4 u_viewR;
+  float u_scaleX; float u_scaleY; vec2 u_vrPadding;
 )";
 
-void CalcCullRange(float minValues[4], float maxValues[4], bool flipViewport, bool hasNegZ);
-
-void BaseUpdateUniforms(UB_VS_FS_Base *ub, uint64_t dirtyUniforms, bool flipViewport, bool useBufferedRendering);
+// useBufferedRendering is only used to determine the rotation uniform.
+void BaseUpdateUniforms(UB_VS_FS_Base *ub, uint64_t dirtyUniforms, bool useBufferedRendering, bool pixelMapped);
 void LightUpdateUniforms(UB_VS_Lights *ub, uint64_t dirtyUniforms);
-void BoneUpdateUniforms(UB_VS_Bones *ub, uint64_t dirtyUniforms);
+// Call for every draw after BaseUpdateUniforms: the HUD guess depends on state that dirties nothing.
+// Replaces the base view with the left eye's.
+void VRUpdateUniforms(UB_VS_FS_Base *base, UB_VS_VR *vr, uint64_t dirtyUniforms);
+// Whether a draw looks like part of the HUD, which VR scales down to keep in view.
+bool GuessVRDrawingHUD(bool is2D, bool flatScreen);
 
+uint32_t PackLightControlBits();
+uint32_t PackDepalBits(bool pixelMapped);
+// Call before reading the dirty uniforms: the depal uniform depends on pixelMapped, which changes per draw.
+void DirtyDepalIfPixelMappedChanged(bool pixelMapped);
+
+void UpdateFogCoef(const GEState &state, float fogCoef[2]);
+
+// Computes u_texclamp and u_texclampoff. Only meaningful when gstate_c.needShaderTexClamp is set.
+void CalcTexClamp(float texClamp[4], float texClampOffset[2]);
+// The part of a video texture the frame fills, and whether it's smaller than the texture.
+int VideoFrameWidth();
+int VideoFrameHeight();
+bool VideoClampsS();
+bool VideoClampsT();
+
+// This happens so much that I want it inline.
+inline void UpdateUVScaleOff(const GEState &state, float uvScaleOff[4]) {
+	if (gstate_c.textureIsFramebuffer) {
+		uvScaleOff[0] = (float)gstate.getTextureWidth(0) / (float)gstate_c.curTextureWidth;
+		uvScaleOff[1] = (float)gstate.getTextureHeight(0) / (float)gstate_c.curTextureHeight;
+	} else {
+		uvScaleOff[0] = 1.0f;
+		uvScaleOff[1] = 1.0f;
+	}
+	uvScaleOff[2] = 0.0f;
+	uvScaleOff[3] = 0.0f;
+}

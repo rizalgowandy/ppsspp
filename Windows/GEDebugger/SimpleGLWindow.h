@@ -22,6 +22,7 @@
 
 #include "Common/GPU/OpenGL/GLSLProgram.h"
 #include "Common/CommonWindows.h"
+#include "Windows/W32Util/ContextMenu.h"
 
 struct SimpleGLWindow {
 	static const wchar_t *windowClass;
@@ -116,7 +117,7 @@ struct SimpleGLWindow {
 	}
 
 	// Called first with 0 that it's opening, then the selected item.
-	void SetRightClickMenu(HMENU menu, std::function<void(int)> callback) {
+	void SetRightClickMenu(ContextMenuID menu, std::function<void(int, int, int)> callback) {
 		rightClickCallback_ = callback;
 		rightClickMenu_ = menu;
 	}
@@ -135,6 +136,7 @@ protected:
 	bool Leave();
 	bool RightClick(int mouseX, int mouseY);
 	bool ToggleZoom();
+	POINT PosFromMouse(int mouseX, int mouseY);
 	const u8 *Reformat(const u8 *data, Format fmt, u32 numPixels);
 
 	HWND hWnd_;
@@ -172,6 +174,6 @@ protected:
 
 	std::function<void()> redrawCallback_;
 	std::function<void(int, int)> hoverCallback_;
-	std::function<void(int)> rightClickCallback_;
-	HMENU rightClickMenu_;
+	std::function<void(int, int, int)> rightClickCallback_;
+	ContextMenuID rightClickMenu_;
 };

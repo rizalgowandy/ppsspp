@@ -18,7 +18,10 @@
 
 #pragma once
 
+#include <vector>
+
 #include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Swap.h"
 
 enum PBPSubFile {
@@ -48,21 +51,31 @@ public:
 	bool IsValid() const { return file_ != nullptr; }
 	bool IsELF() const { return file_ == nullptr && isELF_; }
 
-	bool GetSubFile(PBPSubFile file, std::vector<u8> *out);
-	void GetSubFileAsString(PBPSubFile file, std::string *out);
+	bool GetSubFile(PBPSubFile file, std::vector<u8> *out) const;
+	bool GetSubFileAsString(PBPSubFile file, std::string *out) const;
+	// Part of a subfile, for the large ones. False if it doesn't lie within it.
+	bool ReadSubFile(PBPSubFile file, u32 offset, size_t size, void *out) const;
 
-	size_t GetSubFileSize(PBPSubFile file) {
-		int num = (int)file;
-		if (num < 7) {
-			return header_.offsets[file + 1] - header_.offsets[file];
-		} else {
-			return fileSize_ - header_.offsets[file];
-		}
+	size_t GetSubFileSize(PBPSubFile file) const {
+		const int num = (int)file;
+		if (num < 0 || num >= (int)ARRAY_SIZE(header_.offsets))
+			return 0;
+		const u32 start = header_.offsets[num];
+		// The last subfile runs to the end of the file, the rest to where the next one starts.
+		const u32 stop = num + 1 < (int)ARRAY_SIZE(header_.offsets) ? header_.offsets[num + 1] : (u32)fileSize_;
+		// These offsets come out of the file, so they aren't necessarily ordered or even inside it.
+		// Subtracting them blind produced a huge size from an underflow.
+		if (stop < start || stop > fileSize_)
+			return 0;
+		return stop - start;
 	}
 
 private:
-	FileLoader *file_;
-	size_t fileSize_;
-	const PBPHeader header_;
-	bool isELF_;
+	FileLoader *file_ = nullptr;
+	size_t fileSize_ = 0;
+	// Not const: the constructor reads the file straight into this. It used to be, and was written
+	// through a cast that stripped the const away - which compiles, but lets the compiler assume the
+	// value never changes from the {} it was initialized with.
+	PBPHeader header_{};
+	bool isELF_ = false;
 };

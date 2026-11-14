@@ -2,17 +2,29 @@
 #include <array>
 #include <string.h>
 
-extern "C"
-{
 #include "ext/libkirk/kirk_engine.h"
+#include "ext/libkirk/amctrl.h"
 #include "ext/libkirk/SHA1.h"
-}
 #include "Common/Common.h"
 #include "Common/Log.h"
 #include "Common/Swap.h"
 #include "Core/ELF/PrxDecrypter.h"
 
 #define ROUNDUP16(x)  (((x)+15)&~15)
+
+// PSP_Header::decrypt_mode, the byte at 0x7C. Only the one we act on is named; the rest select
+// which decryption variant a real PSP would use, which we don't need since we try them in turn.
+enum {
+	PRX_DECRYPT_MODE_SPRX = 23,
+};
+
+// A module that arrived inside an NPDRM EDAT carries this fixed XOR on top of its tag's key. It
+// goes with the decrypt_mode above rather than with any particular tag - tag 0x407810F0's table
+// entry has no seed of its own, in JPCSP's tables as well as ours, so keying this on the tag
+// would be wrong for a 0x407810F0 module that arrived some other way.
+static const u8 xor_91E0A9AD[16] = {
+	0x84, 0x7B, 0xF5, 0xFE, 0xE8, 0x4D, 0xAD, 0x7A, 0xB5, 0x06, 0x28, 0x0E, 0x09, 0xFA, 0x81, 0xE1,
+};
 
 // Thank you PSARDUMPER & JPCSP keys
 
@@ -50,6 +62,8 @@ static const u8 keys500_c[] = {0xA3, 0x5D, 0x51, 0xE6, 0x56, 0xC8, 0x01, 0xCA, 0
 static const u8 keys505_a[] = {0x7B, 0x94, 0x72, 0x27, 0x4C, 0xCC, 0x54, 0x3B, 0xAE, 0xDF, 0x46, 0x37, 0xAC, 0x01, 0x4D, 0x87};
 static const u8 keys505_0[] = {0x2E, 0x8E, 0x97, 0xA2, 0x85, 0x42, 0x70, 0x73, 0x18, 0xDA, 0xA0, 0x8A, 0xF8, 0x62, 0xA2, 0xB0};
 static const u8 keys505_1[] = {0x58, 0x2A, 0x4C, 0x69, 0x19, 0x7B, 0x83, 0x3D, 0xD2, 0x61, 0x61, 0xFE, 0x14, 0xEE, 0xAA, 0x11};
+static const u8 keys555_k1[] = {0x9F, 0xFD, 0x4C, 0x28, 0x20, 0xB1, 0x3E, 0x76, 0x36, 0x4A, 0xAB, 0x1C, 0x54, 0xBC, 0x3B, 0xDC};
+static const u8 keys555_k2[] = {0xAB, 0x1A, 0x74, 0x43, 0xF7, 0x4F, 0xE5, 0xFF, 0x04, 0xA5, 0xFC, 0x3B, 0xEC, 0xD4, 0xF8, 0xF0};
 static const u8 keys570_5k[] = {0x6D, 0x72, 0xA4, 0xBA, 0x7F, 0xBF, 0xD1, 0xF1, 0xA9, 0xF3, 0xBB, 0x07, 0x1B, 0xC0, 0xB3, 0x66};
 static const u8 keys600_1[] = {0xE3, 0x52, 0x39, 0x97, 0x3B, 0x84, 0x41, 0x1C, 0xC3, 0x23, 0xF1, 0xB8, 0xA9, 0x09, 0x4B, 0xF0};
 static const u8 keys600_2[] = {0xE1, 0x45, 0x93, 0x2C, 0x53, 0xE2, 0xAB, 0x06, 0x6F, 0xB6, 0x8F, 0x0B, 0x66, 0x91, 0xE7, 0x1E};
@@ -119,9 +133,20 @@ static const u8 key_D91624F0[] = {0x61, 0xB7, 0x26, 0xAF, 0x8B, 0xF1, 0x41, 0x58
 static const u8 key_D91628F0[] = {0x49, 0xA4, 0xFC, 0x66, 0xDC, 0xE7, 0x62, 0x21, 0xDB, 0x18, 0xA7, 0x50, 0xD6, 0xA8, 0xC1, 0xB6};
 static const u8 key_D91680F0[] = {0x2C, 0x22, 0x9B, 0x12, 0x36, 0x74, 0x11, 0x67, 0x49, 0xD1, 0xD1, 0x88, 0x92, 0xF6, 0xA1, 0xD8};
 static const u8 key_D91681F0[] = {0x52, 0xB6, 0x36, 0x6C, 0x8C, 0x46, 0x7F, 0x7A, 0xCC, 0x11, 0x62, 0x99, 0xC1, 0x99, 0xBE, 0x98};
+static const u8 key_2E5E0AF0[] = {0xAC, 0xD7, 0x6D, 0x90, 0x33, 0x37, 0x38, 0x92, 0x31, 0x41, 0xD6, 0x36, 0xAF, 0x9F, 0x17, 0x15};
+static const u8 xor_2E5E0AF0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
 static const u8 key_2E5E10F0[] = {0x9D, 0x5C, 0x5B, 0xAF, 0x8C, 0xD8, 0x69, 0x7E, 0x51, 0x9F, 0x70, 0x96, 0xE6, 0xD5, 0xC4, 0xE8};
+static const u8 xor_2E5E10F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
+static const u8 key_2E5E11F0[] = {0x75, 0xEB, 0xE8, 0x43, 0xF4, 0x87, 0x8F, 0xD0, 0x14, 0x7F, 0x7E, 0x39, 0xAD, 0xAF, 0x04, 0x9D};
+static const u8 xor_2E5E11F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
 static const u8 key_2E5E12F0[] = {0x8A, 0x7B, 0xC9, 0xD6, 0x52, 0x58, 0x88, 0xEA, 0x51, 0x83, 0x60, 0xCA, 0x16, 0x79, 0xE2, 0x07};
+static const u8 xor_2E5E12F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
 static const u8 key_2E5E13F0[] = {0xFF, 0xA4, 0x68, 0xC3, 0x31, 0xCA, 0xB7, 0x4C, 0xF1, 0x23, 0xFF, 0x01, 0x65, 0x3D, 0x26, 0x36};
+static const u8 xor_2E5E13F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
+static const u8 key_2E5E80F0[] = {0x0F, 0x74, 0xAF, 0x43, 0x75, 0xCD, 0xDA, 0x39, 0x81, 0x56, 0xD9, 0x61, 0x3E, 0x16, 0xC8, 0x92};
+static const u8 xor_2E5E80F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
+static const u8 key_2E5E90F0[] = {0x67, 0xE4, 0x8F, 0x4C, 0x08, 0xA0, 0x7D, 0xB1, 0x5F, 0x51, 0xA7, 0x72, 0x98, 0xA8, 0x2D, 0x7E};
+static const u8 xor_2E5E90F0[] = {0x69, 0xBA, 0x55, 0x34, 0xF0, 0xC0, 0xD6, 0x71, 0xE3, 0x1F, 0xDB, 0x97, 0xE0, 0x7C, 0xD2, 0x2A};
 static const u8 key_2FD30BF0[] = {0xD8, 0x58, 0x79, 0xF9, 0xA4, 0x22, 0xAF, 0x86, 0x90, 0xAC, 0xDA, 0x45, 0xCE, 0x60, 0x40, 0x3F};
 static const u8 keys02G_E[] = {0x9D, 0x09, 0xFD, 0x20, 0xF3, 0x8F, 0x10, 0x69, 0x0D, 0xB2, 0x6F, 0x00, 0xCC, 0xC5, 0x51, 0x2E};
 static const u8 keys03G_E[] = {0x4F, 0x44, 0x5C, 0x62, 0xB3, 0x53, 0xC4, 0x30, 0xFC, 0x3A, 0xA4, 0x5B, 0xEC, 0xFE, 0x51, 0xEA};
@@ -151,6 +176,53 @@ static const u8 pauth_98b83b5d_xor[] = {0xA9, 0x1E, 0xDD, 0x7B, 0x09, 0xBB, 0x22
 static const u8 pauth_f7aa47f6_1[] = {0xC5, 0xFB, 0x69, 0x03, 0x20, 0x7A, 0xCF, 0xBA, 0x2C, 0x90, 0xF8, 0xB8, 0x4D, 0xD2, 0xF1, 0xDE};
 static const u8 pauth_f7aa47f6_2[] = {0x3A, 0x6B, 0x48, 0x96, 0x86, 0xA5, 0xC8, 0x80, 0x69, 0x6C, 0xE6, 0x4B, 0xF6, 0x04, 0x17, 0x44};
 static const u8 pauth_f7aa47f6_xor[] = {0xA9, 0x1E, 0xDD, 0x7B, 0x09, 0xBB, 0x22, 0xB5, 0x9D, 0xA3, 0x30, 0x69, 0x13, 0x6E, 0x0E, 0xD8};
+// Retail game patch installed by the DRM BB install utility (decrypt mode 18). JPCSP KeyVault.
+static const u8 key_89742B04[] = {0xD7, 0xEB, 0xC9, 0x24, 0x7E, 0x23, 0x3D, 0x89, 0x46, 0xE7, 0x2E, 0x47, 0xAD, 0xDB, 0x0D, 0x09};
+static const u8 xor_89742B04[] = {0xFF, 0x5E, 0xF1, 0xE9, 0xB1, 0xC9, 0x3E, 0xC5, 0xDB, 0xE0, 0x67, 0x82, 0x95, 0x3A, 0x8E, 0xA5};
+
+// A type 3 module as it ships, inside a DRM BB install package, has its first type 5 step encrypted
+// for KIRK command 2, whose key (AES keyslot 3) isn't known. The install re-encrypts it for the console
+// with command 2. These are command 2's results (the 0x50 bytes the first step decrypts to) for the
+// packages we know of, recovered from installs on a PSP. They're keyed by the first 16 bytes of the
+// command 2 header at 0xEC, its encrypted per-module key.
+struct Kirk2Result {
+	u8 header[16];
+	u8 result[0x50];
+};
+
+static const Kirk2Result g_kirk2Results[] = {
+	// Killzone: Liberation 1.20 + Chapter 5 (UCES00279), KZL.PRX.
+	{
+		{0x68, 0x2F, 0x47, 0x0B, 0xE9, 0x4C, 0xE5, 0xE9, 0xA4, 0x39, 0xD7, 0x6F, 0x38, 0x53, 0xCF, 0xDE},
+		{
+			0xF6, 0xDC, 0x71, 0xF8, 0x19, 0x1A, 0xDB, 0xC4, 0xFF, 0x5C, 0xCE, 0x3A, 0xAE, 0x8A, 0x04, 0x11,
+			0xE3, 0x45, 0x91, 0xDA, 0x7F, 0xE3, 0x2E, 0x75, 0xB8, 0x6B, 0xDF, 0x87, 0x55, 0x22, 0xF6, 0x90,
+			0x96, 0x7B, 0xF4, 0xF6, 0x88, 0x55, 0xE0, 0xF1, 0xB5, 0xD8, 0xDF, 0xF0, 0x9B, 0xB1, 0xBD, 0x60,
+			0x46, 0xA0, 0x1F, 0x53, 0x64, 0xD9, 0x7C, 0xF7, 0x56, 0x7E, 0x23, 0x8A, 0x8F, 0x8E, 0xFD, 0xF6,
+			0x1F, 0x28, 0xDD, 0xB9, 0x39, 0xDE, 0x58, 0xD7, 0x48, 0x55, 0x64, 0x99, 0x5A, 0xD2, 0x55, 0x6C,
+		},
+	},
+	// Killzone: Liberation 1.20 + Chapter 5 (UCUS98646), KZL.PRX.
+	{
+		{0x03, 0x48, 0xC4, 0x10, 0xCD, 0x29, 0x80, 0x92, 0xE9, 0x6D, 0xB8, 0x14, 0xE2, 0x0E, 0x24, 0x2F},
+		{
+			0xDE, 0xE8, 0x0D, 0x22, 0x09, 0xEF, 0x91, 0x45, 0x57, 0xAF, 0x9D, 0xC8, 0xB4, 0xF1, 0xC2, 0x0C,
+			0x34, 0x14, 0x1A, 0x54, 0x66, 0xA1, 0xB3, 0xF8, 0x8E, 0xCF, 0xE9, 0x15, 0x77, 0x42, 0x3B, 0x38,
+			0x67, 0xEA, 0xF8, 0xA7, 0x5C, 0x0A, 0xBF, 0x1D, 0xAD, 0x0D, 0xED, 0x83, 0xEF, 0x8A, 0x0B, 0x54,
+			0xEF, 0xB2, 0xA2, 0x1E, 0x48, 0x3D, 0x92, 0x9D, 0x02, 0xAC, 0x01, 0x35, 0x13, 0xB2, 0xB7, 0xB4,
+			0x72, 0x50, 0xDC, 0x92, 0x22, 0xCA, 0x80, 0x10, 0xD6, 0x45, 0x9B, 0x84, 0x7D, 0xB9, 0x7B, 0x05,
+		},
+	},
+};
+
+static const u8 *FindKirk2Result(const u8 *header) {
+	for (const Kirk2Result &r : g_kirk2Results) {
+		if (!memcmp(r.header, header, sizeof(r.header))) {
+			return r.result;
+		}
+	}
+	return nullptr;
+}
 
 // PRXDecrypter 144-byte tag keys.
 static const u32 g_key0[] = {
@@ -273,12 +345,56 @@ static const u32 g_key_INDEXDAT1xx[] = {
 		0xA34D8C80, 0x962B235D, 0x3E420548, 0x09CF9FFE, 0xD4883F5C, 0xD90E9CB5,
 		0x00AEF4E9, 0xF0886DE9, 0x62A58A5B, 0x52A55546, 0x971941B5, 0xF5B79FAC};
 
-struct TAG_INFO
-{
+// The blocks inside the 1.00 updater's DATA.PSAR (a version 1 archive) carry this tag. Stored raw,
+// as in 1.50's mesg_led.prx, which keeps its tags and keys in a table: this one follows tag
+// 0x06000000 at 0x2028 of the decrypted module.
+static const u32 g_keyUPDATER_PSAR_100[] = {
+		0x8C121584, 0x80D783A8, 0xDB881EEF, 0x239661BC, 0xFC88F32B, 0xDEB53FE5,
+		0x6BA05A98, 0xDB550ADE, 0x3644F8F2, 0x5594D1EB, 0x933E394A, 0x02E33D7C,
+		0xF5E78812, 0xEBC1F0F8, 0xC68D1B25, 0x442B1EB8, 0x7E6AB7A5, 0x924639D0,
+		0x07DE716D, 0x102FB897, 0x53DDBA18, 0x982B07C6, 0x0D748A24, 0xFE5D645C,
+		0x4367E78E, 0xA1B39693, 0x12ECA8A1, 0x4458FBC4, 0x9C0A55FC, 0xFA37301E,
+		0x03D32454, 0x31BD92E2, 0xF7EA0323, 0x09DE73E7, 0x7983B33B, 0x0E8517DA};
+
+// The blocks inside an official updater's DATA.PSAR carry this tag. See Core/Util/PSARUnpack.cpp.
+static const u32 g_keyUPDATER_PSAR[] = {
+		0x77B757DE, 0xEE62DD17, 0x5D03787B, 0x59CA8644, 0x93F68D20, 0x21819328,
+		0x86A74E71, 0x1B2482CA, 0x5F74AE58, 0x568D016C, 0x9A4D8832, 0x2EA24372,
+		0x820CF484, 0xFCFC06B9, 0x8A5BFB6A, 0xBF9F9CD7, 0x15850D01, 0x39ED5FBA,
+		0x4CC38393, 0xED3ADEAF, 0x1AA768BF, 0x89BD8A77, 0x46564165, 0x7333DBD9,
+		0x62E86C81, 0x03299B96, 0x73AFAE5A, 0x40A05320, 0x10664BE8, 0xE5B76A99,
+		0x29E0DD70, 0xEA602428, 0x2042AE30, 0x946F8D32, 0xA29E5F71, 0x7C0C7FD5};
+
+// Used by sceResmgr_9DC14891, which is how the VSH decrypts flash0:/vsh/etc/index_XXg.dat - the
+// XMB item index, and the only thing on the boot path that needs these.
+static const u8 keys_9DC14891_1[] = {0x39, 0xF7, 0xDF, 0x19, 0xD7, 0x10, 0xEA, 0x9F, 0x02, 0xDB, 0x3F, 0xB1, 0x10, 0x9F, 0x26, 0x6B};
+static const u8 keys_9DC14891_2[] = {0x46, 0x1D, 0xC9, 0xC2, 0x1D, 0x44, 0xA6, 0x68, 0xF2, 0x06, 0x37, 0xBF, 0x62, 0xCD, 0x11, 0x9E};
+static const u8 keys_9DC14891_3[] = {0x11, 0x0D, 0x1A, 0x4C, 0x8A, 0x19, 0x17, 0xDC, 0xD0, 0x5A, 0x65, 0x47, 0xA5, 0x03, 0x85, 0x22};
+static const u8 keys_9DC14891_26x[] = {0xE4, 0x98, 0x8E, 0x93, 0x5B, 0x94, 0xAF, 0x19, 0xEA, 0x30, 0x6C, 0xEA, 0x6F, 0x1F, 0x11, 0x59};
+static const u8 keys_9DC14891_28x[] = {0xC3, 0x1A, 0x78, 0xC5, 0xF5, 0xBE, 0xC6, 0x92, 0xF9, 0xEF, 0x94, 0xEA, 0x51, 0xE5, 0x57, 0x11};
+static const u8 keys_9DC14891_30x[] = {0x96, 0x86, 0xDD, 0x78, 0x87, 0xA7, 0x2B, 0xD9, 0xDD, 0xC6, 0x6C, 0x4F, 0x89, 0xFB, 0xD4, 0xD7};
+static const u8 keys_9DC14891_31x[] = {0x27, 0xE1, 0x31, 0xF5, 0xF7, 0x9B, 0xE7, 0x88, 0xD6, 0x8D, 0x7C, 0x0D, 0x99, 0x73, 0xA1, 0x8F};
+static const u8 keys_9DC14891_35x[] = {0x6B, 0x3F, 0x91, 0x58, 0xED, 0x40, 0x68, 0x54, 0x93, 0xD6, 0x45, 0x3F, 0x2C, 0xD4, 0x23, 0x43};
+// From 3.60's mesg_led_02g.prx, where it follows its tag at 0x5EC8 of the decrypted module.
+static const u8 keys_9DC14891_36x[] = {0xF2, 0x91, 0x4E, 0xFA, 0x4A, 0x51, 0x97, 0x7E, 0x99, 0x31, 0x32, 0x4A, 0x18, 0xAF, 0x84, 0xEC};
+static const u8 keys_9DC14891_50x_01g[] = {0xF8, 0x15, 0xCC, 0x79, 0x10, 0x89, 0x16, 0xD6, 0x25, 0x11, 0x00, 0xEB, 0x6B, 0xB1, 0x13, 0xE2};
+static const u8 keys_9DC14891_50x_02g[] = {0x1A, 0x26, 0xFD, 0x16, 0x32, 0x0E, 0x71, 0xD0, 0xDC, 0xD1, 0x3C, 0xE5, 0x53, 0xD5, 0x44, 0x99};
+static const u8 keys_9DC14891_50x_03g[] = {0x20, 0xDC, 0xEF, 0xB8, 0x0A, 0x8D, 0x43, 0x27, 0x68, 0xB9, 0xF9, 0x11, 0x38, 0x94, 0x84, 0x28};
+static const u8 keys_9DC14891_60x_01g[] = {0x2F, 0xB5, 0x04, 0xEF, 0xCB, 0xC8, 0xEC, 0x82, 0x31, 0x26, 0xF7, 0x0A, 0x18, 0x6F, 0xAF, 0xC7};
+static const u8 keys_9DC14891_60x_02g[] = {0xE5, 0xB6, 0xDC, 0x83, 0x94, 0xD1, 0x76, 0xEA, 0x99, 0x2D, 0x22, 0x16, 0xE8, 0x03, 0xA2, 0x03};
+static const u8 keys_9DC14891_60x_03g[] = {0xEF, 0x00, 0x79, 0x32, 0xCE, 0x70, 0x71, 0x21, 0x06, 0x0C, 0xA3, 0xA0, 0x7B, 0xA8, 0x96, 0x53};
+static const u8 keys_9DC14891_63x_01g[] = {0x57, 0xB4, 0xA6, 0x5C, 0x75, 0x2D, 0xB9, 0x4D, 0xE1, 0x67, 0xE3, 0x31, 0xBF, 0x4D, 0x70, 0xF8};
+static const u8 keys_9DC14891_63x_02g[] = {0x29, 0x20, 0x0B, 0x22, 0xCF, 0x1F, 0xD7, 0x50, 0x64, 0xA7, 0x50, 0x20, 0xEC, 0x22, 0x6F, 0xB8};
+static const u8 keys_9DC14891_63x_03g[] = {0x04, 0xB6, 0x9F, 0x92, 0x39, 0xEB, 0xE8, 0xB2, 0xCB, 0x38, 0x29, 0xF6, 0x41, 0x77, 0xFF, 0xAD};
+
+struct TAG_INFO {
 	u32 tag; // 4 byte value at offset 0xD0 in the PRX file
 	const u32 *key; // "step1_result" use for XOR step
 	u8 code;
 	u8 codeExtra;
+	// Most keys here are stored already scrambled, so the kirk7 pass the hardware would do is
+	// skipped. Set this for a key that's stored raw and needs that pass applied first.
+	bool scrambleKey;
 };
 
 static const TAG_INFO g_tagInfo[] =
@@ -299,7 +415,9 @@ static const TAG_INFO g_tagInfo[] =
 	{ 0x862648D1, g_keyMEIMG260, 0x52, 0x52 },
 	{ 0x207BBF2F, g_keyUNK1, 0x5A, 0x5A },
 	{ 0x09000000, g_key_GAMESHARE1xx, 0x4C },
-	{ 0xBB67C59F, g_key_GAMESHARE2xx, 0x5E, 0x5E }
+	{ 0xBB67C59F, g_key_GAMESHARE2xx, 0x5E, 0x5E },
+	{ 0x0E000000, g_keyUPDATER_PSAR, 0x51, 0x00, true },
+	{ 0x06000000, g_keyUPDATER_PSAR_100, 0x49, 0x00, true },
 };
 
 static const TAG_INFO *GetTagInfo(u32 tagFind)
@@ -323,6 +441,24 @@ struct TAG_INFO2
 
 static const TAG_INFO2 g_tagInfo2[] =
 {
+	{ 0x0B2B90F0, keys_9DC14891_1, 0x5C },
+	{ 0x0B2B91F0, keys_9DC14891_2, 0x5C },
+	{ 0x0B2B92F0, keys_9DC14891_3, 0x5C },
+	{ 0x495BE403, keys_9DC14891_26x, 0x5C },
+	{ 0x0B2B05F0, keys_9DC14891_28x, 0x5C },
+	{ 0x0B2B06F0, keys_9DC14891_30x, 0x5C },
+	{ 0x0B2B08F0, keys_9DC14891_31x, 0x5C },
+	{ 0x0B2B0AF0, keys_9DC14891_35x, 0x5C },
+	{ 0x0B2B10F0, keys_9DC14891_36x, 0x5C },
+	{ 0x0B2B0BF0, keys_9DC14891_50x_01g, 0x5C },
+	{ 0x0B2B11F0, keys_9DC14891_50x_02g, 0x5C },
+	{ 0x0B2B1EF0, keys_9DC14891_50x_03g, 0x5C },
+	{ 0x0B2B0CF0, keys_9DC14891_60x_01g, 0x5C },
+	{ 0x0B2B12F0, keys_9DC14891_60x_02g, 0x5C },
+	{ 0x0B2B1FF0, keys_9DC14891_60x_03g, 0x5C },
+	{ 0x0B2B80F0, keys_9DC14891_63x_01g, 0x5C },
+	{ 0x0B2B81F0, keys_9DC14891_63x_02g, 0x5C },
+	{ 0x0B2B82F0, keys_9DC14891_63x_03g, 0x5C },
 	{ 0x4C9494F0, keys660_k1, 0x43 },
 	{ 0x4C9495F0, keys660_k2, 0x43 },
 	{ 0x4C9490F0, keys660_k3, 0x43 },
@@ -361,6 +497,8 @@ static const TAG_INFO2 g_tagInfo2[] =
 	{ 0x4C9422F0, keys600_2, 0x43 },
 	{ 0x4C941EF0, keys600_1, 0x43 },
 	{ 0x4C9429F0, keys570_5k, 0x43 },
+	{ 0x4C941BF0, keys555_k2, 0x43 },
+	{ 0x4C941AF0, keys555_k1, 0x43 },
 	{ 0x457B0BF0, keys505_a, 0x5B },
 	{ 0x4C9419F0, keys505_1, 0x43 },
 	{ 0x4C9418F0, keys505_0, 0x43 },
@@ -398,9 +536,13 @@ static const TAG_INFO2 g_tagInfo2[] =
 	{ 0x4467415D, key_22E0, 0x59 },
 	{ 0x00000000, key_21C0, 0x42 },
 	{ 0x01000000, key_2250, 0x43 },
-	{ 0x2E5E10F0, key_2E5E10F0, 0x48 },
-	{ 0x2E5E12F0, key_2E5E12F0, 0x48 },
-	{ 0x2E5E13F0, key_2E5E13F0, 0x48 },
+	{ 0x2E5E0AF0, key_2E5E0AF0, 0x48, 5, xor_2E5E0AF0 }, //[32]6.20
+	{ 0x2E5E10F0, key_2E5E10F0, 0x48, 5, xor_2E5E10F0 }, //[32]5.00 PSP-2000 (Game PSN Update 2 LBP)
+	{ 0x2E5E11F0, key_2E5E11F0, 0x48, 5, xor_2E5E11F0 }, //[32]6.00
+	{ 0x2E5E12F0, key_2E5E12F0, 0x48, 5, xor_2E5E12F0 },
+	{ 0x2E5E13F0, key_2E5E13F0, 0x48, 5, xor_2E5E13F0 },
+	{ 0x2E5E80F0, key_2E5E80F0, 0x48, 5, xor_2E5E80F0 }, //[32]6.30
+	{ 0x2E5E90F0, key_2E5E90F0, 0x48, 5, xor_2E5E90F0 },
 	{ 0x2FD30BF0, key_2FD30BF0, 0x47 },
 	{ 0xD91605F0, key_D91605F0, 0x5D, 2},
 	{ 0xD91606F0, key_D91606F0, 0x5D, 2},
@@ -452,6 +594,7 @@ static const TAG_INFO2 g_tagInfo2[] =
 	{ 0x2FD313F0, pauth_98b83b5d_1, 0x47, 5, pauth_98b83b5d_xor },
 	{ 0x2FD312F0, pauth_f7aa47f6_1, 0x47, 5, pauth_f7aa47f6_xor },
 	{ 0x2FD311F0, pauth_f7aa47f6_2, 0x47, 5, pauth_f7aa47f6_xor },
+	{ 0x89742B04, key_89742B04, 0x65, 3, xor_89742B04 },
 };
 
 static const TAG_INFO2 *GetTagInfo2(u32 tagFind)
@@ -615,7 +758,11 @@ struct PRXType5
 		memcpy(prxHeader, prx, sizeof(prxHeader));
 	}
 
-	void decrypt(int key, const u8 *xor1, const u8 *xor2)
+	// cmd3Header is for type 3, a game patch installed on a PSP: the first step goes through KIRK
+	// command 3 there, keyed to the console, with the header the install put at 0xEC (JPCSP's
+	// PRX.DecryptPRX). Fails only if that command does. kirk2Result instead is what that step gives
+	// (see g_kirk2Results).
+	bool decrypt(int key, const u8 *xor1, const u8 *xor2, KirkState *kirk = nullptr, const u8 *cmd3Header = nullptr, const u8 *kirk2Result = nullptr)
 	{
 		// first step is to decrypt kirk header + SHA1
 		u8 data[0x50];
@@ -635,7 +782,27 @@ struct PRXType5
 			}
 		}
 
-		kirk7(data, data, 0x50, key);
+		if (kirk2Result)
+		{
+			memcpy(data, kirk2Result, sizeof(data));
+		}
+		else if (cmd3Header)
+		{
+			u8 block[sizeof(KIRK_CMD1_HEADER) + sizeof(data)]{};
+			KIRK_CMD1_HEADER *header = reinterpret_cast<KIRK_CMD1_HEADER *>(block);
+			memcpy(block, cmd3Header, 0x40);
+			header->mode = KIRK_MODE_CMD3;
+			header->data_size = sizeof(data);
+			memcpy(block + sizeof(KIRK_CMD1_HEADER), data, sizeof(data));
+			if (kirk_CMD3(kirk, data, block, sizeof(block)) != KIRK_OPERATION_SUCCESS)
+			{
+				return false;
+			}
+		}
+		else
+		{
+			kirk7(data, data, 0x50, key);
+		}
 
 		// copy the result back
 		memcpy(kirkHeader, data, sizeof(kirkHeader));
@@ -652,6 +819,7 @@ struct PRXType5
 		}
 
 		kirk7(id, id, 0x60, key);
+		return true;
 	}
 
 	u8 tag[4];
@@ -696,9 +864,66 @@ struct PRXType6
 };
 static_assert(sizeof(PRXType6) == 0x150, "inconsistent size of PRX Type 6");
 
-static int pspDecryptType0(const u8 *inbuf, u8 *outbuf, u32 size)
+// Same 0x150-byte layout as type 6 - the difference is that a type 9 PRX carries an ECDSA
+// signature at 0x104..0x12C where type 6 has nothing, and the signature is *excluded* from the
+// hash rather than fed into it. JPCSP zeroes buf2[0x34..0x5C), which is that same range once the
+// header has been rearranged, so here the corresponding field is simply left zero.
+struct PRXType9
 {
-	INFO_LOG(LOADER, "Decrypting tag %02X", (u32)*(u32_le *)&inbuf[0xD0]);
+	explicit PRXType9(const u8 *prx)
+	{
+		memcpy(tag, prx+0xD0, sizeof(tag));
+		memset(empty, 0, sizeof(empty));
+		// Not copied from prx+0x10C, unlike type 6: it holds the tail of the signature.
+		memset(ecdsaSignatureTail, 0, sizeof(ecdsaSignatureTail));
+		memcpy(id, prx+0x140, sizeof(id));
+		memcpy(sha1, prx+0x12C, sizeof(sha1));
+		// kirk header is split between 0x80->0xB0 and 0xC0->0xD0
+		memcpy(kirkHeader, prx+0x80, sizeof(kirkHeader)-0x10);
+		memcpy(kirkHeader+0x30, prx+0xC0, 0x10);
+		memcpy(kirkMetadata, prx+0xB0, sizeof(kirkMetadata));
+		memcpy(prxHeader, prx, sizeof(prxHeader));
+	}
+
+	void decrypt(int key)
+	{
+		kirk7(id, id, 0x60, key);
+	}
+
+	u8 tag[4];
+	u8 empty[0x38];
+	u8 ecdsaSignatureTail[0x20];
+	u8 id[0x10];
+	u8 sha1[0x14];
+	u8 kirkHeader[0x40];
+	u8 kirkMetadata[0x10];
+	u8 prxHeader[0x80];
+};
+static_assert(sizeof(PRXType9) == 0x150, "inconsistent size of PRX Type 9");
+
+// KIRK CMD1 writes the header plus data_offset plus data_size (rounded up to 16) bytes into
+// outbuf, and all three of those come out of the header we just decrypted rather than from the
+// caller. The SHA1 check above doesn't bound them - it only covers the header, so it passes just
+// as happily for a block that's been cut short as for a whole one. A caller that has to guess how
+// long a block is (the PSAR walker does: an updater doesn't record the length of its second
+// block, so it tries the sizes real updaters use) then hands us a size that's too small and KIRK
+// runs off the end of the buffer. That showed up as an intermittent crash unpacking any official
+// updater, since whether the overrun lands on an unmapped page depends on the heap layout.
+static bool KirkOutputFits(u32 headerSize, u32 dataOffset, u32 dataSize, u32 size) {
+	const u64 alignedDataSize = ((u64)dataSize + 15) & ~(u64)15;
+	return (u64)headerSize + (u64)dataOffset + alignedDataSize <= (u64)size;
+}
+
+static bool KirkOutputFits(const KIRK_CMD1_HEADER *header, u32 size) {
+	return KirkOutputFits(sizeof(KIRK_CMD1_HEADER), header->data_offset, header->data_size, size);
+}
+
+static bool KirkOutputFits(const KIRK_CMD1_ECDSA_HEADER *header, u32 size) {
+	return KirkOutputFits(sizeof(KIRK_CMD1_ECDSA_HEADER), header->data_offset, header->data_size, size);
+}
+
+static int pspDecryptType0(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size) {
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 0)", (u32)*(u32_le *)&inbuf[0xD0]);
 	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
 	const auto pti = GetTagInfo((u32)*(u32_le *)&inbuf[0xD0]);
 
@@ -711,6 +936,11 @@ static int pspDecryptType0(const u8 *inbuf, u8 *outbuf, u32 size)
 	// normally this would be a kirk7 op, but we have the seed pre-decrypted
 	std::array<u8, 0x90> xorbuf;
 	memcpy(xorbuf.data(), reinterpret_cast<const u8 *>(pti->key), xorbuf.size());
+	if (pti->scrambleKey)
+	{
+		// ...except for keys we have in their raw form, which need that pass after all.
+		kirk7(xorbuf.data(), xorbuf.data(), xorbuf.size(), pti->code);
+	}
 
 	// construct the header format for a type 0 prx
 	PRXType0 type0(inbuf);
@@ -742,7 +972,12 @@ static int pspDecryptType0(const u8 *inbuf, u8 *outbuf, u32 size)
 	memcpy(reinterpret_cast<u8*>(header)+sizeof(KIRK_CMD1_HEADER), type0.prxHeader, sizeof(type0.prxHeader));
 	decryptKirkHeaderType0(reinterpret_cast<u8*>(header), type0.kirkBlock, xorbuf, pti->code);
 
-	if (kirk_sceUtilsBufferCopyWithRange(outbuf, size, reinterpret_cast<const u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
 	{
 		return -4;
 	}
@@ -750,9 +985,8 @@ static int pspDecryptType0(const u8 *inbuf, u8 *outbuf, u32 size)
 	return decryptSize;
 }
 
-static int pspDecryptType1(const u8 *inbuf, u8 *outbuf, u32 size)
-{
-	INFO_LOG(LOADER, "Decrypting tag %02X", (u32)*(u32_le *)&inbuf[0xD0]);
+static int pspDecryptType1(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size) {
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 1)", (u32)*(u32_le *)&inbuf[0xD0]);
 	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
 	const auto pti = GetTagInfo((u32)*(u32_le *)&inbuf[0xD0]);
 
@@ -797,7 +1031,12 @@ static int pspDecryptType1(const u8 *inbuf, u8 *outbuf, u32 size)
 	memcpy(reinterpret_cast<u8*>(header)+sizeof(KIRK_CMD1_HEADER), type1.prxHeader, sizeof(type1.prxHeader));
 	decryptKirkHeaderType0(reinterpret_cast<u8*>(header), type1.kirkBlock, xorbuf, pti->code);
 
-	if (kirk_sceUtilsBufferCopyWithRange(outbuf, size, reinterpret_cast<const u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
 	{
 		return -4;
 	}
@@ -805,9 +1044,8 @@ static int pspDecryptType1(const u8 *inbuf, u8 *outbuf, u32 size)
 	return decryptSize;
 }
 
-static int pspDecryptType2(const u8 *inbuf, u8 *outbuf, u32 size)
-{
-	INFO_LOG(LOADER, "Decrypting tag %02X", (u32)*(u32_le *)&inbuf[0xD0]);
+static int pspDecryptType2(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size) {
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 2)", (u32)*(u32_le *)&inbuf[0xD0]);
 	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
 	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
 
@@ -861,7 +1099,12 @@ static int pspDecryptType2(const u8 *inbuf, u8 *outbuf, u32 size)
 	decryptKirkHeader(reinterpret_cast<u8*>(header), type2.kirkHeader, xorbuf.cbegin()+0x10, pti->code);
 	header->mode = 1;
 
-	if (kirk_sceUtilsBufferCopyWithRange(outbuf, size, reinterpret_cast<const u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
 	{
 		return -4;
 	}
@@ -869,29 +1112,11 @@ static int pspDecryptType2(const u8 *inbuf, u8 *outbuf, u32 size)
 	return decryptSize;
 }
 
-static int pspDecryptType5(const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed)
-	{
-	INFO_LOG(LOADER, "Decrypting tag %02X", (u32)*(u32_le *)&inbuf[0xD0]);
+// The part of type 5 decryption after its kirk header and SHA1 have been decrypted, which type 3
+// shares.
+static int pspFinishType5(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size, PRXType5 &type5, const std::array<u8, 0x90> &xorbuf, int code)
+{
 	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
-	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
-
-	if (!pti)
-	{
-		return -1;
-	}
-
-	// check if range is non-zero
-	if (std::any_of(inbuf+0xD4+1, inbuf+0xD4+0x58, [](u8 x) { return x != 0; }))
-	{
-		return -2;
-	}
-
-	// expand the seed into a xor buffer
-	auto xorbuf = expandSeed(pti->key, pti->code, seed);
-
-	// construct the header format for a type 2 prx
-	PRXType5 type5(inbuf);
-	type5.decrypt(pti->code, pti->seed, seed);
 
 	SHA_CTX ctx;
 	SHAInit(&ctx);
@@ -922,20 +1147,78 @@ static int pspDecryptType5(const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed
 	memset(header, 0, sizeof(KIRK_CMD1_HEADER));
 	memcpy(reinterpret_cast<u8*>(&header->data_size), type5.kirkMetadata, sizeof(type5.kirkMetadata));
 	memcpy(reinterpret_cast<u8*>(header)+sizeof(KIRK_CMD1_HEADER), type5.prxHeader, sizeof(type5.prxHeader));
-	decryptKirkHeader(reinterpret_cast<u8*>(header), type5.kirkHeader, xorbuf.cbegin()+0x10, pti->code);
+	decryptKirkHeader(reinterpret_cast<u8*>(header), type5.kirkHeader, xorbuf.cbegin()+0x10, code);
 	header->mode = 1;
 
-	if (kirk_sceUtilsBufferCopyWithRange(outbuf, size, reinterpret_cast<const u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
 	{
 		return -4;
 	}
 
 	return decryptSize;
+}
+
+static int pspDecryptType5(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed) {
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 5)", (u32)*(u32_le *)&inbuf[0xD0]);
+	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
+
+	if (!pti)
+	{
+		return -1;
 	}
 
-static int pspDecryptType6(const u8 *inbuf, u8 *outbuf, u32 size)
+	// check if range is non-zero
+	if (std::any_of(inbuf+0xD4+1, inbuf+0xD4+0x58, [](u8 x) { return x != 0; }))
+	{
+		return -2;
+	}
+
+	// expand the seed into a xor buffer
+	auto xorbuf = expandSeed(pti->key, pti->code, seed);
+
+	// The XOR the decrypt_mode implies wins over the tag table's, which is only the fallback -
+	// same precedence as JPCSP, and it leaves every tag that has a seed of its own alone.
+	const u8 *xor1 = inbuf[0x7C] == PRX_DECRYPT_MODE_SPRX ? xor_91E0A9AD : pti->seed;
+
+	// construct the header format for a type 2 prx
+	PRXType5 type5(inbuf);
+	type5.decrypt(pti->code, xor1, seed);
+
+	return pspFinishType5(kirk, inbuf, outbuf, size, type5, xorbuf, pti->code);
+	}
+
+// Decrypt mode 18: a game patch installed through the DRM BB install utility, like the one
+// Killzone: Liberation's DLC installs. Type 5 with the first step through KIRK command 3, so it only
+// decrypts with the Fuse ID of the PSP that did the install. The secure install ID the game passes
+// to sceKernelLoadModuleDNAS is the second XOR. JPCSP's PRX.DecryptPRX, uofw's mesgled.h.
+static int pspDecryptType3(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size, const u8 *secureId)
 {
-	INFO_LOG(LOADER, "Decrypting tag %02X", (u32)*(u32_le *)&inbuf[0xD0]);
+	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
+	if (!pti || pti->type != 3 || !secureId)
+	{
+		return -1;
+	}
+	DEBUG_LOG(Log::Loader, "Decrypting tag %08X (type 3)", (u32)*(u32_le *)&inbuf[0xD0]);
+
+	auto xorbuf = expandSeed(pti->key, pti->code, secureId);
+	PRXType5 type5(inbuf);
+	// Either still as the package has it, if we know command 2's result, or installed on a PSP.
+	const u8 *kirk2Result = FindKirk2Result(inbuf + 0xEC);
+	if (!type5.decrypt(pti->code, pti->seed, secureId, kirk, inbuf + 0xEC, kirk2Result))
+	{
+		return -6;
+	}
+	return pspFinishType5(kirk, inbuf, outbuf, size, type5, xorbuf, pti->code);
+}
+
+static int pspDecryptType6(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size)
+{
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 6)", (u32)*(u32_le *)&inbuf[0xD0]);
 	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
 	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
 
@@ -992,7 +1275,12 @@ static int pspDecryptType6(const u8 *inbuf, u8 *outbuf, u32 size)
 	header->mode = 1;
 	header->ecdsa_hash = 1;
 
-	if (kirk_sceUtilsBufferCopyWithRange(outbuf, size, reinterpret_cast<const u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
 	{
 		return -4;
 	}
@@ -1000,32 +1288,353 @@ static int pspDecryptType6(const u8 *inbuf, u8 *outbuf, u32 size)
 	return decryptSize;
 }
 
-int pspDecryptPRX(const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed)
+// Used by sceResmgr for flash0:/vsh/etc/index_XXg.dat. Identical to type 6 except for the ECDSA
+// signature at 0x104..0x12C - so the "must be empty" check stops short of it, the signature is
+// left out of the hash (see PRXType9), and it is not written back over the output header the way
+// type 6 writes its tail there.
+static int pspDecryptType9(KirkState *kirk, const u8 *inbuf, u8 *outbuf, u32 size)
 {
-	kirk_init();
+	DEBUG_LOG(Log::Loader, "Decrypting tag %02X (type 9)", (u32)*(u32_le *)&inbuf[0xD0]);
+	const auto decryptSize = *(s32_le*)&inbuf[0xB0];
+	const auto pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
+
+	if (!pti)
+	{
+		return -1;
+	}
+
+	// Only up to 0x104 - past that is the signature, which is present rather than empty here.
+	if (std::any_of(inbuf+0xD4, inbuf+0x104, [](u8 x) { return x != 0; }))
+	{
+		return -2;
+	}
+
+	// expand the seed into a xor buffer
+	auto xorbuf = expandSeed(pti->key, pti->code);
+
+	PRXType9 type9(inbuf);
+	type9.decrypt(pti->code);
+
+	SHA_CTX ctx;
+	SHAInit(&ctx);
+	SHAUpdate(&ctx, type9.tag, sizeof(type9.tag));
+	SHAUpdate(&ctx, xorbuf.data(), 0x10);
+	SHAUpdate(&ctx, type9.empty, sizeof(type9.empty));
+	SHAUpdate(&ctx, type9.ecdsaSignatureTail, sizeof(type9.ecdsaSignatureTail));
+	SHAUpdate(&ctx, type9.id, sizeof(type9.id));
+	SHAUpdate(&ctx, type9.kirkHeader, sizeof(type9.kirkHeader));
+	SHAUpdate(&ctx, type9.kirkMetadata, sizeof(type9.kirkMetadata));
+	SHAUpdate(&ctx, type9.prxHeader, sizeof(type9.prxHeader));
+
+	u8 sha1[0x14];
+	SHAFinal(sha1, &ctx);
+
+	if (memcmp(sha1, type9.sha1, sizeof(sha1)) != 0)
+	{
+		return -3;
+	}
+
+	constexpr auto offset = sizeof(PSP_Header)-sizeof(KIRK_CMD1_ECDSA_HEADER)-sizeof(type9.prxHeader);
+	KIRK_CMD1_ECDSA_HEADER *header = reinterpret_cast<KIRK_CMD1_ECDSA_HEADER *>(outbuf+offset);
+
+	if (outbuf != inbuf)
+	{
+		memcpy(outbuf, inbuf, size);
+	}
+
+	memset(header, 0, sizeof(KIRK_CMD1_ECDSA_HEADER));
+	memcpy(reinterpret_cast<u8*>(&header->data_size), type9.kirkMetadata, sizeof(type9.kirkMetadata));
+	memcpy(reinterpret_cast<u8*>(header)+sizeof(KIRK_CMD1_ECDSA_HEADER), type9.prxHeader, sizeof(type9.prxHeader));
+	decryptKirkHeader(reinterpret_cast<u8*>(header), type9.kirkHeader, xorbuf.cbegin()+0x10, pti->code);
+	header->mode = 1;
+	// Left at 0, unlike type 6/7 which set it: type 9 carries a real ECDSA signature that was
+	// verified separately, so KIRK is not asked to hash-check this block. JPCSP's equivalent
+	// branch only writes the mode word and zeroes the rest of that region.
+	header->ecdsa_hash = 0;
+
+	if (!KirkOutputFits(header, size - offset))
+	{
+		return -5;
+	}
+
+	if (kirk_sceUtilsBufferCopyWithRange(kirk, outbuf, size, reinterpret_cast<u8*>(header), size - offset, KIRK_CMD_DECRYPT_PRIVATE) != 0)
+	{
+		return -4;
+	}
+
+	return decryptSize;
+}
+
+static int pspDecryptPRXAnyType(const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed, const u32 *fuseId)
+{
+	// Every type below reads the tag at 0xD0, the size at 0xB0 and key data as far as 0x150, and
+	// writes a KIRK header into outbuf at a fixed offset derived from sizeof(PSP_Header). Without
+	// this, a PRX declaring a tiny psp_size got read past its end, had a header written past the end
+	// of the (equally tiny) output buffer, and passed "size - offset" to KIRK as an unsigned
+	// underflow. Callers must supply at least a whole header on both sides.
+	if (size < sizeof(PSP_Header)) {
+		ERROR_LOG(Log::Loader, "PRX too small to decrypt: %d bytes, need at least %d", (int)size, (int)sizeof(PSP_Header));
+		return -1;
+	}
+
+	KirkState kirk{};
+	if (fuseId) {
+		kirk_init2(&kirk, (u8 *)"PrxDecrypter", 12, fuseId[0], fuseId[1]);
+	} else {
+		kirk_init(&kirk);
+	}
+
+	// Type 3 tags are only ever type 3, and the others would fail on its header anyway.
+	const TAG_INFO2 *pti = GetTagInfo2((u32)*(u32_le *)&inbuf[0xD0]);
+	if (pti && pti->type == 3) {
+		return pspDecryptType3(&kirk, inbuf, outbuf, size, seed);
+	}
 
 	// this would be significantly better if we had a log of the tags
 	// and their appropriate prx types
 	// since we don't know the PRX type we attempt a decrypt using all
-	auto res = pspDecryptType0(inbuf, outbuf, size);
+	auto res = pspDecryptType0(&kirk, inbuf, outbuf, size);
 
 	if (res >= 0)
 		return res;
 	
-	res = pspDecryptType1(inbuf, outbuf, size);
+	res = pspDecryptType1(&kirk, inbuf, outbuf, size);
 
 	if (res >= 0)
 		return res;
 	
-	res = pspDecryptType2(inbuf, outbuf, size);
+	res = pspDecryptType2(&kirk, inbuf, outbuf, size);
 
 	if (res >= 0)
 		return res;
 	
-	res = pspDecryptType5(inbuf, outbuf, size, seed);
+	res = pspDecryptType5(&kirk, inbuf, outbuf, size, seed);
 
 	if (res >= 0)
 		return res;
-	
-	return pspDecryptType6(inbuf, outbuf, size);
+
+	res = pspDecryptType6(&kirk, inbuf, outbuf, size);
+
+	if (res >= 0)
+		return res;
+
+	// Last, because its header check is a subset of type 6's - a genuine type 6 PRX would pass it
+	// and then fail on the hash, so trying it earlier would shadow the real answer.
+	return pspDecryptType9(&kirk, inbuf, outbuf, size);
+}
+
+int pspDecryptPRX(const u8 *inbuf, u8 *outbuf, u32 size, const u8 *seed, const u32 *fuseId)
+{
+	const int res = pspDecryptPRXAnyType(inbuf, outbuf, size, seed, fuseId);
+	// The decrypted size comes from the header, and callers size their reads of outbuf by it.
+	if (res > 0 && (u32)res > size) {
+		ERROR_LOG(Log::Loader, "PRX claims a decrypted size of %d, larger than its %d bytes", res, (int)size);
+		return -1;
+	}
+	return res;
+}
+
+bool pspUnwrapDNASPGD(std::vector<u8> &data, const u8 *secureId, const u32 *fuseId)
+{
+	if (data.size() < 0x90 || memcmp(data.data(), "\0PGD", 4) != 0) {
+		return false;
+	}
+
+	KirkState kirk{};
+	if (fuseId) {
+		kirk_init2(&kirk, (u8 *)"PrxDecrypter", 12, fuseId[0], fuseId[1]);
+	} else {
+		kirk_init(&kirk);
+	}
+
+	// The PGD of an installed patch uses the flag 1 fixed key; keep 2 (the usual NPDRM one) as a fallback.
+	u8 header[0x90];
+	PGD_DESC *pgd = nullptr;
+	for (int flag : { 1, 2 }) {
+		memcpy(header, data.data(), sizeof(header));
+		pgd = pgd_open(&kirk, header, flag, const_cast<u8 *>(secureId));
+		if (pgd) {
+			break;
+		}
+	}
+	if (!pgd) {
+		return false;
+	}
+
+	const u64 blocksSize = (u64)pgd->block_nr * pgd->block_size;
+	if ((u64)pgd->data_offset + blocksSize > data.size() || pgd->data_size > blocksSize) {
+		pgd_close(pgd);
+		return false;
+	}
+	std::vector<u8> plain((size_t)blocksSize);
+	for (u32 block = 0; block < pgd->block_nr; block++) {
+		memcpy(pgd->block_buf, data.data() + pgd->data_offset + (size_t)block * pgd->block_size, pgd->block_size);
+		pgd_decrypt_block(&kirk, pgd, block);
+		memcpy(plain.data() + (size_t)block * pgd->block_size, pgd->block_buf, pgd->block_size);
+	}
+	plain.resize(pgd->data_size);
+	pgd_close(pgd);
+	data = std::move(plain);
+	return true;
+}
+
+// psheet's fixed version key for the package header (its data segment, firmware 6.61).
+static const u8 drmbb_header_key[16] = {0xED, 0xE2, 0x5D, 0x2D, 0xBB, 0xF8, 0x12, 0xE5, 0x3C, 0x5C, 0x59, 0x32, 0xFA, 0xE3, 0xE2, 0x43};
+
+// sceDrmBBCipher type 1 (fixed keys), decrypting in place.
+static bool DrmBBDecrypt(KirkState *kirk, u8 *data, u32 size, u32 seed, const u8 *headerKey, const u8 *versionKey) {
+	CIPHER_KEY ckey;
+	u8 hkey[16];
+	memcpy(hkey, headerKey, sizeof(hkey));
+	bool ok = sceDrmBBCipherInit(kirk, &ckey, 1, 2, hkey, const_cast<u8 *>(versionKey), seed) == 0 &&
+		sceDrmBBCipherUpdate(kirk, &ckey, data, (int)size) == 0;
+	sceDrmBBCipherFinal(&ckey);
+	return ok;
+}
+
+bool pspReadDrmBBPackage(const std::vector<u8> &pbp, const u8 *secureIdIn, std::vector<DrmBBFile> &files, u8 *secureIdOut)
+{
+	// Layout from psheet's bbox_access.c functions (get_core_header, get_params, get_string). All
+	// offsets below are relative to DATA.PSP.
+	if (pbp.size() < 0x28 || memcmp(pbp.data(), "\0PBP", 4) != 0) {
+		return false;
+	}
+	const u32 base = *(const u32_le *)&pbp[0x20];
+	const u32 end = *(const u32_le *)&pbp[0x24];
+	if (end > pbp.size() || base > end || end - base < 0x60) {
+		return false;
+	}
+	const u32 size = end - base;
+	const u8 *psp = pbp.data() + base;
+
+	KirkState kirk{};
+	kirk_init(&kirk);
+
+	// The whole file is MACed with the header key, the last 16 bytes.
+	{
+		std::vector<u8> copy(pbp.begin(), pbp.end() - 16);
+		u8 mac[16];
+		memcpy(mac, &pbp[pbp.size() - 16], sizeof(mac));
+		MAC_KEY mkey;
+		sceDrmBBMacInit(&mkey, 1);
+		sceDrmBBMacUpdate(&kirk, &mkey, copy.data(), (int)copy.size());
+		if (sceDrmBBMacFinal2(&kirk, &mkey, mac, const_cast<u8 *>(drmbb_header_key)) != 0) {
+			return false;
+		}
+	}
+
+	// 0x50 bytes of header, MACed with the secure install ID. The game passes the same ID to the install.
+	u8 header[0x50];
+	u8 mac[16];
+	memcpy(header, psp, sizeof(header));
+	memcpy(mac, psp + 0x50, sizeof(mac));
+	u8 secureId[16];
+	MAC_KEY mkey;
+	sceDrmBBMacInit(&mkey, 1);
+	sceDrmBBMacUpdate(&kirk, &mkey, header, sizeof(header));
+	if (secureIdIn) {
+		memcpy(secureId, secureIdIn, sizeof(secureId));
+		if (sceDrmBBMacFinal2(&kirk, &mkey, mac, secureId) != 0) {
+			return false;
+		}
+	} else if (bbmac_getkey(&kirk, &mkey, mac, secureId) != 0) {
+		return false;
+	}
+	if (secureIdOut) {
+		memcpy(secureIdOut, secureId, sizeof(secureId));
+	}
+	memcpy(header, psp, sizeof(header));
+	if (!DrmBBDecrypt(&kirk, header + 0x10, 0x40, 0, header, drmbb_header_key)) {
+		return false;
+	}
+	const u8 *paramKey = header + 0x10;
+	const u8 *fileKey = header + 0x20;
+	const u32 *h = (const u32 *)(header + 0x30);
+	if (h[0] != 1 || h[2] != 1) {
+		return false;
+	}
+	const u32 paramOffset = h[4], paramCount = h[5], fileTable = h[6];
+
+	// The 16-byte aligned blocks around [offset, offset + len), decrypted with block-numbered seeds.
+	auto readBlocks = [&](u32 tableOffset, u32 offset, u32 len, const u8 *key, std::vector<u8> &dst) {
+		const u32 start = offset & ~15;
+		const u64 alignedEnd = ((u64)offset + len + 15) & ~15ULL;
+		if ((u64)tableOffset + alignedEnd > size) {
+			return false;
+		}
+		dst.assign(psp + tableOffset + start, psp + tableOffset + alignedEnd);
+		if (!DrmBBDecrypt(&kirk, dst.data(), (u32)dst.size(), start >> 4, key, secureId)) {
+			return false;
+		}
+		dst.erase(dst.begin(), dst.begin() + (offset - start));
+		dst.resize(len);
+		return true;
+	};
+
+	// Parameters are (id, value) pairs. 0x01010100 is the number of files.
+	std::vector<u8> params;
+	if (paramCount > 0x100 || !readBlocks(paramOffset, 0, paramCount * 8, paramKey, params)) {
+		return false;
+	}
+	u32 fileCount = 0;
+	for (u32 i = 0; i < paramCount; i++) {
+		const u32 *p = (const u32 *)&params[i * 8];
+		if (p[0] == 0x01010100) {
+			fileCount = p[1];
+		}
+	}
+
+	// File entries are 16 bytes: u16 name offset, u16 name length, u32 data offset, u32 size, all
+	// relative to the table.
+	if (fileCount > 0x100) {
+		return false;
+	}
+	files.clear();
+	for (u32 i = 0; i < fileCount; i++) {
+		std::vector<u8> entry, name;
+		if (!readBlocks(fileTable, i * 16, 16, fileKey, entry)) {
+			return false;
+		}
+		const u16 nameOffset = *(const u16 *)&entry[0];
+		const u16 nameLength = *(const u16 *)&entry[2];
+		const u32 dataOffset = *(const u32 *)&entry[4];
+		const u32 dataSize = *(const u32 *)&entry[8];
+		if (!readBlocks(fileTable, nameOffset, nameLength, fileKey, name)) {
+			return false;
+		}
+		DrmBBFile &file = files.emplace_back();
+		// The name is NUL terminated within its length.
+		file.name.assign((const char *)name.data(), strnlen((const char *)name.data(), name.size()));
+		if (!readBlocks(fileTable, dataOffset, dataSize, fileKey, file.data)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool pspParseFuseId(std::string_view text, u32 fuseId[2])
+{
+	if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+		text.remove_prefix(2);
+	}
+	if (text.size() != 12 && text.size() != 16) {
+		return false;
+	}
+	u64 value = 0;
+	for (char c : text) {
+		int digit;
+		if (c >= '0' && c <= '9') {
+			digit = c - '0';
+		} else if (c >= 'a' && c <= 'f') {
+			digit = c - 'a' + 10;
+		} else if (c >= 'A' && c <= 'F') {
+			digit = c - 'A' + 10;
+		} else {
+			return false;
+		}
+		value = (value << 4) | digit;
+	}
+	fuseId[0] = (u32)value;
+	fuseId[1] = (u32)(value >> 32);
+	return true;
 }

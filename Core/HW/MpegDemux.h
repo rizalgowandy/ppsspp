@@ -16,6 +16,7 @@ public:
 
 	bool addStreamData(const u8 *buf, int addSize);
 	bool demux(int audioChannel);
+	void setAudioChannel(int audioChannel);
 
 	// return its framesize
 	int getNextAudioFrame(u8 **buf, int *headerCode1, int *headerCode2, s64 *pts = NULL);
@@ -41,19 +42,34 @@ private:
 	};
 
 	int read8() {
+		// PES header field lengths (e.g. readPesHeader()'s headerLength byte) are
+		// only cross-checked against the outer packet length, not against how much
+		// data is actually available - a crafted stream can claim more than that,
+		// so guard the actual buffer access here rather than in every caller.
+		if (m_index < 0 || m_index >= m_len) {
+			return 0;
+		}
 		return m_buf[m_index++];
 	}
+	// The operands of | aren't sequenced, so read into locals to get the byte order right.
 	int read16() {
-		return (read8() << 8) | read8();
+		const int hi = read8();
+		const int lo = read8();
+		return (hi << 8) | lo;
 	}
 	int read24() {
-		return (read8() << 16) | (read8() << 8) | read8();
+		const int hi = read8();
+		const int mid = read8();
+		const int lo = read8();
+		return (hi << 16) | (mid << 8) | lo;
 	}
 	s64 readPts() {
 		return readPts(read8());
 	}
 	s64 readPts(int c) {
-		return (((s64) (c & 0x0E)) << 29) | ((read16() >> 1) << 15) | (read16() >> 1);
+		const int hi = read16();
+		const int lo = read16();
+		return (((s64) (c & 0x0E)) << 29) | ((hi >> 1) << 15) | (lo >> 1);
 	}
 	bool isEOF() const {
 		return m_index >= m_readSize;
@@ -61,6 +77,9 @@ private:
 	void skip(int n) {
 		if (n > 0) {
 			m_index += n;
+			if (m_index > m_len) {
+				m_index = m_len;
+			}
 		}
 	}
 	int readPesHeader(PesHeader &pesHeader, int length, int startCode);

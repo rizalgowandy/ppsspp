@@ -15,72 +15,134 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#pragma once
+
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "Common/File/Path.h"
 #include "Common/Serialize/Serializer.h"
 
-namespace SaveState
-{
+class ParamSFOData;
+#undef Process
+
+namespace SaveState {
 	enum class Status {
 		FAILURE,
 		WARNING,
 		SUCCESS,
 	};
-	typedef std::function<void(Status status, const std::string &message, void *cbUserData)> Callback;
+	typedef std::function<void(Status status, std::string_view message, std::string_view metadata)> Callback;
 
-	static const int NUM_SLOTS = 5;
-	static const char *STATE_EXTENSION = "ppst";
-	static const char *SCREENSHOT_EXTENSION = "jpg";
-	static const char *UNDO_STATE_EXTENSION = "undo.ppst";
-	static const char *UNDO_SCREENSHOT_EXTENSION = "undo.jpg";
+	// The whole state, for CChunkFileReader. libretro uses it directly.
+	struct SaveStart {
+		void DoState(PointerWrap &p);
+		// Rewind snapshots and verification don't count towards IsStale().
+		bool countsAsSave = true;
+	};
+
+	static const char * const SCREENSHOT_EXTENSION = "jpg";
 
 	void Init();
 	void Shutdown();
 
 	// Cycle through the 5 savestate slots
+	void PrevSlot();
 	void NextSlot();
-	void SaveSlot(const std::string &gameFilename, int slot, Callback callback, void *cbUserData = 0);
-	void LoadSlot(const std::string &gameFilename, int slot, Callback callback, void *cbUserData = 0);
-	bool UndoSaveSlot(const std::string &gameFilename, int slot);
-	// Checks whether there's an existing save in the specified slot.
-	bool HasSaveInSlot(const std::string &gameFilename, int slot);
-	bool HasUndoSaveInSlot(const std::string &gameFilename, int slot);
-	bool HasScreenshotInSlot(const std::string &gameFilename, int slot);
 
+	std::string GetGamePrefix(const ParamSFOData &paramSFO);
+
+	// Run the various actions directly.
+	void SaveSlot(std::string_view gamePrefix, int slot, Callback callback);
+	void LoadSlot(std::string_view gamePrefix, int slot, Callback callback);
+	bool UndoSaveSlot(std::string_view gamePrefix, int slot);
+	bool UndoLastSave(std::string_view gamePrefix);
+	bool UndoLoad(std::string_view gamePrefix, Callback callback);
+	void DeleteSlot(std::string_view gamePrefix, int slot);
+
+	// This will rescan the save state directory for files associated with the specified game.
+	// Note that when we have many save states, this is really important on Android.
+	void Rescan(std::string_view gamePrefix);
+
+	// Checks whether there's an existing save in the specified slot.
+	bool HasSaveInSlot(std::string_view gamePrefix, int slot);
+	// A save to the slot was asked for and isn't written yet. UIMessage::SAVESTATE_SLOT_SAVED says when it ends.
+	bool IsSlotSavePending(std::string_view gamePrefix, int slot);
+	bool HasUndoSaveInSlot(std::string_view gamePrefix, int slot);
+	bool HasUndoLastSave(std::string_view gamePrefix);
+	bool HasUndoLoad(std::string_view gamePrefix);
+	bool HasScreenshotInSlot(std::string_view gamePrefix, int slot);
+
+	// Just returns the current slot from config.
 	int GetCurrentSlot();
 
 	// Returns -1 if there's no oldest/newest slot.
-	int GetNewestSlot(const std::string &gameFilename);
-	int GetOldestSlot(const std::string &gameFilename);
+	int GetNewestSlot(std::string_view gamePrefix);
+	int GetOldestSlot(std::string_view gamePrefix);
 	
-	std::string GetSlotDateAsString(const std::string &gameFilename, int slot);
-	std::string GenerateSaveSlotFilename(const std::string &gameFilename, int slot, const char *extension);
+	std::string GetSlotDateAsString(std::string_view gamePrefix, int slot);
 
-	std::string GetTitle(const std::string &filename);
+	std::string GetSlotCustomName(std::string_view gamePrefix, int slot);
+	Path GenerateSaveSlotPath(std::string_view gamePrefix, int slot, const char *extension);
+	void SetSlotCustomName(std::string_view gamePrefix, int slot, std::string_view newName);
 
-	// Load the specified file into the current state (async.)
-	// Warning: callback will be called on a different thread.
-	void Load(const std::string &filename, int slot, Callback callback = Callback(), void *cbUserData = 0);
+	// The files that sit beside a savestate and mean nothing without it: its screenshot, and the
+	// slot's custom name if it was given one. Anything deleting a .ppst from outside DeleteSlot -
+	// the savestate browser does exactly that - has to take these along, or they stay in the
+	// savestate folder for good. Returns nothing for a path that isn't a savestate.
+	std::vector<Path> GetCompanionFilePaths(const Path &statePath);
 
-	// Save the current state to the specified file (async.)
-	// Warning: callback will be called on a different thread.
-	void Save(const std::string &filename, int slot, Callback callback = Callback(), void *cbUserData = 0);
+	std::string GetTitle(const Path &filename);
+
+	// What the game was booted from. Stored in states, so the values are fixed.
+	enum class BootType : u8 {
+		UNKNOWN = 0,
+		ISO = 1,
+		PBP = 2,
+		ELF = 3,
+		DISC_DIRECTORY = 4,
+	};
+
+	// What a boot needs to know about a state before it's loaded.
+	struct BootInfo {
+		std::string discID;
+		std::string discVersion;
+		BootType bootType = BootType::UNKNOWN;
+	};
+
+	// Reads only the start of the state. Fails for states older than the disc ID in them.
+	bool PeekBootInfo(const Path &filename, BootInfo *info, std::string *error);
+
+	// Load the specified file into the current state (async.) The file is read while emulation goes
+	// on, and the state applied in a later Process().
+	// Returns true if queued. The callback runs from Process(), once the state has been applied.
+	bool Load(const Path &filename, int slot, Callback callback = Callback());
+
+	// Save the current state to the specified file (async.) The state is captured in the next
+	// Process(), and compressed and written on the worker.
+	// Returns true if queued. The callback runs from Process(), once the file has been written.
+	// Saving to a path that already has a save pending counts as a repeat of that save.
+	bool Save(const Path &filename, int slot, Callback callback = Callback());
 
 	CChunkFileReader::Error SaveToRam(std::vector<u8> &state);
 	CChunkFileReader::Error LoadFromRam(std::vector<u8> &state, std::string *errorString);
 
 	// For testing / automated tests.  Runs a save state verification pass (async.)
-	// Warning: callback will be called on a different thread.
-	void Verify(Callback callback = Callback(), void *cbUserData = 0);
+	// The callback runs from Process().
+	bool Verify(Callback callback = Callback());
 
 	// To go back to a previous snapshot (only if enabled.)
-	// Warning: callback will be called on a different thread.
-	void Rewind(Callback callback = Callback(), void *cbUserData = 0);
+	// The callback runs from Process(), once the snapshot has been applied.
+	bool Rewind(Callback callback = Callback());
 
 	// Returns true if there are rewind snapshots available.
 	bool CanRewind();
+
+	// Returns true while a save, load or rewind is queued or still in progress (rewind snapshots
+	// don't count). Saves are done once the file is written.
+	bool IsBusy();
 
 	// Returns true if a savestate has been used during this session.
 	bool HasLoadedState();
@@ -92,8 +154,22 @@ namespace SaveState
 	bool IsOldVersion();
 
 	// Check if there's any save stating needing to be done.  Normally called once per frame.
-	void Process();
+	// While the game is paused (under the pause menu, say), pass false: there's nothing new to take
+	// rewind snapshots of.
+	void Process(bool takeRewindSnapshots = true);
 
-	// Cleanup by triggering a restart if needed.
-	void Cleanup();
-};
+	// Notify save state code that new save data has been written.
+	void NotifySaveData();
+
+	// Checks whether a bad load required the caller to trigger a restart (and if returns true, resets the flag internally).
+	bool PollRestartNeeded();
+
+	// Returns the time since last save. -1 if N/A.
+	double SecondsSinceLastSavestate();
+
+	// The savestate worker thread, for compression and file I/O away from the emu thread. Jobs run
+	// one at a time, in the order they were queued, and mustn't touch emulator state.
+	void RunOnWorker(std::function<void()> job);
+	// Waits until every job queued so far has finished.
+	void WaitForWorker();
+}  // namespace SaveState

@@ -17,7 +17,10 @@
 
 #pragma once
 
-#include "Common/Common.h"
+#include <cstdint>
+
+#include "Common/CommonTypes.h"
+#include "Common/Swap.h"
 
 class PointerWrap;
 
@@ -29,8 +32,10 @@ struct PSPTimeval {
 void __RtcTimeOfDay(PSPTimeval *tv);
 int32_t RtcBaseTime(int32_t *micro = nullptr);
 void RtcSetBaseTime(int32_t seconds, int32_t micro = 0);
+u64 __RtcGetCurrentTick();
 
 void Register_sceRtc();
+void Register_sceRtc_driver();
 void __RtcInit();
 void __RtcDoState(PointerWrap &p);
 
@@ -43,3 +48,7 @@ struct ScePspDateTime {
 	s16_le second;
 	u32_le microsecond;
 };
+
+// The emulated PSP's clock, in local time - what sceRtcGetCurrentClockLocalTime gives the game.
+// For host UI that shows the PSP's time. False if the date is out of range.
+bool __RtcGetCurrentLocalTime(ScePspDateTime *t);

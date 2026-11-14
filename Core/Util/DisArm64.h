@@ -18,6 +18,8 @@
 // Basic ARM64 disassembler.
 // No promises of accuracy, mostly just made to debug JIT code.
 
+#pragma once
+
 #include <cstdint>
 
 typedef bool (*SymbolCallback)(char *buffer, int bufsize, uint8_t *address);
@@ -39,7 +41,7 @@ struct Arm64LSInstructionInfo {
 	int Rn;
 	int Rm;
 
-	// TODO: more.
+	int OperandSizeInBytes() const { return 1 << size; }
 };
 
 bool Arm64AnalyzeLoadStore(uint64_t addr, uint32_t op, Arm64LSInstructionInfo *info);

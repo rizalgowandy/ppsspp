@@ -55,34 +55,49 @@ const int CTRL_STICK_RIGHT = 1;
 #define CTRL_BACK         0x20000000
 #define CTRL_PLAYPAUSE    0x40000000
 
+// Obscure extra keys that were never mapped to hardware, but can be used to bring up the debug menu in SOTN, see issue #17464
+#define CTRL_L3 0x0002
+#define CTRL_R3 0x0004
+#define CTRL_L2 0x0400
+#define CTRL_R2 0x0800
+
 #define CTRL_MASK_DPAD    (CTRL_UP | CTRL_DOWN | CTRL_LEFT | CTRL_RIGHT)
 #define CTRL_MASK_ACTION  (CTRL_SQUARE | CTRL_TRIANGLE | CTRL_CIRCLE | CTRL_CROSS)
 #define CTRL_MASK_TRIGGER (CTRL_LTRIGGER | CTRL_RTRIGGER)
-#define CTRL_MASK_USER    (CTRL_MASK_DPAD | CTRL_MASK_ACTION | CTRL_START | CTRL_SELECT | CTRL_MASK_TRIGGER | CTRL_HOME | CTRL_HOLD | CTRL_WLAN | CTRL_REMOTE_HOLD | CTRL_VOL_UP | CTRL_VOL_DOWN | CTRL_SCREEN | CTRL_NOTE)
+#define CTRL_MASK_USER    (CTRL_MASK_DPAD | CTRL_MASK_ACTION | CTRL_START | CTRL_SELECT | CTRL_MASK_TRIGGER | CTRL_HOME | CTRL_HOLD | CTRL_WLAN | CTRL_REMOTE_HOLD | CTRL_VOL_UP | CTRL_VOL_DOWN | CTRL_SCREEN | CTRL_NOTE | CTRL_L2 | CTRL_L3 | CTRL_R2 | CTRL_R3)
 
 void __CtrlInit();
 void __CtrlDoState(PointerWrap &p);
 void __CtrlShutdown();
+void __CtrlVblank();
 
-// Call this whenever a button is pressed, using the above CTRL_ constants.
-// Multiple buttons may be sent in one call OR'd together.
-// Resending a currently pressed button is fine but not required.
-void __CtrlButtonDown(u32 buttonBit);
-// Call this whenever a button is released.  Similar to __CtrlButtonDown().
-void __CtrlButtonUp(u32 buttonBit);
+// Clears and sets selected buttons. NOTE: Clearing happens first.
+void __CtrlUpdateButtons(u32 bitsToSet, u32 bitsToClear);
+// Presses buttons for a number of vblanks of emulated time; returns an id for __CtrlPressActive.
+int __CtrlPressFor(u32 buttons, int vblanks);
+bool __CtrlPressActive(int id);
 
 // Call this to set the position of an analog stick, ideally when it changes.
-// Position value should be from -1 to 1, inclusive, in a square (no need to force to a circle.)
+// X and Y values should be from -1 to 1, inclusive, in a square (no need to force to a circle.)
 // No deadzone filtering is done (but note that this applies to the actual PSP as well.)
-void __CtrlSetAnalogX(float value, int stick = CTRL_STICK_LEFT);
-void __CtrlSetAnalogY(float value, int stick = CTRL_STICK_LEFT);
+void __CtrlSetAnalogXY(int stick, float x, float y);
+void __CtrlSetAnalogX(int stick, float x);
+void __CtrlSetAnalogY(int stick, float y);
 
 // Call this to enable rapid-fire.  This will cause buttons other than arrows to alternate.
-void __CtrlSetRapidFire(bool state);
+void __CtrlSetRapidFire(bool state, int interval);
 bool __CtrlGetRapidFire();
 
 // For use by internal UI like MsgDialog
 u32 __CtrlPeekButtons();
+// While set, the game sees no buttons and centered sticks (a system overlay such as the HOME
+// button's quit screen has the controls). __CtrlPeekButtons still returns the real state.
+void __CtrlSetGameInputBlocked(bool blocked);
+bool __CtrlIsGameInputBlocked();
+
+// Exposed so sceVshBridge can reuse it directly for vshCtrlReadBufferPositive, matching JPCSP.
+int sceCtrlReadBufferPositive(u32 ctrlDataPtr, u32 nBufs);
+u32 __CtrlPeekButtonsVisual();  // also incorporates rapid-fire
 void __CtrlPeekAnalog(int stick, float *x, float *y);
 u32 __CtrlReadLatch();
 

@@ -17,31 +17,28 @@
 
 #pragma once
 
-#include <vector>
 #include <string>
+#include <vector>
 
-#include "Common/Common.h"
 #include "Common/CommonTypes.h"
+#include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 
 // TODO: Find a better place for these.
 std::vector<std::string> DisassembleArm2(const u8 *data, int size);
 std::vector<std::string> DisassembleArm64(const u8 *data, int size);
-std::vector<std::string> DisassembleX86(const u8 *data, int size);
+// offsets, if given, receives each line's offset from data.
+std::vector<std::string> DisassembleX86(const u8 *data, int size, std::vector<int> *offsets = nullptr);
+std::vector<std::string> DisassembleRV64(const u8 *data, int size);
+std::vector<std::string> DisassembleLA64(const u8 *data, int size);
 
-struct JitBlock;
-class JitBlockCache;
 class JitBlockCacheDebugInterface;
 class PointerWrap;
-
-#ifdef USING_QT_UI
-#undef emit
-#endif
 
 class MIPSState;
 
 namespace MIPSComp {
-	void JitAt();
+	void JitAt(MIPSState *mips);
 
 	class MIPSFrontendInterface {
 	public:
@@ -50,9 +47,9 @@ namespace MIPSComp {
 		virtual void EatPrefix() = 0;
 
 		virtual void Comp_Generic(MIPSOpcode op) = 0;
-		virtual void Comp_RunBlock(MIPSOpcode op) = 0;
 		virtual void Comp_ReplacementFunc(MIPSOpcode op) = 0;
 		virtual void Comp_ITypeMem(MIPSOpcode op) = 0;
+		virtual void Comp_StoreSync(MIPSOpcode op) = 0;
 		virtual void Comp_Cache(MIPSOpcode op) = 0;
 		virtual void Comp_RelBranch(MIPSOpcode op) = 0;
 		virtual void Comp_RelBranchRI(MIPSOpcode op) = 0;
@@ -112,15 +109,69 @@ namespace MIPSComp {
 		virtual void Comp_Vocp(MIPSOpcode op) = 0;
 		virtual void Comp_ColorConv(MIPSOpcode op) = 0;
 		virtual void Comp_Vbfy(MIPSOpcode op) = 0;
+		virtual void Comp_Vsrt(MIPSOpcode op) = 0;
+		virtual void Comp_Vf2h(MIPSOpcode op) = 0;
 		virtual void Comp_DoNothing(MIPSOpcode op) = 0;
 
 		virtual int Replace_fabsf() = 0;
 	};
 
+	// For the JIT stats debug overlay.
+	struct JitStats {
+		int numBlocks = 0;
+		int numValidBlocks = 0;
+		// In IR instructions. Invalidated blocks keep their space until the cache is cleared.
+		size_t irArenaUsed = 0;
+		size_t irArenaSize = 0;
+		// In bytes. Zero when not compiling to native code.
+		size_t codeUsed = 0;
+		size_t codeSize = 0;
+		// How many times the cache was cleared because one of them filled up.
+		int irArenaFullClears = 0;
+		int codeFullClears = 0;
+		// Calls to InvalidateCacheAt that hit at least one block, and the blocks they hit.
+		int invalidations = 0;
+		int invalidatedBlocks = 0;
+		// Large icache invalidations, which hash every block to find overwritten code, and the blocks dropped.
+		int changedCodeChecks = 0;
+		int changedCodeBlocks = 0;
+	};
+
+	// Time spent compiling, totalled since startup. The IR JITs fill it in.
+	struct JitCompileTimes {
+		// Blocks are timed by phase only while that's shown (the JIT overlay) or benchmarked: reading
+		// the clock can cost 0.3 us. These are the phases of those blocks.
+		int64_t frontendNanos = 0;  // MIPS to IR
+		int64_t passNanos = 0;  // The IR passes
+		int64_t backendNanos = 0;  // IR to host code, or into the IR arena
+		int64_t finalizeNanos = 0;  // The block table and linking
+		int64_t phaseBlocks = 0;
+		// The other blocks, whole.
+		int64_t unphasedNanos = 0;
+		int64_t clearNanos = 0;  // Clearing the whole cache
+		int64_t invalidateNanos = 0;
+		int64_t maxBlockNanos = 0;
+		int64_t blocks = 0;
+		int64_t mipsInstructions = 0;
+		int64_t irInstructions = 0;  // After the passes
+		int clears = 0;
+
+		int64_t CompileNanos() const {
+			return frontendNanos + passNanos + backendNanos + finalizeNanos + unphasedNanos;
+		}
+		int64_t TotalNanos() const {
+			return CompileNanos() + clearNanos + invalidateNanos;
+		}
+	};
+	extern JitCompileTimes g_jitCompileTimes;
+
 	class JitInterface {
 	public:
 		virtual ~JitInterface() {}
 
+		virtual void GetStats(JitStats *stats) const {}
+
+		virtual const u8 *GetCodeBase() const = 0;  // Just for displaying in the debugger.
 		virtual bool CodeInRange(const u8 *ptr) const = 0;
 		virtual bool DescribeCodePtr(const u8 *ptr, std::string &name) = 0;
 		virtual bool IsAtDispatchFetch(const u8 *ptr) const {
@@ -128,34 +179,47 @@ namespace MIPSComp {
 		}
 		virtual const u8 *GetDispatcher() const = 0;
 		virtual const u8 *GetCrashHandler() const = 0;
-		virtual JitBlockCache *GetBlockCache() = 0;
 		virtual JitBlockCacheDebugInterface *GetBlockCacheDebugInterface() = 0;
 		virtual void InvalidateCacheAt(u32 em_address, int length = 4) = 0;
+		// Recompiles every block a few times and logs how long it took. Only the IR JITs do it.
+		virtual void BenchmarkCompile() {}
+		// Invalidates every block not entirely inside one of the (address, size) ranges.
+		virtual void InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep) = 0;
+		// Drops every block whose guest code no longer matches what it was compiled from.
+		virtual void InvalidateChangedBlocks() {}
 		virtual void DoState(PointerWrap &p) = 0;
 		virtual void RunLoopUntil(u64 globalticks) = 0;
+		// Runs until the downcount runs out, without CoreTiming. For the Media Engine, which the IR
+		// interpreter runs, and the native JITs that NativeJitRunsMediaEngine().
+		virtual void RunDowncount() {}
 		virtual void Compile(u32 em_address) = 0;
-		virtual void CompileFunction(u32 start_address, u32 length) { }
 		virtual void ClearCache() = 0;
 		virtual void UpdateFCR31() = 0;
-		virtual MIPSOpcode GetOriginalOp(MIPSOpcode op) = 0;
-
-		// No jit operations may be run between these calls.
-		// Meant to be used to make memory safe for savestates, memcpy, etc.
-		virtual std::vector<u32> SaveAndClearEmuHackOps() = 0;
-		virtual void RestoreSavedEmuHackOps(std::vector<u32> saved) = 0;
-
-		// Block linking. This may need to work differently for whole-function JITs and stuff
-		// like that.
-		virtual void LinkBlock(u8 *exitPoint, const u8 *entryPoint) = 0;
-		virtual void UnlinkBlock(u8 *checkedEntry, u32 originalAddress) = 0;
+		// Writes out what --jit-profile collected, before the JIT goes away.
+		virtual void FlushProfile() {}
+		// What the block shadow holds for a replacement hook without a compiled block. The
+		// dispatcher has to send this to the compiler.
+		virtual u32 GetBlockShadowHookValue() const { return Memory::BLOCK_SHADOW_HOOK_NO_JIT; }
 	};
 
 	typedef void (MIPSFrontendInterface::*MIPSCompileFunc)(MIPSOpcode opcode);
 	typedef int (MIPSFrontendInterface::*MIPSReplaceFunc)();
 
-	extern JitInterface *jit;
+	struct BranchInfo {
+		BranchInfo(u32 pc, MIPSOpcode op, MIPSOpcode delaySlotOp, bool andLink, bool likely);
 
-	void DoDummyJitState(PointerWrap &p);
+		u32 compilerPC;
+		MIPSOpcode op;
+		MIPSOpcode delaySlotOp;
+		bool likely;
+		bool andLink;
+		// Update manually if it's not always nice (rs/rt, rs/zero, etc.)
+		bool delaySlotIsNice = true;
+	};
+
+	void DoDummyJitState(PointerWrap &p, const MIPSState *mips);
 
 	JitInterface *CreateNativeJit(MIPSState *mipsState);
+	// Whether the native JIT's dispatcher can run the Media Engine.
+	bool NativeJitRunsMediaEngine();
 }

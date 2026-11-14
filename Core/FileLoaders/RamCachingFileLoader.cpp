@@ -18,13 +18,11 @@
 #include <algorithm>
 #include <thread>
 #include <cstring>
-#include <cstdlib>
 
 #include "Common/Thread/ThreadUtil.h"
 #include "Common/TimeUtil.h"
-#include "Core/FileLoaders/RamCachingFileLoader.h"
-
 #include "Common/Log.h"
+#include "Core/FileLoaders/RamCachingFileLoader.h"
 
 // Takes ownership of backend.
 RamCachingFileLoader::RamCachingFileLoader(FileLoader *backend)
@@ -90,10 +88,16 @@ size_t RamCachingFileLoader::ReadAt(s64 absolutePos, size_t bytes, void *data, F
 
 void RamCachingFileLoader::InitCache() {
 	std::lock_guard<std::mutex> guard(blocksMutex_);
+	// The whole file has to fit in memory (and a size_t, which may be 32 bits).
+	if (filesize_ <= 0 || (u64)filesize_ > (u64)(SIZE_MAX - BLOCK_SIZE) || (u64)filesize_ > (8ULL << 30)) {
+		ERROR_LOG(Log::IO, "Can't cache a file of %lld bytes in RAM, will fall back to regular reads.", (long long)filesize_);
+		return;
+	}
 	u32 blockCount = (u32)((filesize_ + BLOCK_SIZE - 1) >> BLOCK_SHIFT);
 	// Overallocate for the last block.
 	cache_ = (u8 *)malloc((size_t)blockCount << BLOCK_SHIFT);
 	if (cache_ == nullptr) {
+		ERROR_LOG(Log::IO, "Failed to allocate cache for Cache full ISO in RAM! Will fall back to regular reads.");
 		return;
 	}
 	aheadRemaining_ = blockCount;
@@ -105,11 +109,10 @@ void RamCachingFileLoader::ShutdownCache() {
 
 	// We can't delete while the thread is running, so have to wait.
 	// This should only happen from the menu.
-	while (aheadThreadRunning_) {
-		sleep_ms(1);
-	}
 	if (aheadThread_.joinable())
 		aheadThread_.join();
+
+	_dbg_assert_(!aheadThreadRunning_);
 
 	std::lock_guard<std::mutex> guard(blocksMutex_);
 	blocks_.clear();
@@ -181,6 +184,8 @@ void RamCachingFileLoader::SaveIntoCache(s64 pos, size_t bytes, Flags flags) {
 				if (blocksToRead >= MAX_BLOCKS_PER_READ) {
 					break;
 				}
+
+				// TODO: Shouldn't we break as soon as we see a 1?
 			}
 		}
 	}
@@ -189,7 +194,16 @@ void RamCachingFileLoader::SaveIntoCache(s64 pos, size_t bytes, Flags flags) {
 	size_t bytesRead = backend_->ReadAt(cacheFilePos, blocksToRead << BLOCK_SHIFT, &cache_[cacheFilePos], flags);
 
 	// In case there was an error, let's not mark blocks that failed to read as read.
-	u32 blocksActuallyRead = (u32)((bytesRead + BLOCK_SIZE - 1) >> BLOCK_SHIFT);
+	// Round up only for a genuine short read exactly at the true end of the file -
+	// cache_ is deliberately over-allocated to a full BLOCK_SIZE for the last block,
+	// so its unwritten tail past filesize_ is never read back. Any other short read
+	// (e.g. a dropped Remote ISO connection mid-file) must not be rounded up, or the
+	// unwritten (uninitialized, since cache_ is malloc'd) rest of that block would be
+	// served as if it were real file data.
+	u32 blocksActuallyRead = (u32)(bytesRead >> BLOCK_SHIFT);
+	if ((bytesRead & (BLOCK_SIZE - 1)) != 0 && cacheFilePos + (s64)bytesRead == filesize_) {
+		++blocksActuallyRead;
+	}
 	{
 		std::lock_guard<std::mutex> guard(blocksMutex_);
 
@@ -225,7 +239,9 @@ void RamCachingFileLoader::StartReadAhead(s64 pos) {
 	if (aheadThread_.joinable())
 		aheadThread_.join();
 	aheadThread_ = std::thread([this] {
-		setCurrentThreadName("FileLoaderReadAhead");
+		SetCurrentThreadName("FileLoaderReadAhead");
+
+		AndroidJNIThreadContext jniContext;
 
 		while (aheadRemaining_ != 0 && !aheadCancel_) {
 			// Where should we look?

@@ -29,7 +29,7 @@ enum class WebSocketClose : uint16_t {
 // RFC 6455
 class WebSocketServer {
 public:
-	static WebSocketServer *CreateAsUpgrade(const http::Request &request, const std::string &protocol = "");
+	static WebSocketServer *CreateAsUpgrade(const http::ServerRequest &request, const std::string &protocol = "");
 
 	void Send(const std::string &str);
 	void Send(const std::vector<uint8_t> &payload);
@@ -73,7 +73,16 @@ protected:
 
 	void SendHeader(bool fin, int opcode, size_t sz);
 	void SendBytes(const void *p, size_t sz);
+	// True once we've queued our own close frame. RFC 6455 5.5.1: no data frames may follow it.
+	// Just as importantly, anything queued after that point keeps outBuf_/out_ non-empty, which
+	// starves the "everything is flushed" check in Process() so the connection never finishes
+	// closing - and since the socket stays writable, select() stops blocking and we spin.
+	bool SendingIsOver() const { return sentClose_; }
+	void CloseAbnormally();
+	void CloseForReadFailure();
 	void SendFlush();
+	void CompactOutBuf();
+	size_t OutBufPending() const { return outBuf_.size() - outBufOffset_; }
 	bool ReadFrames();
 	bool ReadFrame();
 	bool ReadPending();
@@ -81,12 +90,18 @@ protected:
 
 	bool open_ = true;
 	bool sentClose_ = false;
+	// When sentClose_ was set. A peer that never reads would otherwise keep us waiting forever.
+	double sentCloseTime_ = 0.0;
+	// Set when the peer stopped reading and the backlog hit its cap. Nothing more gets queued.
+	bool outputOverflowed_ = false;
 	int fragmentOpcode_ = -1;
 	size_t fd_ = 0;
 	InputSink *in_ = nullptr;
 	OutputSink *out_ = nullptr;
 	WebSocketClose closeReason_ = WebSocketClose::NO_STATUS;
 	std::vector<uint8_t> outBuf_;
+	// How much of outBuf_ has already been handed to out_. See CompactOutBuf().
+	size_t outBufOffset_ = 0;
 	size_t lastPressure_ = 0;
 
 	std::vector<uint8_t> pendingBuf_;

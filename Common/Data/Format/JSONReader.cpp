@@ -1,29 +1,44 @@
-#include "Common/File/VFS/VFS.h"
-#include "Common/File/FileUtil.h"
+#include <climits>
+
 #include "Common/Data/Format/JSONReader.h"
+#include "Common/File/VFS/VFS.h"
+#include "Common/File/Path.h"
+#include "Common/File/FileUtil.h"
+#include "Common/Log.h"
 
 namespace json {
 
 JsonReader::JsonReader(const std::string &filename) {
 	size_t buf_size;
-	buffer_ = (char *)VFSReadFile(filename.c_str(), &buf_size);
+	buffer_ = (char *)g_VFS.ReadFile(filename.c_str(), &buf_size);
 	if (buffer_) {
 		parse();
 	} else {
 		// Okay, try to read on the local file system
-		buffer_ = (char *)ReadLocalFile(filename.c_str(), &buf_size);
+		buffer_ = (char *)File::ReadLocalFile(Path(filename), &buf_size);
 		if (buffer_) {
 			parse();
 		} else {
-			ERROR_LOG(IO, "Failed to read json file '%s'", filename.c_str());
+			ERROR_LOG(Log::IO, "Failed to read json file '%s'", filename.c_str());
 		}
 	}
+}
+
+bool JsonReader::parse() {
+	char *error_pos;
+	int status = jsonParse(buffer_, &error_pos, &root_, alloc_);
+	if (status != JSON_OK) {
+		ERROR_LOG(Log::IO, "Error at (%i): %s\n%s\n\n", (int)(error_pos - buffer_), jsonStrError(status), error_pos);
+		return false;
+	}
+	ok_ = true;
+	return true;
 }
 
 int JsonGet::numChildren() const {
 	int count = 0;
 	if (value_.getTag() == JSON_OBJECT || value_.getTag() == JSON_ARRAY) {
-		for (auto it : value_) {
+		for (const auto &it : value_) {
 			(void)it;
 			count++;
 		}
@@ -33,13 +48,13 @@ int JsonGet::numChildren() const {
 
 const JsonNode *JsonGet::get(const char *child_name) const {
 	if (!child_name) {
-		ERROR_LOG(IO, "JSON: Cannot get from null child name");
+		ERROR_LOG(Log::IO, "JSON: Cannot get from null child name");
 		return nullptr;
 	}
 	if (value_.getTag() != JSON_OBJECT) {
 		return nullptr;
 	}
-	for (auto it : value_) {
+	for (const auto &it : value_) {
 		if (!strcmp(it->key, child_name)) {
 			return it;
 		}
@@ -54,15 +69,24 @@ const JsonNode *JsonGet::get(const char *child_name, JsonTag type) const {
 	return nullptr;
 }
 
-const char *JsonGet::getStringOrDie(const char *child_name) const {
+const char *JsonGet::getStringOrNull(const char *child_name) const {
 	const JsonNode *val = get(child_name, JSON_STRING);
 	if (val)
 		return val->value.toString();
-	ERROR_LOG(IO, "String '%s' missing from node", child_name);
+	ERROR_LOG(Log::IO, "String '%s' missing from node", child_name);
 	return nullptr;
 }
 
-const char *JsonGet::getString(const char *child_name, const char *default_value) const {
+bool JsonGet::getString(const char *child_name, std::string *output) const {
+	const JsonNode *val = get(child_name, JSON_STRING);
+	if (!val) {
+		return false;
+	}
+	*output = val->value.toString();
+	return true;
+}
+
+const char *JsonGet::getStringOr(const char *child_name, const char *default_value) const {
 	const JsonNode *val = get(child_name, JSON_STRING);
 	if (!val)
 		return default_value;
@@ -72,7 +96,7 @@ const char *JsonGet::getString(const char *child_name, const char *default_value
 bool JsonGet::getStringVector(std::vector<std::string> *vec) const {
 	vec->clear();
 	if (value_.getTag() == JSON_ARRAY) {
-		for (auto it : value_) {
+		for (const auto &it : value_) {
 			if (it->value.getTag() == JSON_STRING) {
 				vec->push_back(it->value.toString());
 			}
@@ -84,7 +108,12 @@ bool JsonGet::getStringVector(std::vector<std::string> *vec) const {
 }
 
 double JsonGet::getFloat(const char *child_name) const {
-	return get(child_name, JSON_NUMBER)->value.toNumber();
+	const JsonNode *val = get(child_name, JSON_NUMBER);
+	if (!val) {
+		ERROR_LOG(Log::IO, "Number '%s' missing from node", child_name);
+		return 0.0;
+	}
+	return val->value.toNumber();
 }
 
 double JsonGet::getFloat(const char *child_name, double default_value) const {
@@ -94,22 +123,43 @@ double JsonGet::getFloat(const char *child_name, double default_value) const {
 	return val->value.toNumber();
 }
 
+// Casting a double that's out of range (or NaN) to int is undefined.
+static int ClampToInt(double d) {
+	if (!(d >= (double)INT_MIN)) {
+		return d != d ? 0 : INT_MIN;
+	}
+	if (d > (double)INT_MAX) {
+		return INT_MAX;
+	}
+	return (int)d;
+}
+
 int JsonGet::getInt(const char *child_name) const {
-	return (int)get(child_name, JSON_NUMBER)->value.toNumber();
+	const JsonNode *val = get(child_name, JSON_NUMBER);
+	if (!val) {
+		ERROR_LOG(Log::IO, "Number '%s' missing from node", child_name);
+		return 0;
+	}
+	return ClampToInt(val->value.toNumber());
 }
 
 int JsonGet::getInt(const char *child_name, int default_value) const {
 	const JsonNode *val = get(child_name, JSON_NUMBER);
 	if (!val)
 		return default_value;
-	return (int)val->value.toNumber();
+	return ClampToInt(val->value.toNumber());
 }
 
 bool JsonGet::getBool(const char *child_name) const {
-	return get(child_name)->value.getTag() == JSON_TRUE;
+	const JsonNode *val = get(child_name);
+	if (!val) {
+		ERROR_LOG(Log::IO, "Value '%s' missing from node", child_name);
+		return false;
+	}
+	return val->value.getTag() == JSON_TRUE;
 }
 
-bool JsonGet::getBool(const char *child_name, bool default_value) const {
+bool JsonGet::getBoolOr(const char *child_name, bool default_value) const {
 	const JsonNode *val = get(child_name);
 	if (val) {
 		JsonTag tag = val->value.getTag();

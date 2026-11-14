@@ -17,20 +17,22 @@
 
 #include "ppsspp_config.h"
 
+#if !PPSSPP_PLATFORM(SWITCH)
 #include <cstring>
 #include <cstdlib>
 
-#include "Common/Common.h"
+#include "Common/CommonTypes.h"
 #include "Common/Log.h"
 #include "Common/MemoryUtil.h"
 #include "Common/StringUtils.h"
 #include "Common/SysError.h"
+#include "Common/Data/Text/Parsers.h"
 
 #ifdef _WIN32
 #include "Common/CommonWindows.h"
 #else
-#include <errno.h>
-#include <stdio.h>
+#include <cerrno>
+#include <cstdio>
 #endif
 
 #ifdef __APPLE__
@@ -39,9 +41,23 @@
 #include <mach/vm_param.h>
 #endif
 
+#if PPSSPP_PLATFORM(MAC) && PPSSPP_ARCH(ARM64)
+#include <mutex>
+#include <utility>
+#include <vector>
+#include <pthread.h>
+#define USE_MAP_JIT
+#endif
+
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+
+#ifndef MAP_NORESERVE
+// Not implemented on BSDs
+#define MAP_NORESERVE 0
+#endif
+
 static int hint_location;
 #ifdef __APPLE__
 #define MEM_PAGE_SIZE (PAGE_SIZE)
@@ -118,10 +134,11 @@ static void *SearchForFreeMem(size_t size) {
 }
 #endif
 
+#if PPSSPP_PLATFORM(WINDOWS)
+
 // This is purposely not a full wrapper for virtualalloc/mmap, but it
 // provides exactly the primitive operations that PPSSPP needs.
 void *AllocateExecutableMemory(size_t size) {
-#if defined(_WIN32)
 	void *ptr = nullptr;
 	DWORD prot = PAGE_EXECUTE_READWRITE;
 	if (PlatformIsWXExclusive())
@@ -142,8 +159,17 @@ void *AllocateExecutableMemory(size_t size) {
 #endif
 		if (ptr) {
 			ptr = VirtualAlloc(ptr, aligned_size, MEM_RESERVE | MEM_COMMIT, prot);
+			if (!ptr) {
+				// Finding a free region isn't the same as being able to reserve it: VirtualAlloc
+				// rounds a non-null address down to the 64K allocation granularity, and
+				// SearchForFreeMem only returns page alignment, so the rounded-down base can land
+				// back inside something committed. Another thread allocating in between does it too.
+				WARN_LOG(Log::Common, "Could not reserve the nearby executable memory found for jit. Proceeding with far memory.");
+			}
 		} else {
-			WARN_LOG(COMMON, "Unable to find nearby executable memory for jit. Proceeding with far memory.");
+			WARN_LOG(Log::Common, "Unable to find nearby executable memory for jit. Proceeding with far memory.");
+		}
+		if (!ptr) {
 			// Can still run, thanks to "RipAccessible".
 			ptr = VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, prot);
 		}
@@ -157,11 +183,57 @@ void *AllocateExecutableMemory(size_t size) {
 		ptr = VirtualAlloc(0, size, MEM_RESERVE | MEM_COMMIT, prot);
 #endif
 	}
-#else
-	static char *map_hint = 0;
+	if (!ptr) {
+		ERROR_LOG(Log::MemMap, "Failed to allocate executable memory (%d)", (int)size);
+	}
+	return ptr;
+}
+
+#else  // Non-Windows platforms
+
+#ifdef USE_MAP_JIT
+// With MAP_JIT, a thread switches all of its view of the JIT memory between writable and executable
+// with pthread_jit_write_protect_np(), far cheaper than an mprotect() for every block compiled and
+// linked. A hardened runtime without the JIT entitlement refuses the mapping: then mprotect() it is.
+static std::mutex g_mapJitLock;
+static int g_mapJitState;  // 0 untried, 1 in use, -1 refused.
+static std::vector<std::pair<uintptr_t, uintptr_t>> g_mapJitRanges;
+
+static bool IsMapJitMemory(const void *ptr) {
+	std::lock_guard<std::mutex> guard(g_mapJitLock);
+	for (const auto &range : g_mapJitRanges) {
+		if ((uintptr_t)ptr >= range.first && (uintptr_t)ptr < range.second)
+			return true;
+	}
+	return false;
+}
+#endif
+
+void *AllocateExecutableMemory(size_t size) {
+#ifdef USE_MAP_JIT
+	{
+		std::lock_guard<std::mutex> guard(g_mapJitLock);
+		if (g_mapJitState >= 0) {
+			void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+			if (ptr != MAP_FAILED) {
+				g_mapJitState = 1;
+				g_mapJitRanges.emplace_back((uintptr_t)ptr, (uintptr_t)ptr + size);
+				return ptr;
+			}
+			if (g_mapJitState == 0) {
+				WARN_LOG(Log::MemMap, "MAP_JIT refused (errno=%d), using mprotect", errno);
+				g_mapJitState = -1;
+			}
+		}
+	}
+#endif
+
+	static char *map_hint = nullptr;
+
 #if PPSSPP_ARCH(AMD64)
 	// Try to request one that is close to our memory location if we're in high memory.
 	// We use a dummy global variable to give us a good location to start from.
+	// TODO: Should we also do this for ARM64?
 	if (!map_hint) {
 		if ((uintptr_t) &hint_location > 0xFFFFFFFFULL)
 			map_hint = (char*)ppsspp_round_page(&hint_location) - 0x20000000; // 0.5gb lower than our approximate location
@@ -177,20 +249,13 @@ void *AllocateExecutableMemory(size_t size) {
 		prot = PROT_READ | PROT_WRITE;  // POST_EXEC is added later in this case.
 
 	void* ptr = mmap(map_hint, size, prot, MAP_ANON | MAP_PRIVATE, -1, 0);
-#endif /* defined(_WIN32) */
 
-#if !defined(_WIN32)
-	static const void *failed_result = MAP_FAILED;
-#else
-	static const void *failed_result = nullptr;
-#endif
-
-	if (ptr == failed_result) {
+	if (ptr == MAP_FAILED) {
 		ptr = nullptr;
-		ERROR_LOG(MEMMAP, "Failed to allocate executable memory (%d) errno=%d", (int)size, errno);
+		ERROR_LOG(Log::MemMap, "Failed to allocate executable memory (%d) errno=%d", (int)size, errno);
 	}
 
-#if PPSSPP_ARCH(AMD64) && !defined(_WIN32)
+#if PPSSPP_ARCH(AMD64)
 	else if ((uintptr_t)map_hint <= 0xFFFFFFFF) {
 		// Round up if we're below 32-bit mark, probably allocating sequentially.
 		map_hint += ppsspp_round_page(size);
@@ -202,29 +267,34 @@ void *AllocateExecutableMemory(size_t size) {
 		}
 	}
 #endif
+
 	return ptr;
 }
 
+#endif  // non-windows
+
 void *AllocateMemoryPages(size_t size, uint32_t memProtFlags) {
-	size = ppsspp_round_page(size);
 #ifdef _WIN32
 	if (sys_info.dwPageSize == 0)
 		GetSystemInfo(&sys_info);
 	uint32_t protect = ConvertProtFlagsWin32(memProtFlags);
+	// Make sure to do this after GetSystemInfo().
+	size = ppsspp_round_page(size);
 #if PPSSPP_PLATFORM(UWP)
 	void* ptr = VirtualAllocFromApp(0, size, MEM_COMMIT, protect);
 #else
 	void* ptr = VirtualAlloc(0, size, MEM_COMMIT, protect);
 #endif
 	if (!ptr) {
-		ERROR_LOG(MEMMAP, "Failed to allocate raw memory pages");
+		ERROR_LOG(Log::MemMap, "Failed to allocate raw memory pages");
 		return nullptr;
 	}
 #else
+	size = ppsspp_round_page(size);
 	uint32_t protect = ConvertProtFlagsUnix(memProtFlags);
 	void *ptr = mmap(0, size, protect, MAP_ANON | MAP_PRIVATE, -1, 0);
 	if (ptr == MAP_FAILED) {
-		ERROR_LOG(MEMMAP, "Failed to allocate raw memory pages: errno=%d", errno);
+		ERROR_LOG(Log::MemMap, "Failed to allocate raw memory pages: errno=%d", errno);
 		return nullptr;
 	}
 #endif
@@ -234,9 +304,57 @@ void *AllocateMemoryPages(size_t size, uint32_t memProtFlags) {
 	return ptr;
 }
 
+void *ReserveMemoryPages(size_t size) {
+#ifdef _WIN32
+	if (sys_info.dwPageSize == 0)
+		GetSystemInfo(&sys_info);
+	size = ppsspp_round_page(size);
+#if PPSSPP_PLATFORM(UWP)
+	void *ptr = VirtualAllocFromApp(0, size, MEM_RESERVE, PAGE_NOACCESS);
+#else
+	void *ptr = VirtualAlloc(0, size, MEM_RESERVE, PAGE_NOACCESS);
+#endif
+	if (!ptr) {
+		ERROR_LOG(Log::MemMap, "Failed to reserve %d bytes of address space", (int)size);
+		return nullptr;
+	}
+#else
+	size = ppsspp_round_page(size);
+	void *ptr = mmap(0, size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+	if (ptr == MAP_FAILED) {
+		ERROR_LOG(Log::MemMap, "Failed to reserve %d bytes of address space: errno=%d", (int)size, errno);
+		return nullptr;
+	}
+#endif
+	return ptr;
+}
+
+bool CommitMemoryPages(void *ptr, size_t size) {
+	uintptr_t page_size = GetMemoryProtectPageSize();
+	uintptr_t start = (uintptr_t)ptr & ~(page_size - 1);
+	uintptr_t end = ((uintptr_t)ptr + size + page_size - 1) & ~(page_size - 1);
+#ifdef _WIN32
+#if PPSSPP_PLATFORM(UWP)
+	void *result = VirtualAllocFromApp((void *)start, end - start, MEM_COMMIT, PAGE_READWRITE);
+#else
+	void *result = VirtualAlloc((void *)start, end - start, MEM_COMMIT, PAGE_READWRITE);
+#endif
+	if (!result) {
+		ERROR_LOG(Log::MemMap, "CommitMemoryPages failed!\n%s", GetLastErrorMsg().c_str());
+		return false;
+	}
+#else
+	if (mprotect((void *)start, end - start, PROT_READ | PROT_WRITE) != 0) {
+		ERROR_LOG(Log::MemMap, "CommitMemoryPages failed (%p)! errno=%d (%s)", (void *)start, errno, strerror(errno));
+		return false;
+	}
+#endif
+	return true;
+}
+
 void *AllocateAlignedMemory(size_t size, size_t alignment) {
 #ifdef _WIN32
-	void* ptr = _aligned_malloc(size,alignment);
+	void* ptr = _aligned_malloc(size, alignment);
 #else
 	void* ptr = NULL;
 #ifdef __ANDROID__
@@ -247,8 +365,6 @@ void *AllocateAlignedMemory(size_t size, size_t alignment) {
 	}
 #endif
 #endif
-
-	_assert_msg_(ptr != nullptr, "Failed to allocate aligned memory");
 	return ptr;
 }
 
@@ -259,11 +375,28 @@ void FreeMemoryPages(void *ptr, size_t size) {
 	size = (size + page_size - 1) & (~(page_size - 1));
 #ifdef _WIN32
 	if (!VirtualFree(ptr, 0, MEM_RELEASE)) {
-		ERROR_LOG(MEMMAP, "FreeMemoryPages failed!\n%s", GetLastErrorMsg().c_str());
+		ERROR_LOG(Log::MemMap, "FreeMemoryPages failed!\n%s", GetLastErrorMsg().c_str());
 	}
 #else
 	munmap(ptr, size);
 #endif
+}
+
+void FreeExecutableMemory(void *ptr, size_t size) {
+#ifdef USE_MAP_JIT
+	if (IsMapJitMemory(ptr)) {
+		std::lock_guard<std::mutex> guard(g_mapJitLock);
+		for (size_t i = 0; i < g_mapJitRanges.size(); i++) {
+			if (g_mapJitRanges[i].first == (uintptr_t)ptr) {
+				g_mapJitRanges.erase(g_mapJitRanges.begin() + i);
+				break;
+			}
+		}
+		// Back to executable, which the protection change before freeing undid.
+		pthread_jit_write_protect_np(1);
+	}
+#endif
+	FreeMemoryPages(ptr, size);
 }
 
 void FreeAlignedMemory(void* ptr) {
@@ -290,7 +423,7 @@ bool PlatformIsWXExclusive() {
 }
 
 bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
-	VERBOSE_LOG(JIT, "ProtectMemoryPages: %p (%d) : r%d w%d x%d", ptr, (int)size,
+	VERBOSE_LOG(Log::JIT, "ProtectMemoryPages: %p (%d) : r%d w%d x%d", ptr, (int)size,
 			(memProtFlags & MEM_PROT_READ) != 0, (memProtFlags & MEM_PROT_WRITE) != 0, (memProtFlags & MEM_PROT_EXEC) != 0);
 
 	if (PlatformIsWXExclusive()) {
@@ -298,6 +431,16 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 			_assert_msg_(false, "Bad memory protect flags %d: W^X is in effect, can't both write and exec", memProtFlags);
 		}
 	}
+#ifdef USE_MAP_JIT
+	if (IsMapJitMemory(ptr)) {
+		_assert_msg_((memProtFlags & (MEM_PROT_WRITE | MEM_PROT_EXEC)) != 0, "MAP_JIT memory is writable or executable");
+		pthread_jit_write_protect_np((memProtFlags & MEM_PROT_WRITE) == 0);
+		return true;
+	}
+#endif
+	if (size == 0)
+		return true;
+
 	// Note - VirtualProtect will affect the full pages containing the requested range.
 	// mprotect does not seem to, at least not on Android unless I made a mistake somewhere, so we manually round.
 #ifdef _WIN32
@@ -306,13 +449,13 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 #if PPSSPP_PLATFORM(UWP)
 	DWORD oldValue;
 	if (!VirtualProtectFromApp((void *)ptr, size, protect, &oldValue)) {
-		ERROR_LOG(MEMMAP, "WriteProtectMemory failed!\n%s", GetLastErrorMsg().c_str());
+		ERROR_LOG(Log::MemMap, "WriteProtectMemory failed!\n%s", GetLastErrorMsg().c_str());
 		return false;
 	}
 #else
 	DWORD oldValue;
 	if (!VirtualProtect((void *)ptr, size, protect, &oldValue)) {
-		ERROR_LOG(MEMMAP, "WriteProtectMemory failed!\n%s", GetLastErrorMsg().c_str());
+		ERROR_LOG(Log::MemMap, "WriteProtectMemory failed!\n%s", GetLastErrorMsg().c_str());
 		return false;
 	}
 #endif
@@ -327,7 +470,7 @@ bool ProtectMemoryPages(const void* ptr, size_t size, uint32_t memProtFlags) {
 	end = (end + page_size - 1) & ~(page_size - 1);
 	int retval = mprotect((void *)start, end - start, protect);
 	if (retval != 0) {
-		ERROR_LOG(MEMMAP, "mprotect failed (%p)! errno=%d (%s)", (void *)start, errno, strerror(errno));
+		ERROR_LOG(Log::MemMap, "mprotect failed (%p)! errno=%d (%s)", (void *)start, errno, strerror(errno));
 		return false;
 	}
 	return true;
@@ -339,6 +482,12 @@ int GetMemoryProtectPageSize() {
 	if (sys_info.dwPageSize == 0)
 		GetSystemInfo(&sys_info);
 	return sys_info.dwPageSize;
+#else
+	static int pageSize = 0;
+	if (!pageSize) {
+		pageSize = sysconf(_SC_PAGE_SIZE);
+	}
+	return pageSize;
 #endif
-	return MEM_PAGE_SIZE;
 }
+#endif // !PPSSPP_PLATFORM(SWITCH)

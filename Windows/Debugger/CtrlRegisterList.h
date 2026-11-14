@@ -1,5 +1,3 @@
-// NOTE: Apologies for the quality of this code, this is really from pre-opensource Dolphin - that is, 2003.
-
 #pragma once
 
 //////////////////////////////////////////////////////////////////////////
@@ -18,24 +16,24 @@
 //To get a class instance to be able to access it, just use 
 //  CtrlRegisterList::getFrom(GetDlgItem(yourdialog, IDC_yourid)).
 
-#include "../../Core/Debugger/DebugInterface.h"
+#include "Core/MIPS/MIPSDebugInterface.h"
 
-class CtrlRegisterList
-{
+class CtrlRegisterList {
 	HWND wnd;
 	HFONT font;
 	RECT rect;
 
 	int rowHeight;
+	int charWidth;
 	int selection = 0;
 	int category = 0;
+	int scrollRow_ = 0;
 
 	int oldSelection = 0;
-	
+
 	bool selecting = false;
 	bool hasFocus = false;
-	DebugInterface *cpu = nullptr;
-	static TCHAR szClassName[];
+	MIPSDebugInterface *cpu = nullptr;
 
 	u32 lastPC = 0;
 	u32 *lastCat0Values = nullptr;
@@ -45,6 +43,9 @@ class CtrlRegisterList
 	u32 getSelectedRegValue(char *out, size_t size);
 	void copyRegisterValue();
 	void editRegisterValue();
+	int totalRows();
+	int visibleRows();
+	void scrollTo(int row);
 public:
 	CtrlRegisterList(HWND _wnd);
 	~CtrlRegisterList();
@@ -54,6 +55,7 @@ public:
 	static CtrlRegisterList * getFrom(HWND wnd);
 	
 	void onPaint(WPARAM wParam, LPARAM lParam);
+	void onVScroll(WPARAM wParam, LPARAM lParam);
 	void onKeyDown(WPARAM wParam, LPARAM lParam);
 	void onMouseDown(WPARAM wParam, LPARAM lParam, int button);
 	void onMouseUp(WPARAM wParam, LPARAM lParam, int button);
@@ -62,18 +64,19 @@ public:
 
 	int yToIndex(int y);
 
-	void setCPU(DebugInterface *deb)
-	{
+	void setCPU(MIPSDebugInterface *deb) {
 		cpu = deb;
-
-		int regs = cpu->GetNumRegsInCategory(0);
+		constexpr int regs = MIPSDebugInterface::GetNumRegsInCategory(0);
 		lastCat0Values = new u32[regs+3];
 		changedCat0Regs = new bool[regs+3];
 		memset(lastCat0Values, 0, (regs+3) * sizeof(u32));
 		memset(changedCat0Regs, 0, (regs+3) * sizeof(bool));
 	}
-	DebugInterface *getCPU()
+	MIPSDebugInterface *getCPU()
 	{
 		return cpu;
 	}
+
+private:
+	bool redrawScheduled_ = false;
 };

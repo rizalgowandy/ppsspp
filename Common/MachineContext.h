@@ -11,7 +11,8 @@
 
 #if PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(UWP)
 
-#include <windows.h>
+#include "Common/CommonWindows.h"
+
 typedef CONTEXT SContext;
 
 #if defined(__LIBRETRO__)
@@ -54,32 +55,25 @@ typedef CONTEXT SContext;
 
 #elif PPSSPP_ARCH(ARM64)
 
+#define MACHINE_CONTEXT_SUPPORTED
+
 #define CTX_REG(x) X[x]
-#define CTX_SP Sp
-#define CTX_PC Pc
-
-#elif PPSSPP_ARCH(ARM)
-
-//#define CTX_REG(x) R##x
 #define CTX_SP Sp
 #define CTX_PC Pc
 
 #endif
 
-#elif PPSSPP_PLATFORM(MAC)
+#elif PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
 
-// for modules:
-#define _XOPEN_SOURCE
-#include <ucontext.h>
-
-#include <mach/mach.h>
-#include <mach/message.h>
+// The context handed to the fault handler is the thread state inside the signal's mcontext
+// (uc_mcontext->__ss). <sys/ucontext.h> gives us that without the _XOPEN_SOURCE that <ucontext.h> demands.
+#include <sys/ucontext.h>
 
 #if PPSSPP_ARCH(AMD64)
 
 #define MACHINE_CONTEXT_SUPPORTED
 
-typedef x86_thread_state64_t SContext;
+typedef _STRUCT_X86_THREAD_STATE64 SContext;
 #define CTX_RAX __rax
 #define CTX_RBX __rbx
 #define CTX_RCX __rcx
@@ -98,6 +92,18 @@ typedef x86_thread_state64_t SContext;
 #define CTX_R15 __r15
 #define CTX_RIP __rip
 
+#elif PPSSPP_ARCH(ARM64) && !__DARWIN_OPAQUE_ARM_THREAD_STATE64
+
+// (The opaque, pointer-authenticated thread state is arm64e only.)
+#define MACHINE_CONTEXT_SUPPORTED
+
+typedef _STRUCT_ARM_THREAD_STATE64 SContext;
+
+// Only valid for x0-x28. x29 and x30 are __fp and __lr.
+#define CTX_REG(x) __x[x]
+#define CTX_SP __sp
+#define CTX_PC __pc
+
 #else
 
 // No context definition for architecture
@@ -106,7 +112,7 @@ typedef x86_thread_state64_t SContext;
 
 #elif defined(__linux__)
 
-#include <signal.h>
+#include <csignal>
 
 #if PPSSPP_ARCH(AMD64)
 
@@ -167,6 +173,28 @@ typedef sigcontext SContext;
 typedef sigcontext SContext;
 #define CTX_PC arm_pc
 #define CTX_REG(x) regs[x]
+
+#elif PPSSPP_ARCH(RISCV64)
+
+#include <ucontext.h>
+typedef mcontext_t SContext;
+
+#define MACHINE_CONTEXT_SUPPORTED
+
+#define CTX_REG(x) __gregs[x]
+#define CTX_PC CTX_REG(0)
+#define CTX_SP CTX_REG(2)
+
+#elif PPSSPP_ARCH(LOONGARCH64)
+
+#include <ucontext.h>
+typedef mcontext_t SContext;
+
+#define MACHINE_CONTEXT_SUPPORTED
+
+#define CTX_REG(x) __gregs[x]
+#define CTX_PC __pc
+#define CTX_SP CTX_REG(2)
 
 #else
 

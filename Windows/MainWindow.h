@@ -5,7 +5,6 @@
 #if !PPSSPP_PLATFORM(UWP)
 
 #include "Common/CommonWindows.h"
-#include <string>
 
 #include "Core/System.h"
 #include "MainWindowMenu.h"
@@ -16,12 +15,12 @@ namespace MainWindow
 	enum {
 		WM_USER_SAVESTATE_FINISH = WM_USER + 100,
 		WM_USER_UPDATE_UI = WM_USER + 101,
-		WM_USER_BROWSE_BG_DONE = WM_USER + 102,
 		WM_USER_WINDOW_TITLE_CHANGED = WM_USER + 103,
-		WM_USER_BROWSE_BOOT_DONE = WM_USER + 104,
-		WM_USER_TOGGLE_FULLSCREEN = WM_USER + 105,
-		WM_USER_RESTART_EMUTHREAD = WM_USER + 106,
-		WM_USER_SWITCHUMD_UPDATED = WM_USER + 107
+		WM_USER_APPLY_FULLSCREEN = WM_USER + 105,
+		WM_USER_SWITCHUMD_UPDATED = WM_USER + 107,
+		WM_USER_RUN_CALLBACK = WM_USER + 108,
+		WM_USER_DESTROY = WM_USER + 109,
+		WM_USER_SHOW_DISASM = WM_USER + 110,
 	};
 
 	enum {
@@ -51,7 +50,6 @@ namespace MainWindow
 		RESOLUTION_9X = 9,
 		RESOLUTION_MAX = 10,
 		
-		TEXSCALING_AUTO = 0,
 		TEXSCALING_OFF = 1,
 		TEXSCALING_2X = 2,
 		TEXSCALING_3X = 3,
@@ -62,24 +60,29 @@ namespace MainWindow
 
 	void Init(HINSTANCE hInstance);
 	BOOL Show(HINSTANCE hInstance);
-	void CreateDebugWindows();
+	void CreateDisasmWindow();
+	void CreateGeDebuggerWindow();
+	void CreateMemoryWindow();
+	void CreateVFPUWindow();
+	void NotifyDebuggerMapLoaded();
 	void DestroyDebugWindows();
-	void Close();
-	void UpdateMenus(bool isMenuSelect = false);
+	void UpdateMenus(HMENU menuSelected);
 	void UpdateCommands();
 	void UpdateSwitchUMD();
 	void SetWindowTitle(const wchar_t *title);
-	void Redraw();
 	HWND GetHWND();
 	HINSTANCE GetHInstance();
-	HWND GetDisplayHWND();
-	void ToggleFullscreen(HWND hWnd, bool goingFullscreen);
+	void ApplyFullscreenState(HWND hWnd, bool goingFullscreen);
 	void Minimize();
-	void SendToggleFullscreen(bool fullscreen);  // To be used off-thread
-	bool IsFullscreen();
+	void SendApplyFullscreenState();  // To be used off-thread
 	void ToggleDebugConsoleVisibility();
 	void SetInternalResolution(int res = -1);
 	void SetWindowSize(int zoom);
+	void RunCallbackInWndProc(void (*callback)(void *window, void *userdata), void *userdata);
+	void SetKeepScreenBright(bool keepBright);
+	void CreateGameWindow();
+
+	bool ConfirmAction(HWND hWnd, bool actionIsReset);
 }
 
 #endif

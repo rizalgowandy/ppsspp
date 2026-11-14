@@ -20,6 +20,7 @@
 #include "Core/Reporting.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/FunctionWrappers.h"
+#include "Core/HLE/ErrorCodes.h"
 #include "Core/HLE/sceVaudio.h"
 #include "Core/HLE/sceAudio.h"
 #include "Core/HLE/__sceAudio.h"
@@ -27,69 +28,160 @@
 // Ultra hacky Vaudio implementation. Not sure what the point of this API is.
 
 bool vaudioReserved = false;
+// For a channel reserved with sceVaudio_E8E78DC8, the parameter vaudio.prx hands the ME with each
+// buffer (ME command 0x125). -1 otherwise.
+static int vaudioMeParam = -1;
 
 void __VaudioInit() {
 	vaudioReserved = false;
+	vaudioMeParam = -1;
 }
 
 void __VaudioDoState(PointerWrap &p) {
-	auto s = p.Section("sceVaudio", 1);
+	auto s = p.Section("sceVaudio", 1, 2);
 	if (!s)
 		return;
 
 	Do(p, vaudioReserved);
+	if (s >= 2) {
+		Do(p, vaudioMeParam);
+	} else {
+		vaudioMeParam = -1;
+	}
 }
 
 static u32 sceVaudioChReserve(int sampleCount, int freq, int format) {
+	// The vaudio channel is pickier than the normal ones: a fixed set of sample counts, stereo
+	// only, and the same set of sample rates the SRC channel takes. It tests
+	// 256/576/1024/1152 and then 2048, returning 0x80000104, before it looks at the format at all.
+	// 576 and 1152 are the MPEG-2/2.5 and MPEG-1 Layer III frame sizes, so leaving them out broke
+	// games that feed MP3 frames straight to the vaudio channel.
+	if (sampleCount != 256 && sampleCount != 576 && sampleCount != 1024 && sampleCount != 1152 && sampleCount != 2048) {
+		ERROR_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i) - invalid sample count", sampleCount, freq, format);
+		return SCE_KERNEL_ERROR_INVALID_SIZE;
+	}
+	if (format != 2) {
+		ERROR_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i) - unexpected format", sampleCount, freq, format);
+		return SCE_KERNEL_ERROR_INVALID_FORMAT;
+	}
 	if (vaudioReserved) {
-		ERROR_LOG(SCEAUDIO, "sceVaudioChReserve(%i, %i, %i) - already reserved", sampleCount, freq, format);
+		ERROR_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i) - already reserved", sampleCount, freq, format);
 		return SCE_KERNEL_ERROR_BUSY;
 	}
-	// We still have to check the channel also, which gives a different error.
-	if (chans[PSP_AUDIO_CHANNEL_VAUDIO].reserved) {
-		ERROR_LOG(SCEAUDIO, "sceVaudioChReserve(%i, %i, %i) - channel already reserved", sampleCount, freq, format);
-		return SCE_ERROR_AUDIO_CHANNEL_ALREADY_RESERVED;
-	}
-	DEBUG_LOG(SCEAUDIO, "sceVaudioChReserve(%i, %i, %i)", sampleCount, freq, format);
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].reserved = true;
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].sampleCount = sampleCount;
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].format = format == 2 ? PSP_AUDIO_FORMAT_STEREO : PSP_AUDIO_FORMAT_MONO;
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].leftVolume = 0;
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].rightVolume = 0;
+
+	// Everything past here is the underlying sceAudioSRCChReserve, and the module marks itself
+	// reserved before handing over - it does not undo that when the reserve fails. So a caller
+	// that got 0x80268002 because Output2 held the channel is told 0x80000021 next time round,
+	// until a release clears it.
+	// From here on the call waits about 250us, whether it succeeds or not; on hardware worse
+	// threads get to run meanwhile (pspautotests audio/sceaudio/reserve shows the reschedule).
 	vaudioReserved = true;
+	const int reserveUs = 250;
+	if (freq != 0 && !SRCFrequencyAllowed(freq)) {
+		ERROR_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i) - invalid frequency", sampleCount, freq, format);
+		return hleDelayResult(SCE_ERROR_AUDIO_INVALID_FREQUENCY, "vaudio reserve", reserveUs);
+	}
+	// We still have to check the channel also, which gives a different error.
+	if (g_audioSRC.reserved) {
+		ERROR_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i) - channel already reserved", sampleCount, freq, format);
+		return hleDelayResult(SCE_ERROR_AUDIO_CHANNEL_ALREADY_RESERVED, "vaudio reserve", reserveUs);
+	}
+	DEBUG_LOG(Log::sceAudio, "sceVaudioChReserve(%i, %i, %i)", sampleCount, freq, format);
+	g_audioSRC.clear();
+	g_audioSRC.reserved = true;
+	g_audioSRC.sampleCount = sampleCount;
+	g_audioSRC.format = format == 2 ? PSP_AUDIO_FORMAT_STEREO : PSP_AUDIO_FORMAT_MONO;
 	__AudioSetSRCFrequency(freq);
-	return 0;
+	return hleDelayResult(0, "vaudio reserve", reserveUs);
 }
 
 static u32 sceVaudioChRelease() {
-	DEBUG_LOG(SCEAUDIO, "sceVaudioChRelease(...)");
-	if (!chans[PSP_AUDIO_CHANNEL_VAUDIO].reserved) {
+	DEBUG_LOG(Log::sceAudio, "sceVaudioChRelease(...)");
+	// Not gated on vaudio's own flag: the release goes straight at the SRC channel, so it will
+	// happily release a reservation that Output2 made. pspautotests calls that the "wrong
+	// release" and the hardware allows it.
+	vaudioReserved = false;
+	vaudioMeParam = -1;
+	if (!g_audioSRC.reserved) {
 		return SCE_ERROR_AUDIO_CHANNEL_NOT_RESERVED;
-	} else {
-		chans[PSP_AUDIO_CHANNEL_VAUDIO].reset();
-		chans[PSP_AUDIO_CHANNEL_VAUDIO].reserved = false;
-		vaudioReserved = false;
-		return 0;
 	}
+
+	// Unlike the Output2 and SRC releases, which refuse while a buffer is in flight, this one
+	// hands the channel a null pointer first. That parks the caller until a buffer finishes, so
+	// what was playing is played out instead of being cut off.
+	__AudioSRCEnqueueBlocking(g_audioSRC, 0, -1);
+	if (g_audioSRC.Full()) {
+		// One drain was not enough to free a descriptor, so the release itself fails.
+		return SCE_ERROR_AUDIO_CHANNEL_ALREADY_RESERVED;
+	}
+
+	// The reservation goes now rather than when the drain finishes. The caller is parked either
+	// way and gets the same answer at the same time; the buffers keep playing because the mixer
+	// does not look at the reservation. Only another thread peeking during that window could
+	// tell the difference.
+	g_audioSRC.reserved = false;
+	g_audioSRC.sampleCount = 0;
+	__AudioSRCSignal(g_audioSRC);
+	return 0;
 }
 
 static u32 sceVaudioOutputBlocking(int vol, u32 buffer) {
-	DEBUG_LOG(SCEAUDIO, "sceVaudioOutputBlocking(%i, %08x)", vol, buffer);
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].leftVolume = vol;
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].rightVolume = vol;
-	// TODO: This may be wrong, not sure if's in a different format?
-	chans[PSP_AUDIO_CHANNEL_VAUDIO].sampleAddress = buffer;
-	return __AudioEnqueue(chans[PSP_AUDIO_CHANNEL_VAUDIO], PSP_AUDIO_CHANNEL_VAUDIO, true);
+	DEBUG_LOG(Log::sceAudio, "sceVaudioOutputBlocking(%i, %08x)", vol, buffer);
+	// Shares the SRC channel, so it also shares the two-buffer depth and the busy return.
+	return __AudioSRCEnqueueBlocking(g_audioSRC, buffer, vol);
 }
 
 static u32 sceVaudioSetEffectType(int effectType, int vol) {
-	ERROR_LOG_REPORT(SCEAUDIO, "UNIMPL sceVaudioSetEffectType(%i, %i)", effectType, vol);
-	return 0;
+	// vaudio.prx accepts 0-4 and drops vol (it passes 0 on to the driver function).
+	if ((u32)effectType >= 5) {
+		return hleLogError(Log::sceAudio, SCE_KERNEL_ERROR_INVALID_INDEX, "bad effect type");
+	}
+	if (effectType != 0) {
+		ERROR_LOG_REPORT(Log::sceAudio, "UNIMPL sceVaudioSetEffectType(%i, %i)", effectType, vol);
+	}
+	return hleLogDebug(Log::sceAudio, 0);
 }
 
+// Automatic level control (SensMe shows it as the volume normalizer). In vaudio.prx, mode 1 sends
+// each buffer through the ME for processing, as a non-zero effect type does, if the sample count is a
+// multiple of 8. Not emulated, so the audio goes out unchanged. Works with or without a reservation.
+// It's also used in DMB Tuner. It's used in a few games too, strangely: Mega Man X4, INFECTED,
+// Snoopy vs The Red Baron, Heracles Chariot Racing, Cover Girl. Unless these are some kind of false positives.
 static u32 sceVaudioSetAlcMode(int alcMode) {
-	ERROR_LOG_REPORT(SCEAUDIO, "UNIMPL sceVaudioSetAlcMode(%i)", alcMode);
-	return 0;
+	if ((u32)alcMode >= 2) {
+		return hleLogError(Log::sceAudio, SCE_KERNEL_ERROR_INVALID_INDEX, "bad mode");
+	}
+	return hleLogDebug(Log::sceAudio, 0);
+}
+
+// In vaudio.prx this is sceVaudioChReserve with a flag set (a3 = 1 into the shared reserve, 0 for
+// ChReserve), which presumably buffers deeper. Not modelled. The VSH's UMD Video player uses it.
+static u32 sceVaudioChReserveBuffering(int sampleCount, int freq, int format) {
+	return sceVaudioChReserve(sampleCount, freq, format);
+}
+
+// ChReserveBuffering, after setting up an effect on the ME (command 0x124, with the frequency and
+// sample count): vaudio.prx then passes every buffer through the ME with a parameter that starts at
+// 0x800, and ChRelease tears it down (0x126). The VSH's video player uses it, and only it changes
+// the parameter (sceVaudio_504E4745). Unknown what the effect is, so the audio goes out unchanged.
+static u32 sceVaudio_E8E78DC8(int sampleCount, int freq, int format) {
+	u32 result = sceVaudioChReserve(sampleCount, freq, format);
+	if (result == 0) {
+		vaudioMeParam = 0x800;
+	}
+	return result;
+}
+
+static u32 sceVaudio_504E4745(int param) {
+	// As vaudio.prx checks it.
+	if (vaudioMeParam < 0) {
+		return hleLogError(Log::sceAudio, 0x80000001, "not reserved through the ME");
+	}
+	if (param < 0x400 || param > 0x1000) {
+		return hleLogError(Log::sceAudio, SCE_KERNEL_ERROR_INVALID_VALUE, "out of range");
+	}
+	vaudioMeParam = param;
+	return hleLogDebug(Log::sceAudio, 0);
 }
 
 const HLEFunction sceVaudio[] = {
@@ -98,11 +190,16 @@ const HLEFunction sceVaudio[] = {
 	{0X67585DFD, &WrapU_V<sceVaudioChRelease>,       "sceVaudioChRelease",          'x', ""   },
 	{0X346FBE94, &WrapU_II<sceVaudioSetEffectType>,  "sceVaudioSetEffectType",      'x', "ii" },
 	{0XCBD4AC51, &WrapU_I<sceVaudioSetAlcMode>,      "sceVaudioSetAlcMode",         'x', "i"  },
-	{0X504E4745, nullptr,                            "sceVaudio_504E4745",          '?', ""   },
-	{0X27ACC20B, nullptr,                            "sceVaudioChReserveBuffering", '?', ""   },
-	{0XE8E78DC8, nullptr,                            "sceVaudio_E8E78DC8",          '?', ""   },
+	{0X504E4745, &WrapU_I<sceVaudio_504E4745>,       "sceVaudio_504E4745",          'x', "x"  },
+	{0X27ACC20B, &WrapU_III<sceVaudioChReserveBuffering>, "sceVaudioChReserveBuffering", 'x', "iii"},
+	{0XE8E78DC8, &WrapU_III<sceVaudio_E8E78DC8>,     "sceVaudio_E8E78DC8",          'x', "iii"},
 };
 
 void Register_sceVaudio() {
-	RegisterModule("sceVaudio",ARRAY_SIZE(sceVaudio), sceVaudio );
+	RegisterHLEModule("sceVaudio",ARRAY_SIZE(sceVaudio), sceVaudio );
+}
+
+void Register_sceVaudio_driver() {
+	// The same functions; vshbridge.prx imports them under the driver name for the VSH's video player.
+	RegisterHLEModule("sceVaudio_driver", ARRAY_SIZE(sceVaudio), sceVaudio);
 }

@@ -7,8 +7,8 @@
 
 #include "libretro/LibretroGLCoreContext.h"
 
-bool LibretroGLCoreContext::Init() {
-	if (!LibretroHWRenderContext::Init(true))
+bool LibretroGLCoreContext::InitAPI(void *wnd, std::string *deviceName, std::string *error_message) {
+	if (!LibretroHWRenderContext::InitHW(false))
 		return false;
 
 	g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
@@ -19,18 +19,31 @@ void LibretroGLCoreContext::CreateDrawContext() {
 	if (!glewInitDone) {
 #if !PPSSPP_PLATFORM(IOS) && !defined(USING_GLES2)
 		if (glewInit() != GLEW_OK) {
-			ERROR_LOG(G3D, "glewInit() failed.\n");
+			ERROR_LOG(Log::G3D, "glewInit() failed.\n");
 			return;
 		}
 #endif
 		glewInitDone = true;
+		// We requested RETRO_HW_CONTEXT_OPENGL_CORE; tell GLFeatures so the
+		// Core-profile workaround in CheckGLExtensions (which force-enables
+		// ARB_framebuffer_object / ARB_vertex_array_object) fires. Apple's
+		// Core driver doesn't list these as extensions, so without this both
+		// stay false and glBindFramebuffer(default) silently no-ops in
+		// GLQueueRunner::fbo_unbind on macOS → black screen.
+		SetGLCoreContext(true);
 		CheckGLExtensions();
 	}
-	draw_ = Draw::T3DCreateGLContext();
+	draw_ = Draw::T3DCreateGLContext(false);
 	renderManager_ = (GLRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+	renderManager_->SetInflightFrames(g_Config.iInflightFrames);
+	SetGPUBackend(GPUBackend::OPENGL);
 }
 
 void LibretroGLCoreContext::DestroyDrawContext() {
 	LibretroHWRenderContext::DestroyDrawContext();
 	renderManager_ = nullptr;
+}
+
+void LibretroGLCoreContext::NotifyEmuThreadExit() {
+   renderManager_->NotifyEmuThreadExit();
 }

@@ -18,13 +18,22 @@
 #pragma once
 
 #include <string>
+#include <memory>
 
 class FileLoader;
+class BlockDevice;
 
 bool Load_PSP_ISO(FileLoader *fileLoader, std::string *error_string);
-bool Load_PSP_ELF_PBP(FileLoader *fileLoader, std::string *error_string);
+bool Load_PSP_ELF_PBP(FileLoader *fileLoader, std::string_view discId, bool loadGameConfigs, std::string *error_string);
 bool Load_PSP_GE_Dump(FileLoader *fileLoader, std::string *error_string);
-void InitMemoryForGameISO(FileLoader *fileLoader);
-bool ReInitMemoryForGameISO(FileLoader *fileLoader);
-void InitMemoryForGamePBP(FileLoader *fileLoader);
-void PSPLoaders_Shutdown();
+// Booting a savestate without its game: the first sets up the disc ID and a disc with nothing on it,
+// the second a placeholder program that runs until the state is loaded.
+bool MountStateBoot(const Path &statePath, std::string *errorString);
+bool Load_PSP_StateBoot(std::string *error_string);
+bool Load_PSP_POPS(FileLoader *fileLoader, std::string *error_string);
+
+bool MountGameISO(FileLoader *fileLoader, std::string *errorString);
+bool LoadParamSFOFromDisc();
+bool LoadParamSFOFromPBP(FileLoader *fileLoader);
+void InitMemorySizeForGame();
+void DumpBlockDeviceAsync(std::shared_ptr<BlockDevice> bd, Path destPath, std::string title);

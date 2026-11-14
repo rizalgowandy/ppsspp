@@ -8,25 +8,31 @@
 #define PPSSPP_API(PPSSPP_FEATURE) (PPSSPP_API_##PPSSPP_FEATURE)
 
 // ARCH defines
-#if defined(_M_IX86) || defined(__i386__)
+#if defined(_M_IX86) || defined(__i386__) || defined (__EMSCRIPTEN__)
     #define PPSSPP_ARCH_X86 1
     #define PPSSPP_ARCH_32BIT 1
+    #define PPSSPP_ARCH_SSE2 1
     //TODO: Remove this compat define
     #ifndef _M_IX86
         #define _M_IX86 600
     #endif
 #endif
 
-#if defined(_M_X64) || defined(__amd64__) || defined(__x86_64__)
+#if (defined(_M_X64) || defined(__amd64__) || defined(__x86_64__)) && !defined(__EMSCRIPTEN__)
     #define PPSSPP_ARCH_AMD64 1
-    #define PPSSPP_ARCH_64BIT 1
+    #define PPSSPP_ARCH_SSE2 1
+    #if defined(__ILP32__)
+        #define PPSSPP_ARCH_32BIT 1
+    #else
+        #define PPSSPP_ARCH_64BIT 1
+    #endif
     //TODO: Remove this compat define
     #ifndef _M_X64
         #define _M_X64 1
     #endif
 #endif
 
-#if defined(__arm__) || defined(_M_ARM)
+#if defined(__arm__)
     #define PPSSPP_ARCH_ARM 1
     #define PPSSPP_ARCH_32BIT 1
 
@@ -43,17 +49,13 @@
     #if defined(__ARM_NEON) || defined(__ARM_NEON__)
         #define PPSSPP_ARCH_ARM_NEON 1
     #endif
-
-    #if defined(_M_ARM)
-        #define PPSSPP_ARCH_ARMV7 1
-        #define PPSSPP_ARCH_ARM_NEON 1
-    #endif
 #endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
     #define PPSSPP_ARCH_ARM64 1
     #define PPSSPP_ARCH_64BIT 1
-    #define PPSSPP_ARCH_ARM_NEON 1
+    #define PPSSPP_ARCH_ARM_NEON 1  // Applies to both ARM32 and ARM64
+    #define PPSSPP_ARCH_ARM64_NEON 1
 #endif
 
 #if defined(__mips64__)
@@ -64,14 +66,29 @@
     #define PPSSPP_ARCH_32BIT 1
 #endif
 
+#if defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64
+    //https://github.com/riscv/riscv-c-api-doc/blob/master/riscv-c-api.md
+    #define PPSSPP_ARCH_RISCV64 1
+    #define PPSSPP_ARCH_64BIT 1
+#endif
 
+#if defined(__loongarch_lp64)
+    //https://github.com/gcc-mirror/gcc/blob/master/gcc/config/loongarch/loongarch-c.cc
+    #define PPSSPP_ARCH_LOONGARCH64 1
+    #define PPSSPP_ARCH_64BIT 1
+
+    #if defined(__loongarch_asx)
+        #define PPSSPP_ARCH_LOONGARCH64_LASX 1
+    #endif
+
+    #if defined(__loongarch_asx) || defined(__loongarch_sx)
+        #define PPSSPP_ARCH_LOONGARCH64_LSX  1
+    #endif
+#endif
 // PLATFORM defines
 #if defined(_WIN32)
     // Covers both 32 and 64bit Windows
     #define PPSSPP_PLATFORM_WINDOWS 1
-	#ifdef _M_ARM
-        #define PPSSPP_ARCH_ARM_HARDFP 1
-	#endif
 	// UWP trickery
     #if defined(WINAPI_FAMILY) && defined(WINAPI_FAMILY_PARTITION)
         #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP) && WINAPI_FAMILY != WINAPI_FAMILY_DESKTOP_APP
@@ -80,6 +97,14 @@
     #endif
 #elif defined(__APPLE__)
     #include <TargetConditionals.h>
+    // tvOS is iOS with some APIs removed, so it also gets PPSSPP_PLATFORM_IOS.
+    // Check PPSSPP_PLATFORM(TVOS) for the differences.
+    #if TARGET_OS_TV
+        #define PPSSPP_PLATFORM_TVOS 1
+        #if TARGET_OS_SIMULATOR
+            #define PPSSPP_PLATFORM_TVOS_SIMULATOR 1
+        #endif
+    #endif
     #if TARGET_IPHONE_SIMULATOR
         #define PPSSPP_PLATFORM_IOS 1
         #define PPSSPP_PLATFORM_IOS_SIMULATOR 1
@@ -97,17 +122,29 @@
     #define PPSSPP_PLATFORM_LINUX 1
 #elif defined(__linux__)
     #define PPSSPP_PLATFORM_LINUX 1
+#elif defined(__OpenBSD__)
+    #define PPSSPP_PLATFORM_OPENBSD 1
 #endif
 
-// Windows ARM/ARM64, and Windows UWP (all), are the only platform that don't do GL at all (until Apple finally removes it)
-#if !PPSSPP_PLATFORM(WINDOWS) || ((!PPSSPP_ARCH(ARM) && !PPSSPP_ARCH(ARM64)) && !PPSSPP_PLATFORM(UWP))
+// Windows ARM/ARM64, Windows UWP (all) and the iOS app don't do GL at all. The iOS libretro core still does.
+#if PPSSPP_PLATFORM(WINDOWS)
+#if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(ARM) || PPSSPP_PLATFORM(UWP)
+// No GL
+#else
+#define PPSSPP_API_ANY_GL 1
+#endif
+#elif PPSSPP_PLATFORM(IOS) && !defined(__LIBRETRO__)
+// No GL
+#else
+// All other platforms support GL.
 #define PPSSPP_API_ANY_GL 1
 #endif
 
 #if PPSSPP_PLATFORM(WINDOWS)
-#if !PPSSPP_PLATFORM(UWP)
-#define PPSSPP_API_D3D9 1
-#endif
 #define PPSSPP_API_D3D11 1
 #endif
 
+// Not in the libretro cores, which get their graphics context from the frontend.
+#if (PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)) && !defined(__LIBRETRO__)
+#define PPSSPP_API_METAL 1
+#endif

@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <cstring>
 
-#define ATLAS_MAGIC ('A' + ('T' << 8) + ('L' << 16) | ('A' << 24))
+#include <string_view>
+
+#define ATLAS_MAGIC ('A' | ('T' << 8) | ('L' << 16) | ('A' << 24))
 
 // Metadata file structure v0:
 //
@@ -21,34 +23,31 @@ struct Atlas;
 
 struct ImageID {
 public:
-	ImageID() : id(nullptr) {}
-	explicit ImageID(const char *_id) : id(_id) {}
+	ImageID() {}
+	explicit ImageID(std::string_view _id) : id(_id) {}
 
 	static inline ImageID invalid() {
-		return ImageID{ nullptr };
+		return ImageID{""};
 	}
 
 	bool isValid() const {
-		return id != nullptr;
+		return !id.empty();
 	}
 
 	bool isInvalid() const {
-		return id == nullptr;
+		return id.empty();
 	}
 
 	bool operator ==(const ImageID &other) {
-		return (id == other.id) || !strcmp(id, other.id);
+		return id == other.id;
 	}
 
 	bool operator !=(const ImageID &other) {
-		if (id == other.id) {
-			return false;
-		}
-		return strcmp(id, other.id) != 0;
+		return id != other.id;
 	}
 
 private:
-	const char *id;
+	std::string_view id;
 	friend struct Atlas;
 };
 
@@ -97,6 +96,9 @@ struct AtlasFontHeader {
 };
 
 struct AtlasFont {
+	AtlasFont() = default;
+	AtlasFont(const AtlasFont &) = delete;
+	AtlasFont &operator=(const AtlasFont &) = delete;
 	~AtlasFont();
 
 	float padding;
@@ -110,7 +112,7 @@ struct AtlasFont {
 	char name[32];
 
 	// Returns 0 on no match.
-	const AtlasChar *getChar(int utf32) const ;
+	const AtlasChar *getChar(int utf32) const;
 };
 
 struct AtlasImage {
@@ -127,16 +129,22 @@ struct AtlasHeader {
 };
 
 struct Atlas {
+	Atlas() = default;
+	Atlas(const Atlas &) = delete;
+	Atlas &operator=(const Atlas &) = delete;
 	~Atlas();
-	bool Load(const uint8_t *data, size_t data_size);
-	bool IsMetadataLoaded() {
+	bool LoadMeta(const uint8_t *data, size_t data_size);
+	bool IsMetadataLoaded() const {
 		return images != nullptr;
 	}
+	void Clear();
 
 	AtlasFont *fonts = nullptr;
 	int num_fonts = 0;
 	AtlasImage *images = nullptr;
 	int num_images = 0;
+	// Texels per UI unit that generated images were rasterized at. Not stored in metadata.
+	float dpiScale = 1.0f;
 
 	// These are inefficient linear searches, try not to call every frame.
 	const AtlasFont *getFont(FontID id) const;

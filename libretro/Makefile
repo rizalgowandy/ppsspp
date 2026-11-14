@@ -1,4 +1,4 @@
-DEBUG=0
+DEBUG     := 0
 WITH_DYNAREC := 1
 
 DYNAFLAGS :=
@@ -42,7 +42,7 @@ endif
 
 # Dirs
 CORE_DIR			= ..
-FFMPEGDIR		= $(CORE_DIR)/ffmpeg
+FFMPEGDIR		= $(CORE_DIR)/ext/ffmpeg
 LIBRETRODIR		= $(CORE_DIR)/libretro
 COREDIR			= $(CORE_DIR)/Core
 COMMONDIR		= $(CORE_DIR)/Common
@@ -53,24 +53,20 @@ EXTDIR			= $(CORE_DIR)/ext
 
 TARGET_NAME := ppsspp
 
-FFMPEGINCFLAGS :=
-FFMPEGLIBDIR :=
-FFMPEGLIBS :=
-
 # Unix
 ifneq (,$(findstring unix,$(platform)))
 	TARGET := $(TARGET_NAME)_libretro.so
 	LDFLAGS += -shared -Wl,--version-script=link.T -Wl,--no-undefined
 
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/linux/$(TARGET_ARCH)/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/linux/$(TARGET_ARCH)/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 	fpic = -fPIC
 	ifneq (,$(findstring gles,$(platform)))
 		GLES = 1
 		GL_LIB := -lGLESv2
 	else
 		GL_LIB := -lGL
+		ifeq ($(GLEW_EGL),1)
+			GL_LIB += -lEGL
+		endif
 	endif
 	PLATFORM_EXT = unix
 	LDFLAGS += -lrt -ldl
@@ -94,9 +90,6 @@ else ifneq (,$(findstring arm64,$(platform)))
 	TARGET_ARCH = arm64
 	fpic := -fPIC
 	LDFLAGS += -shared -Wl,--version-script=link.T -Wl,--no-undefined
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/linux/aarch64/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/linux/aarch64/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 	INCFLAGS += -I.
 	HAVE_NEON=1
 	ifneq (,$(findstring gles,$(platform)))
@@ -121,9 +114,6 @@ else ifneq (,$(findstring imx6,$(platform)))
 	PLATFORM_EXT = unix
 	TARGET_ARCH = arm
 	HAVE_NEON=1
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/linux/$(TARGET_ARCH)/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/linux/$(TARGET_ARCH)/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 	LDFLAGS += -lrt -ldl
 
 # OS X
@@ -140,9 +130,6 @@ else ifneq (,$(findstring osx,$(platform)))
    LDFLAGS += -stdlib=libc++
 	fpic = -fPIC
 
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/macosx/universal/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/macosx/universal/lib
-	FFMPEGLDFLAGS += -liconv -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 	PLATCFLAGS += -D__MACOSX__
 	GL_LIB := -framework OpenGL
 	PLATFORM_EXT = darwin
@@ -166,9 +153,6 @@ else ifneq (,$(findstring ios,$(platform)))
    MINVERSION :=
 	HAVE_NEON = 1
 
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/ios/universal/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/ios/universal/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 
 	ifeq ($(IOSSDK),)
 		IOSSDK := $(shell xcodebuild -version -sdk iphoneos Path)
@@ -202,9 +186,6 @@ else ifeq ($(platform), tvos-arm64)
    MINVERSION :=
 	HAVE_NEON = 1
 
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/ios/universal/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/ios/universal/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 
 	ifeq ($(IOSSDK),)
 		IOSSDK := $(shell xcodebuild -version -sdk appletvos Path)
@@ -237,9 +218,6 @@ else ifneq (,$(findstring android,$(platform)))
 	CFLAGS += -DANDROID
 	LDFLAGS += -llog -lGLESv2 -lEGL
 
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/android/armv7/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/android/armv7/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 
 	PLATFORM_EXT = android
 
@@ -269,9 +247,6 @@ else ifneq (,$(findstring armv,$(platform)))
 	TARGET_ARCH = armv7
 	fpic := -fPIC
 	LDFLAGS += -shared -Wl,--version-script=link.T -Wl,--no-undefined
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/linux/$(TARGET_ARCH)/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/linux/$(TARGET_ARCH)/lib
-	FFMPEGLDFLAGS += -L$(FFMPEGLIBDIR) -lavformat -lavcodec -lavutil -lswresample -lswscale
 	INCFLAGS += -I.
 	ifneq (,$(findstring gles,$(platform)))
 		GLES := 1
@@ -300,150 +275,35 @@ else ifneq (,$(findstring armv,$(platform)))
 
 # emscripten
 else ifeq ($(platform), emscripten)
+	TARGET_ARCH = wasm32
+	GLES = 1
 	TARGET := $(TARGET_NAME)_libretro_emscripten.bc
-	GLES := 1
-	CPUFLAGS +=
-	PLATCFLAGS += -DCC_resampler=mupen_CC_resampler -Dsinc_resampler=mupen_sinc_resampler \
-					-Drglgen_symbol_map=mupen_rglgen_symbol_map -Dmain_exit=mupen_main_exit \
-					-Dadler32=mupen_adler32 -Drarch_resampler_realloc=mupen_rarch_resampler_realloc \
-					-Daudio_convert_s16_to_float_C=mupen_audio_convert_s16_to_float_C -Daudio_convert_float_to_s16_C=mupen_audio_convert_float_to_s16_C \
-					-Daudio_convert_init_simd=mupen_audio_convert_init_simd -Drglgen_resolve_symbols_custom=mupen_rglgen_resolve_symbols_custom \
-					-Drglgen_resolve_symbols=mupen_rglgen_resolve_symbols
-	PLATFORM_EXT = unix
+	PLATCFLAGS += -msimd128 -msse3 -mssse3 -msse4.1 -pthread -D__EMSCRIPTEN__ -DNO_MMAP
+	PLATFORM_EXT = emscripten
+	STATIC_LINKING = 1
 
-# Windows MSVC 2017 all architectures
-else ifneq (,$(findstring windows_msvc2017,$(platform)))
-
-	PlatformSuffix = $(subst windows_msvc2017_,,$(platform))
-	ifneq (,$(findstring desktop,$(PlatformSuffix)))
-		WinPartition = desktop
-		MSVC2017CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP -D_UNICODE -DUNICODE -DWINVER=0x0600 -D_WIN32_WINNT=0x0600
-		LDFLAGS += -MANIFEST -NXCOMPAT -DYNAMICBASE -DEBUG -OPT:REF -INCREMENTAL:NO -SUBSYSTEM:WINDOWS -MANIFESTUAC:"level='asInvoker' uiAccess='false'" -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1
-		LIBS += kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib
-	else ifneq (,$(findstring uwp,$(PlatformSuffix)))
-		WinPartition = uwp
-		MSVC2017CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_APP -DWINDLL -D_UNICODE -DUNICODE -DWRL_NO_DEFAULT_LIB
-		LDFLAGS += -APPCONTAINER -NXCOMPAT -DYNAMICBASE -MANIFEST:NO -OPT:REF -SUBSYSTEM:CONSOLE -MANIFESTUAC:NO -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1 -DEBUG:FULL -WINMD:NO
-		LIBS += WindowsApp.lib
-	endif
-
-	ifeq ($(DEBUG), 1)
-		MSVC2017CompileFlags += -DEBUG
-	endif
-
-	CFLAGS += $(MSVC2017CompileFlags) -nologo
-	CXXFLAGS += $(MSVC2017CompileFlags) -nologo -EHsc
-
-	TargetArchMoniker = $(subst $(WinPartition)_,,$(PlatformSuffix))
-
-	CC  = cl.exe
-	CXX = cl.exe
-
-	SPACE :=
-	SPACE := $(SPACE) $(SPACE)
-	BACKSLASH :=
-	BACKSLASH := \$(BACKSLASH)
-	filter_out1 = $(filter-out $(firstword $1),$1)
-	filter_out2 = $(call filter_out1,$(call filter_out1,$1))
-
-	reg_query = $(call filter_out2,$(subst $2,,$(shell reg query "$2" -v "$1" 2>/dev/null)))
-	fix_path = $(subst $(SPACE),\ ,$(subst \,/,$1))
-
-	b1 := (
-	b2 := )
-	ProgramFiles86w := $(ProgramFiles$(b1)x86$(b2))
-	ProgramFiles86 := $(shell cygpath "$(ProgramFiles86w)")
-
-	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
-	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
-	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
-	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0)
-	WindowsSdkDir := $(WindowsSdkDir)
-
-	WindowsSDKVersion ?= $(firstword $(foreach folder,$(subst $(subst \,/,$(WindowsSdkDir)Include/),,$(wildcard $(call fix_path,$(WindowsSdkDir)Include\*))),$(if $(wildcard $(call fix_path,$(WindowsSdkDir)Include/$(folder)/um/Windows.h)),$(folder),)))$(BACKSLASH)
-	WindowsSDKVersion := $(WindowsSDKVersion)
-
-	VsInstallBuildTools = $(ProgramFiles86)/Microsoft Visual Studio/2017/BuildTools
-	VsInstallEnterprise = $(ProgramFiles86)/Microsoft Visual Studio/2017/Enterprise
-	VsInstallProfessional = $(ProgramFiles86)/Microsoft Visual Studio/2017/Professional
-	VsInstallCommunity = $(ProgramFiles86)/Microsoft Visual Studio/2017/Community
-
-	VsInstallRoot ?= $(shell if [ -d "$(VsInstallBuildTools)" ]; then echo "$(VsInstallBuildTools)"; fi)
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallEnterprise)" ]; then echo "$(VsInstallEnterprise)"; fi)
-	endif
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallProfessional)" ]; then echo "$(VsInstallProfessional)"; fi)
-	endif
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallCommunity)" ]; then echo "$(VsInstallCommunity)"; fi)
-	endif
-	VsInstallRoot := $(VsInstallRoot)
-
-	VcCompilerToolsVer := $(shell cat "$(VsInstallRoot)/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" | grep -o '[0-9\.]*')
-	VcCompilerToolsDir := $(VsInstallRoot)/VC/Tools/MSVC/$(VcCompilerToolsVer)
-	VcCompilerLibDir := $(VcCompilerToolsDir)/lib/$(TargetArchMoniker)
-
-	WindowsSDKSharedIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\shared")
-	WindowsSDKUCRTIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\ucrt")
-	WindowsSDKUMIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\um")
-	WindowsSDKUCRTLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\ucrt\$(TargetArchMoniker)")
-	WindowsSDKUMLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\um\$(TargetArchMoniker)")
-
-	LIB := $(shell IFS=$$'\n'; cygpath -w "$(VcCompilerLibDir)")
-	INCLUDE := $(shell IFS=$$'\n'; cygpath -w "$(VcCompilerToolsDir)/include")
-
-	# For some reason the HostX86 compiler doesn't like compiling for x64
-	# ("no such file" opening a shared library), and vice-versa.
-	# Work around it for now by using the strictly x86 compiler for x86, and x64 for x64.
-	# NOTE: What about ARM?
-	ifneq (,$(findstring x64,$(TargetArchMoniker)))
-		override TARGET_ARCH = x86_64
-		VCCompilerToolsBinDir := $(VcCompilerToolsDir)/bin/HostX64/$(TargetArchMoniker)
-      LIB := $(LIB);$(CORE_DIR)/dx9sdk/Lib/x64
-	else
-		override TARGET_ARCH = x86
-		VCCompilerToolsBinDir := $(VcCompilerToolsDir)/bin/HostX86/$(TargetArchMoniker)
-      LIB := $(LIB);$(CORE_DIR)/dx9sdk/Lib/x86
-	endif
-
-	PATH := $(shell IFS=$$'\n'; cygpath "$(VCCompilerToolsBinDir)"):$(PATH)
-	PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VsInstallRoot)/Common7/IDE")
-
-	export INCLUDE := $(INCLUDE);$(WindowsSDKSharedIncludeDir);$(WindowsSDKUCRTIncludeDir);$(WindowsSDKUMIncludeDir)
-	export LIB := $(LIB);$(WindowsSDKUCRTLibDir);$(WindowsSDKUMLibDir);$(FFMPEGDIR)/Windows/$(TARGET_ARCH)/lib
-	TARGET := $(TARGET_NAME)_libretro.dll
-	PSS_STYLE :=2
-	LDFLAGS += -DLL
-	PLATFORM_EXT = win32
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/Windows/$(TARGET_ARCH)/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/Windows/$(TARGET_ARCH)/lib
-	FFMPEGLDFLAGS += -LIBPATH:$(FFMPEGLIBDIR)
-	GL_LIB := opengl32.lib
-	LDFLAGS += ws2_32.lib user32.lib shell32.lib avcodec.lib avutil.lib swresample.lib swscale.lib avformat.lib advapi32.lib winmm.lib gdi32.lib d3d9.lib d3dx9.lib Iphlpapi.lib
-
-# Windows MSVC 2019 all architectures
+# Windows MSVC all architectures
 else ifneq (,$(findstring windows_msvc2019,$(platform)))
 
 	PlatformSuffix = $(subst windows_msvc2019_,,$(platform))
 	ifneq (,$(findstring desktop,$(PlatformSuffix)))
 		WinPartition = desktop
-		MSVC2019CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP -D_UNICODE -DUNICODE -DWINVER=0x0600 -D_WIN32_WINNT=0x0600
+		MSVCCompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP -D_UNICODE -DUNICODE -DWINVER=0x0600 -D_WIN32_WINNT=0x0600
 		LDFLAGS += -MANIFEST -NXCOMPAT -DYNAMICBASE -DEBUG -OPT:REF -INCREMENTAL:NO -SUBSYSTEM:WINDOWS -MANIFESTUAC:"level='asInvoker' uiAccess='false'" -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1
 		LIBS += kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib
 	else ifneq (,$(findstring uwp,$(PlatformSuffix)))
 		WinPartition = uwp
-		MSVC2019CompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_APP -DWINDLL -D_UNICODE -DUNICODE -DWRL_NO_DEFAULT_LIB
+		MSVCCompileFlags = -DWINAPI_FAMILY=WINAPI_FAMILY_APP -DWINDLL -D_UNICODE -DUNICODE -DWRL_NO_DEFAULT_LIB
 		LDFLAGS += -APPCONTAINER -NXCOMPAT -DYNAMICBASE -MANIFEST:NO -OPT:REF -SUBSYSTEM:CONSOLE -MANIFESTUAC:NO -OPT:ICF -ERRORREPORT:PROMPT -NOLOGO -TLBID:1 -DEBUG:FULL -WINMD:NO
 		LIBS += WindowsApp.lib
 	endif
 
 	ifeq ($(DEBUG), 1)
-		MSVC2019CompileFlags += -DEBUG
+		MSVCCompileFlags += -DEBUG
 	endif
 
-	CFLAGS += $(MSVC2019CompileFlags) -nologo
-	CXXFLAGS += $(MSVC2019CompileFlags) -nologo -EHsc
+	CFLAGS += $(MSVCCompileFlags) -nologo
+	CXXFLAGS += $(MSVCCompileFlags) -nologo -EHsc -DARMIPS_USE_STD_FILESYSTEM
 
 	TargetArchMoniker = $(subst $(WinPartition)_,,$(PlatformSuffix))
 
@@ -460,10 +320,9 @@ else ifneq (,$(findstring windows_msvc2019,$(platform)))
 	reg_query = $(call filter_out2,$(subst $2,,$(shell reg query "$2" -v "$1" 2>/dev/null)))
 	fix_path = $(subst $(SPACE),\ ,$(subst \,/,$1))
 
-	b1 := (
-	b2 := )
-	ProgramFiles86w := $(ProgramFiles$(b1)x86$(b2))
-	ProgramFiles86 := $(shell cygpath "$(ProgramFiles86w)")
+	VSCommand := bash VSWhere.sh -latest -property installationPath
+	VSInstallPathw := $(shell cmd //c "$(VSCommand)")
+	VSInstallPath := $(shell cygpath "$(VSInstallPathw)")
 
 	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_LOCAL_MACHINE\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
 	WindowsSdkDir ?= $(call reg_query,InstallationFolder,HKEY_CURRENT_USER\SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows\v10.0)
@@ -474,22 +333,7 @@ else ifneq (,$(findstring windows_msvc2019,$(platform)))
 	WindowsSDKVersion ?= $(firstword $(foreach folder,$(subst $(subst \,/,$(WindowsSdkDir)Include/),,$(wildcard $(call fix_path,$(WindowsSdkDir)Include\*))),$(if $(wildcard $(call fix_path,$(WindowsSdkDir)Include/$(folder)/um/Windows.h)),$(folder),)))$(BACKSLASH)
 	WindowsSDKVersion := $(WindowsSDKVersion)
 
-	VsInstallBuildTools = $(ProgramFiles86)/Microsoft Visual Studio/2019/BuildTools
-	VsInstallEnterprise = $(ProgramFiles86)/Microsoft Visual Studio/2019/Enterprise
-	VsInstallProfessional = $(ProgramFiles86)/Microsoft Visual Studio/2019/Professional
-	VsInstallCommunity = $(ProgramFiles86)/Microsoft Visual Studio/2019/Community
-
-	VsInstallRoot ?= $(shell if [ -d "$(VsInstallBuildTools)" ]; then echo "$(VsInstallBuildTools)"; fi)
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallEnterprise)" ]; then echo "$(VsInstallEnterprise)"; fi)
-	endif
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallProfessional)" ]; then echo "$(VsInstallProfessional)"; fi)
-	endif
-	ifeq ($(VsInstallRoot), )
-		VsInstallRoot = $(shell if [ -d "$(VsInstallCommunity)" ]; then echo "$(VsInstallCommunity)"; fi)
-	endif
-	VsInstallRoot := $(VsInstallRoot)
+	VsInstallRoot := $(VSInstallPath)
 
 	VcCompilerToolsVer := $(shell cat "$(VsInstallRoot)/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" | grep -o '[0-9\.]*')
 	VcCompilerToolsDir := $(VsInstallRoot)/VC/Tools/MSVC/$(VcCompilerToolsVer)
@@ -498,6 +342,7 @@ else ifneq (,$(findstring windows_msvc2019,$(platform)))
 	WindowsSDKSharedIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\shared")
 	WindowsSDKUCRTIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\ucrt")
 	WindowsSDKUMIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\um")
+	WindowsSDKWinRTIncludeDir := $(shell cygpath -w "$(WindowsSdkDir)\Include\$(WindowsSDKVersion)\winrt")
 	WindowsSDKUCRTLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\ucrt\$(TargetArchMoniker)")
 	WindowsSDKUMLibDir := $(shell cygpath -w "$(WindowsSdkDir)\Lib\$(WindowsSDKVersion)\um\$(TargetArchMoniker)")
 
@@ -511,44 +356,31 @@ else ifneq (,$(findstring windows_msvc2019,$(platform)))
 	ifneq (,$(findstring x64,$(TargetArchMoniker)))
 		override TARGET_ARCH = x86_64
 		VCCompilerToolsBinDir := $(VcCompilerToolsDir)/bin/HostX64/$(TargetArchMoniker)
-      LIB := $(LIB);$(CORE_DIR)/dx9sdk/Lib/x64
 	else
 		override TARGET_ARCH = x86
 		VCCompilerToolsBinDir := $(VcCompilerToolsDir)/bin/HostX86/$(TargetArchMoniker)
-      LIB := $(LIB);$(CORE_DIR)/dx9sdk/Lib/x86
 	endif
 
 	PATH := $(shell IFS=$$'\n'; cygpath "$(VCCompilerToolsBinDir)"):$(PATH)
 	PATH := $(PATH):$(shell IFS=$$'\n'; cygpath "$(VsInstallRoot)/Common7/IDE")
 
-	export INCLUDE := $(INCLUDE);$(WindowsSDKSharedIncludeDir);$(WindowsSDKUCRTIncludeDir);$(WindowsSDKUMIncludeDir)
-	export LIB := $(LIB);$(WindowsSDKUCRTLibDir);$(WindowsSDKUMLibDir);$(FFMPEGDIR)/Windows/$(TARGET_ARCH)/lib
+	export INCLUDE := $(INCLUDE);$(WindowsSDKSharedIncludeDir);$(WindowsSDKUCRTIncludeDir);$(WindowsSDKUMIncludeDir);$(WindowsSDKWinRTIncludeDir)
+	export LIB := $(LIB);$(WindowsSDKUCRTLibDir);$(WindowsSDKUMLibDir)
 	TARGET := $(TARGET_NAME)_libretro.dll
 	PSS_STYLE :=2
 	LDFLAGS += -DLL
 	PLATFORM_EXT = win32
-	FFMPEGINCFLAGS += -I$(FFMPEGDIR)/Windows/$(TARGET_ARCH)/include
-	FFMPEGLIBDIR := $(FFMPEGDIR)/Windows/$(TARGET_ARCH)/lib
-	FFMPEGLDFLAGS += -LIBPATH:$(FFMPEGLIBDIR)
 	GL_LIB := opengl32.lib
-	LDFLAGS += ws2_32.lib user32.lib shell32.lib avcodec.lib avutil.lib swresample.lib swscale.lib avformat.lib advapi32.lib winmm.lib gdi32.lib d3d9.lib d3dx9.lib Iphlpapi.lib
+	LDFLAGS += ws2_32.lib user32.lib shell32.lib advapi32.lib winmm.lib gdi32.lib Iphlpapi.lib
 
 # Windows
 else ifneq (,$(findstring win,$(platform)))
 	TARGET := $(TARGET_NAME)_libretro.dll
 	CFLAGS += -D_UNICODE -DUNICODE
-	CXXFLAGS += -fpermissive -Wno-multichar -D_UNICODE -DUNICODE
-	LDFLAGS += -shared -Wl,--no-undefined -static-libgcc -static-libstdc++ -Wl,--version-script=link.T -lwinmm -lgdi32 -lwsock32 -lws2_32 -ld3d9 -ld3dx9
+	CXXFLAGS += -fpermissive -Wno-multichar -D_UNICODE -DUNICODE -DARMIPS_USE_STD_FILESYSTEM
+	LDFLAGS += -shared -Wl,--no-undefined -static-libgcc -static-libstdc++ -Wl,--version-script=link.T -lwinmm -lgdi32 -lwsock32 -lws2_32
 	GL_LIB := -lopengl32
 	PLATFORM_EXT = win32
-   FFMPEGINCFLAGS += -I$(FFMPEGDIR)/Windows/$(TARGET_ARCH)/include
-   FFMPEGLDFLAGS += -lavformat -lavcodec -lavutil -lswresample -lswscale
-   INCFLAGS += -include $(CORE_DIR)/Windows/mingw_defines.h
-   ifneq (,$(findstring 64,$(TARGET_ARCH)))
-		LDFLAGS += -L$(CORE_DIR)/dx9sdk/Lib/x64
-	else
-		LDFLAGS += -L$(CORE_DIR)/dx9sdk/Lib/x86
-	endif
    fpic = -fPIC
 	CC = gcc
 	CXX = g++
@@ -562,7 +394,37 @@ else
 	GLFLAGS += -DHAVE_OPENGL
 endif
 
-COREFLAGS += -D__LIBRETRO__ -DPPSSPP -DUSE_FFMPEG -DWITH_UPNP -DGLEW_STATIC -DGLEW_NO_GLU -DMINIUPNP_STATICLIB
+COREFLAGS += -D__LIBRETRO__ -DPPSSPP -DWITH_UPNP -DGLEW_STATIC -DGLEW_NO_GLU -DMINIUPNP_STATICLIB
+ifneq ($(platform), emscripten)
+	# ffmpeg does not work with emscripten
+	COREFLAGS += -DUSE_FFMPEG
+	BUILD_FFMPEG := 1
+endif
+
+# FFmpeg, from the sources in ext/ffmpeg (see its README.md). Its own include directories go first,
+# so its config.h wins over the other config.h files on the include path.
+ifeq ($(BUILD_FFMPEG), 1)
+	include $(CORE_DIR)/ext/ffmpeg-build/sources.mk
+	FFMPEG_OBJECTS := $(addprefix $(FFMPEGDIR)/,$(FFMPEG_SOURCES:.c=.o))
+	FFMPEG_CFLAGS := -I$(CORE_DIR)/ext/ffmpeg-build -I$(FFMPEGDIR) -DHAVE_AV_CONFIG_H -D_ISOC99_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
+	ifneq (,$(findstring msvc,$(platform)))
+		FFMPEG_CFLAGS += -D_USE_MATH_DEFINES -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_WARNINGS
+		# FFmpeg leaves calls to disabled components for the compiler to drop, which MSVC only does
+		# when optimizing.
+		FFMPEG_CFLAGS_LAST := -O2 -W0
+	else
+		FFMPEG_CFLAGS_LAST := -w -Werror=implicit-function-declaration
+	endif
+	# Linked as a library of its own, since with all these objects the link command line gets too
+	# long for Windows.
+	ifeq ($(STATIC_LINKING), 1)
+		OBJECTS += $(FFMPEG_OBJECTS)
+	else ifneq (,$(findstring msvc,$(platform)))
+		FFMPEG_LIB := $(FFMPEGDIR)/ffmpeg.lib
+	else
+		FFMPEG_LIB := $(FFMPEGDIR)/libffmpeg.a
+	endif
+endif
 
 ifeq ($(DEBUG), 1)
 	ifneq (,$(findstring msvc,$(platform)))
@@ -572,20 +434,39 @@ ifeq ($(DEBUG), 1)
 		CPUOPTS += -O0 -g
 	endif
 	CPUOPTS += -D_DEBUG
+else ifeq ($(platform), emscripten)
+	CPUOPTS += -O3 -DNDEBUG
 else
-	CPUOPTS += -O2 -D_NDEBUG
+	CPUOPTS += -O2 -DNDEBUG
 endif
 
 ifeq (,$(findstring msvc,$(platform)))
-   CXXFLAGS += -std=c++11
+   CXXFLAGS += -std=c++17
+else
+   CXXFLAGS += -std:c++17
 endif
 
 ### Finalize ###
-OBJECTS		+= $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o) $(ASMFILES:.S=.o)
-CXXFLAGS    += $(CPUOPTS) $(COREFLAGS) $(FFMPEGINCFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(PLATCFLAGS) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
-CFLAGS		+= $(CPUOPTS) $(COREFLAGS) $(FFMPEGINCFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(PLATCFLAGS) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
+# GLEW resolves its entry points through GLX by default, and glxewInit() returns
+# GLEW_ERROR_NO_GLX_DISPLAY on a display stack that provides no GLX, so
+# glewInit() fails and the GL backend never comes up. Wayland and GBM are both
+# affected. Building GLEW's EGL backend instead resolves them through
+# eglGetProcAddress. Opt-in, so GLX builds keep the behaviour they have today.
+ifeq ($(GLEW_EGL),1)
+	COREFLAGS += -DGLEW_EGL
+endif
 
-LDFLAGS		+= $(FFMPEGLDFLAGS) $(fpic)
+OBJECTS		+= $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o) $(ASMFILES:.S=.o)
+
+ifeq (,$(findstring msvc,$(platform)))
+# No fused multiply-adds in CPU emulation unless written explicitly, so its float results are the
+# same on every CPU. Elsewhere (the vertex decoder, say) they're fine.
+$(filter $(COREDIR)/MIPS/%,$(SOURCES_CXX:.cpp=.o)): CXXFLAGS += -ffp-contract=off
+endif
+CXXFLAGS    += $(CPUOPTS) $(COREFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(PLATCFLAGS) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
+CFLAGS		+= $(CPUOPTS) $(COREFLAGS) $(INCFLAGS) $(INCFLAGS_PLATFORM) $(PLATCFLAGS) $(fpic) $(PLATCFLAGS) $(CPUFLAGS) $(GLFLAGS) $(DYNAFLAGS)
+
+LDFLAGS		+= $(fpic)
 ifeq (,$(findstring android,$(platform))$(findstring msvc,$(platform)))
    LDFLAGS	+= -lpthread
 endif
@@ -614,18 +495,28 @@ all: $(TARGET)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $(OBJOUT)$@ $<
 
+$(FFMPEG_OBJECTS): %.o: %.c
+	$(CC) $(FFMPEG_CFLAGS) $(CFLAGS) $(FFMPEG_CFLAGS_LAST) -c $(OBJOUT)$@ $<
+
+$(FFMPEGDIR)/ffmpeg.lib: $(FFMPEG_OBJECTS)
+	lib.exe -nologo -out:$@ $^
+
+$(FFMPEGDIR)/libffmpeg.a: $(FFMPEG_OBJECTS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $(OBJOUT)$@ $<
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJECTS) $(FFMPEG_LIB)
 ifeq ($(STATIC_LINKING), 1)
-	$(AR) rcs $A $(OBJECTS)
+	$(AR) rcs $(TARGET) $(OBJECTS)
 else
-	$(LD) $(LINKOUT)$@ $(OBJECTS) $(LDFLAGS) $(GL_LIB)
+	$(LD) $(LINKOUT)$@ $(OBJECTS) $(FFMPEG_LIB) $(LDFLAGS) $(GL_LIB)
 endif
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(filter-out $(CORE_DIR)/ext/zstd/lib/decompress/huf_decompress_amd64.S,$(OBJECTS)) $(FFMPEG_OBJECTS) $(FFMPEG_LIB) $(TARGET)
 
 .PHONY: clean
 

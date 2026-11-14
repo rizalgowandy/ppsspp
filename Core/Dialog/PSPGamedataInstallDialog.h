@@ -22,7 +22,7 @@
 
 struct SceUtilityGamedataInstallParam {
 	pspUtilityDialogCommon common;
-	u32_le unknown1;
+	s32_le mode;
 	char gameName[13];
 	char ignore1[3];
 	char dataName[20];
@@ -35,16 +35,15 @@ struct SceUtilityGamedataInstallParam {
 
 class PSPGamedataInstallDialog: public PSPDialog {
 public:
-	PSPGamedataInstallDialog(UtilityDialogType type);
-	virtual ~PSPGamedataInstallDialog();
+	PSPGamedataInstallDialog(UtilityDialogType type) : PSPDialog(type) {}
 
-	virtual int Init(u32 paramAddr);
-	virtual int Update(int animSpeed) override;
-	virtual int Shutdown(bool force = false) override;
-	virtual void DoState(PointerWrap &p) override;
+	int Init(u32 paramAddr);
+	int Update(int animSpeed) override;
+	int Shutdown(bool force = false) override;
+	void DoState(PointerWrap &p) override;
 
 	int Abort();
-	std::string GetGameDataInstallFileName(SceUtilityGamedataInstallParam *param, std::string filename);
+	std::string GetGameDataInstallFileName(const SceUtilityGamedataInstallParam *param, const std::string &filename);
 
 protected:
 	// TODO: Manage status correctly.
@@ -54,21 +53,22 @@ protected:
 
 private:
 	void UpdateProgress();
+	void RenderProgress(int percentage);
 	void OpenNextFile();
 	void CopyCurrentFileData();
 	void CloseCurrentFile();
 	void WriteSfoFile();
 
-	SceUtilityGamedataInstallParam request;
-	PSPPointer<SceUtilityGamedataInstallParam> param;
+	SceUtilityGamedataInstallParam request{};
+	PSPPointer<SceUtilityGamedataInstallParam> param{};
 	std::vector<std::string> inFileNames;
-	int numFiles;
-	int readFiles;
-	u64 allFilesSize;  // use this to calculate progress value.
-	u64 allReadSize;   // use this to calculate progress value.
-	int progressValue;
+	int numFiles = 0;
+	int readFiles = 0;
+	u64 allFilesSize = 0;  // use this to calculate progress value.
+	u64 allReadSize = 0;   // use this to calculate progress value.
+	int progressValue = 0;
 
-	int currentInputFile;
-	u32 currentInputBytesLeft;
-	int currentOutputFile;
+	int currentInputFile = 0;
+	u32 currentInputBytesLeft = 0;
+	int currentOutputFile = 0;
 };

@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include "Common/Common.h"
 #include "Common/GPU/Shader.h"
+#include "Common/System/Display.h"
 
 struct CardboardSettings {
 	bool enabled;
@@ -31,13 +33,14 @@ struct CardboardSettings {
 struct PostShaderUniforms {
 	float texelDelta[2]; float pixelDelta[2];
 	float time[4];
+	float timeDelta[4];
 	float setting[4];
 	float video; float pad[3];
+	float vr;
 	// Used on Direct3D9.
 	float gl_HalfPixel[4];
 };
 
-// Could use UI::Bounds but don't want to depend on that here.
 struct FRect {
 	float x;
 	float y;
@@ -45,8 +48,35 @@ struct FRect {
 	float h;
 };
 
-FRect GetScreenFrame(float pixelWidth, float pixelHeight);
-void CenterDisplayOutputRect(FRect *rc, float origW, float origH, const FRect &frame, int rotation);
+struct Bounds;  // from geom2d
+struct DisplayLayoutConfig;
+
+// The surface the game is presented to.
+struct OutputParams {
+	int pixelWidth = 0;
+	int pixelHeight = 0;
+	// The safe area, in pixels.
+	float insetLeft = 0.0f;
+	float insetTop = 0.0f;
+	float insetRight = 0.0f;
+	float insetBottom = 0.0f;
+	DeviceOrientation orientation = DeviceOrientation::Landscape;
+	DisplayRotation rotation = DisplayRotation::ROTATE_0;
+	Lin::Matrix4x4 rotMatrix = Lin::Matrix4x4::identity();
+	// Whether SetOverrideScreenFrame (the ImGui debugger's dock node) applies.
+	bool useOverrideFrame = false;
+};
+
+// The primary output: g_display, with the system's safe area insets.
+OutputParams PrimaryOutputParams(int pixelWidth, int pixelHeight);
+
+FRect GetScreenFrame(bool ignoreInsets, const OutputParams &output);
+// On the primary output.
+FRect GetScreenFrame(bool ignoreInsets, float pixelWidth, float pixelHeight);
+void SetOverrideScreenFrame(const Bounds *bounds);
+void CalculateDisplayOutputRect(const DisplayLayoutConfig &config, FRect *rc, float origW, float origH, const FRect &frame, int rotation, DeviceOrientation outputOrientation);
+// On the primary output.
+void CalculateDisplayOutputRect(const DisplayLayoutConfig &config, FRect *rc, float origW, float origH, const FRect &frame, int rotation);
 
 namespace Draw {
 class Buffer;
@@ -59,26 +89,55 @@ class Texture;
 }
 
 struct ShaderInfo;
+struct OverlayLayout;
 class TextureCacheCommon;
 
 enum class OutputFlags {
+	DEFAULT = 0,
 	LINEAR = 0x0000,
 	NEAREST = 0x0001,
 	RB_SWIZZLE = 0x0002,
-	BACKBUFFER_FLIPPED = 0x0004,
-	POSITION_FLIPPED = 0x0008,
-	PILLARBOX = 0x0010,
+	BACKBUFFER_FLIPPED = 0x0004,  // Viewport/scissor coordinates are y-flipped.
+	PILLARBOX = 0x0010,           // Squeeze the image horizontally. Used for the DarkStalkers hack.
+	NO_POST_SHADER = 0x0020,      // Draw straight to the bound target, as post shaders would need to bind their own.
+	NATIVE_SIZE = 0x0040,         // Draw the source rect 1:1 into the corner a host reads a smaller frame from (libretro).
 };
 ENUM_CLASS_BITOPS(OutputFlags);
 
 class PresentationCommon {
 public:
+	PresentationCommon(const PresentationCommon &) = delete;
+	PresentationCommon &operator=(const PresentationCommon &) = delete;
 	PresentationCommon(Draw::DrawContext *draw);
 	~PresentationCommon();
 
-	void UpdateSize(int w, int h, int rw, int rh) {
+	// The size of the primary output.
+	void UpdateDisplaySize(int w, int h) {
 		pixelWidth_ = w;
 		pixelHeight_ = h;
+	}
+	// Presents to another output than the primary, until called with nullptr.
+	void SetOutputOverride(const OutputParams *output) {
+		const bool changed = hasOutputOverride_ != (output != nullptr) || (output &&
+			(output->pixelWidth != outputOverride_.pixelWidth || output->pixelHeight != outputOverride_.pixelHeight || output->orientation != outputOverride_.orientation));
+		hasOutputOverride_ = output != nullptr;
+		if (output) {
+			outputOverride_ = *output;
+		}
+		// The post-shader framebuffers are sized for the output, so another one needs them rebuilt (in BeginFrame).
+		if (changed && usePostShader_) {
+			restorePostShader_ = true;
+		}
+	}
+	bool HasOutputOverride() const {
+		return hasOutputOverride_;
+	}
+	OutputParams GetOutput() const {
+		return hasOutputOverride_ ? outputOverride_ : PrimaryOutputParams(pixelWidth_, pixelHeight_);
+	}
+
+	// NOTE: Should be un-rotated width/height.
+	void UpdateRenderSize(int rw, int rh) {
 		renderWidth_ = rw;
 		renderHeight_ = rh;
 	}
@@ -90,47 +149,94 @@ public:
 		return usePostShader_;
 	}
 
-	bool UpdatePostShader();
+	bool UpdatePostShader(const DisplayLayoutConfig &config);
+
+	void BeginFrame(const DisplayLayoutConfig &config) {
+		if (restorePostShader_) {
+			UpdatePostShader(config);
+			restorePostShader_ = false;
+		}
+		presentedThisFrame_ = false;
+	}
+	bool PresentedThisFrame() const {
+		return presentedThisFrame_;
+	}
+	void NotifyPresent() {
+		// Something else did the present, skipping PresentationCommon.
+		// If you haven't called BindFramebufferAsRenderTarget, you must not set this.
+		presentedThisFrame_ = true;
+	}
 
 	void DeviceLost();
 	void DeviceRestore(Draw::DrawContext *draw);
 
 	void UpdateUniforms(bool hasVideo);
+
+	// One of these must be called every frame.
+	void SourceBlank();
 	void SourceTexture(Draw::Texture *texture, int bufferWidth, int bufferHeight);
 	void SourceFramebuffer(Draw::Framebuffer *fb, int bufferWidth, int bufferHeight);
-	void CopyToOutput(OutputFlags flags, int uvRotation, float u0, float v0, float u1, float v1);
 
-	void CalculateRenderResolution(int *width, int *height, int *scaleFactor, bool *upscaling, bool *ssaa);
+	void RunPostshaderPasses(const DisplayLayoutConfig &config, OutputFlags flags, int uvRotation, float u0, float v0, float u1, float v1);
+	void CopyToOutput(const DisplayLayoutConfig &config);
+
+	void CalculateRenderResolution(const DisplayLayoutConfig &config, int *width, int *height, int *scaleFactor, bool *upscaling, bool *ssaa) const;
 
 protected:
 	void CreateDeviceObjects();
 	void DestroyDeviceObjects();
+
 	void DestroyPostShader();
+	void DestroyStereoShader();
 
-	void ShowPostShaderError(const std::string &errorString);
+	static void ShowPostShaderError(const std::string &errorString);
 
-	Draw::ShaderModule *CompileShaderModule(ShaderStage stage, ShaderLanguage lang, const std::string &src, std::string *errorString);
-	Draw::Pipeline *CreatePipeline(std::vector<Draw::ShaderModule *> shaders, bool postShader, const UniformBufferDesc *uniformDesc);
-	bool BuildPostShader(const ShaderInfo *shaderInfo, const ShaderInfo *next);
+	Draw::ShaderModule *CompileShaderModule(ShaderStage stage, ShaderLanguage lang, const std::string &src, std::string *errorString) const;
+	Draw::Pipeline *CreatePipeline(std::vector<Draw::ShaderModule *> shaders, bool postShader, const UniformBufferDesc *uniformDesc, bool alphaBlend = false) const;
+	bool UseVRStereoSource() const;
+#ifdef __LIBRETRO__
+	void CopyToLibretroVR();
+	float vrUV_[4][2]{};
+	int vrPresentationMode_ = -1;
+#endif
+	bool CompilePostShader(const ShaderInfo *shaderInfo, Draw::Pipeline **outPipeline) const;
+	bool BuildPostShader(const DisplayLayoutConfig &config, const ShaderInfo *shaderInfo, const ShaderInfo *next, Draw::Pipeline **outPipeline);
 	bool AllocateFramebuffer(int w, int h);
 
-	void BindSource(int binding);
+	bool BindSource(int binding, bool bindStereo);
 
-	void GetCardboardSettings(CardboardSettings *cardboardSettings);
-	void CalculatePostShaderUniforms(int bufferWidth, int bufferHeight, int targetWidth, int targetHeight, const ShaderInfo *shaderInfo, PostShaderUniforms *uniforms);
+	bool PrepareOverlayTexture(const OverlayLayout &layout);
+	void DrawOverlay(const OverlayLayout &layout, const OutputParams &output);
+
+	bool UseCardboard(const DisplayLayoutConfig &config) const;
+	void GetCardboardSettings(const DisplayLayoutConfig &config, const OutputParams &output, CardboardSettings *cardboardSettings) const;
+	void CalculatePostShaderUniforms(int bufferWidth, int bufferHeight, int targetWidth, int targetHeight, const ShaderInfo *shaderInfo, PostShaderUniforms *uniforms) const;
 
 	Draw::DrawContext *draw_;
 	Draw::Pipeline *texColor_ = nullptr;
 	Draw::Pipeline *texColorRBSwizzle_ = nullptr;
+	// VR with a stereo (two-layer) source: each view of the multiview backbuffer samples its own layer.
+	Draw::Pipeline *texColorStereo_ = nullptr;
 	Draw::SamplerState *samplerNearest_ = nullptr;
 	Draw::SamplerState *samplerLinear_ = nullptr;
 	Draw::Buffer *vdata_ = nullptr;
-	Draw::Buffer *idata_ = nullptr;
 
-	std::vector<Draw::ShaderModule *> postShaderModules_;
+	// Overlay (bezel) drawn around or behind the game, see Overlay.h.
+	Draw::Pipeline *texColorBlend_ = nullptr;
+	Draw::Buffer *overlayVdata_ = nullptr;
+	Draw::Texture *overlayTexture_ = nullptr;
+	uint32_t overlayGeneration_ = 0xFFFFFFFF;
+
 	std::vector<Draw::Pipeline *> postShaderPipelines_;
 	std::vector<Draw::Framebuffer *> postShaderFramebuffers_;
 	std::vector<ShaderInfo> postShaderInfo_;
+	std::vector<Draw::Framebuffer *> previousFramebuffers_;
+	
+	Draw::Pipeline *stereoPipeline_ = nullptr;
+	ShaderInfo *stereoShaderInfo_ = nullptr;
+
+	int previousIndex_ = 0;
+	PostShaderUniforms previousUniforms_{};
 
 	Draw::Texture *srcTexture_ = nullptr;
 	Draw::Framebuffer *srcFramebuffer_ = nullptr;
@@ -140,11 +246,14 @@ protected:
 
 	int pixelWidth_ = 0;
 	int pixelHeight_ = 0;
+	bool hasOutputOverride_ = false;
+	OutputParams outputOverride_;
 	int renderWidth_ = 0;
 	int renderHeight_ = 0;
 
 	bool usePostShader_ = false;
 	bool restorePostShader_ = false;
+	bool presentedThisFrame_ = false;
 	ShaderLanguage lang_;
 
 	struct PrevFBO {
@@ -153,4 +262,9 @@ protected:
 		int h;
 	};
 	std::vector<PrevFBO> postShaderFBOUsage_;
+
+	// Carry over info between RunPostShaderPasses and CopyToOutput.
+	Draw::Framebuffer *postShaderOutput_ = nullptr;
+	FRect rc_;
+	OutputFlags outputFlags_ = OutputFlags::DEFAULT;
 };

@@ -15,11 +15,13 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include <ctime>
+#include "Common/Serialize/Serializer.h"
+#include "Common/Serialize/SerializeMap.h"
 #include "Core/FileSystems/BlobFileSystem.h"
 
 BlobFileSystem::BlobFileSystem(IHandleAllocator *hAlloc, FileLoader *fileLoader, std::string alias)
 : alloc_(hAlloc), fileLoader_(fileLoader), alias_(alias) {
+	NOTICE_LOG(Log::FileSystem, "%s", fileLoader->GetPath().c_str());
 }
 
 BlobFileSystem::~BlobFileSystem() {
@@ -27,12 +29,18 @@ BlobFileSystem::~BlobFileSystem() {
 }
 
 void BlobFileSystem::DoState(PointerWrap &p) {
-	// Not used in real emulation.
+	auto s = p.Section("BlobFileSystem", 1);
+	if (!s)
+		return;
+	// The open handles and their positions. The blob is the one booted.
+	Do(p, entries_);
 }
 
-std::vector<PSPFileInfo> BlobFileSystem::GetDirListing(std::string path) {
+std::vector<PSPFileInfo> BlobFileSystem::GetDirListing(std::string_view path, bool *exists) {
 	std::vector<PSPFileInfo> listing;
 	listing.push_back(GetFileInfo(alias_));
+	if (exists)
+		*exists = true;
 	return listing;
 }
 
@@ -84,6 +92,10 @@ size_t BlobFileSystem::SeekFile(u32 handle, s32 position, FileMove type) {
 			entry->second = fileLoader_->FileSize() + position;
 			break;
 		}
+		// Reads take the position as a file offset.
+		if (entry->second < 0) {
+			entry->second = 0;
+		}
 		return (size_t)entry->second;
 	}
 	return 0;
@@ -97,6 +109,10 @@ PSPFileInfo BlobFileSystem::GetFileInfo(std::string filename) {
 	info.exists = true;
 	info.type = FILETYPE_NORMAL;
 	return info;
+}
+
+PSPFileInfo BlobFileSystem::GetFileInfoByHandle(u32 handle) {
+	return GetFileInfo("");
 }
 
 bool BlobFileSystem::OwnsHandle(u32 handle) {
@@ -128,11 +144,6 @@ bool BlobFileSystem::RemoveFile(const std::string &filename) {
 	return false;
 }
 
-bool BlobFileSystem::GetHostPath(const std::string &inpath, std::string &outpath) {
-	outpath = fileLoader_->Path();
-	return true;
-}
-
-u64 BlobFileSystem::FreeSpace(const std::string &path) {
+u64 BlobFileSystem::FreeDiskSpace(const std::string &path) {
 	return 0;
 }

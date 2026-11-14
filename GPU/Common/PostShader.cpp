@@ -22,44 +22,60 @@
 #include <vector>
 #include <algorithm>
 
+#include "Common/Log.h"
 #include "Common/Data/Format/IniFile.h"
-#include "Common/File/FileUtil.h"
 #include "Common/File/DirListing.h"
 #include "Common/File/VFS/VFS.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
-
+#include "Common/GPU/thin3d.h"
 #include "Common/StringUtils.h"
-#include "Core/Config.h"
+
+#include "Core/System.h"
+#include "Core/Util/PathUtil.h"
 #include "GPU/Common/PostShader.h"
 
 static std::vector<ShaderInfo> shaderInfo;
 // Okay, not really "post" shaders, but related.
 static std::vector<TextureShaderInfo> textureShaderInfo;
 
+static Draw::GPUVendor VendorFromString(const std::string &vendor) {
+	// TODO: This should probably be a function somewhere.
+	if (vendor == "ARM") {
+		return Draw::GPUVendor::VENDOR_ARM;
+	} else if (vendor == "Qualcomm") {
+		return Draw::GPUVendor::VENDOR_QUALCOMM;
+	} else if (vendor == "IMGTEC") {
+		return Draw::GPUVendor::VENDOR_IMGTEC;
+	} else if (vendor == "NVIDIA") {
+		return Draw::GPUVendor::VENDOR_NVIDIA;
+	} else if (vendor == "AMD") {
+		return Draw::GPUVendor::VENDOR_AMD;
+	} else if (vendor == "Broadcom") {
+		return Draw::GPUVendor::VENDOR_BROADCOM;
+	} else if (vendor == "Apple") {
+		return Draw::GPUVendor::VENDOR_APPLE;
+	} else if (vendor == "Intel") {
+		return Draw::GPUVendor::VENDOR_INTEL;
+	} else if (vendor == "Mesa") {
+		return Draw::GPUVendor::VENDOR_MESA;
+	} else if (vendor == "Vivante") {
+		return Draw::GPUVendor::VENDOR_VIVANTE;
+	}
+	return Draw::GPUVendor::VENDOR_UNKNOWN;
+}
+
 // Scans the directories for shader ini files and collects info about all the shaders found.
 
-void LoadPostShaderInfo(const std::vector<std::string> &directories) {
+void LoadPostShaderInfo(Draw::DrawContext *draw, const std::vector<Path> &directories) {
 	std::vector<ShaderInfo> notVisible;
 
-	shaderInfo.clear();
-	ShaderInfo off{};
-	off.visible = true;
-	off.name = "Off";
-	off.section = "Off";
-	for (size_t i = 0; i < ARRAY_SIZE(off.settings); ++i) {
-		off.settings[i].name = "";
-		off.settings[i].value = 0.0f;
-		off.settings[i].minValue = -1.0f;
-		off.settings[i].maxValue = 1.0f;
-		off.settings[i].step = 0.01f;
+	Draw::GPUVendor gpuVendor = Draw::GPUVendor::VENDOR_UNKNOWN;
+	if (draw) {
+		gpuVendor = draw->GetDeviceCaps().vendor;
 	}
-	shaderInfo.push_back(off);
 
+	shaderInfo.clear();
 	textureShaderInfo.clear();
-	TextureShaderInfo textureOff{};
-	textureOff.name = "Off";
-	textureOff.section = "Off";
-	textureShaderInfo.push_back(textureOff);
 
 	auto appendShader = [&](const ShaderInfo &info) {
 		auto beginErase = std::remove(shaderInfo.begin(), shaderInfo.end(), info.name);
@@ -78,76 +94,121 @@ void LoadPostShaderInfo(const std::vector<std::string> &directories) {
 	};
 
 	for (size_t d = 0; d < directories.size(); d++) {
-		std::vector<FileInfo> fileInfo;
-		getFilesInDir(directories[d].c_str(), &fileInfo, "ini:");
-
-		if (fileInfo.size() == 0) {
-			VFSGetFileListing(directories[d].c_str(), &fileInfo, "ini:");
+		std::vector<File::FileInfo> fileInfo;
+		if (directories[d].IsAbsolute()) {
+			// The memory stick's folder. The VFS would list it the same way, so an empty one got listed twice.
+			File::GetFilesInDir(directories[d], &fileInfo, "ini:");
+		} else {
+			g_VFS.GetFileListing(directories[d].c_str(), &fileInfo, "ini:");
+			if (fileInfo.empty()) {
+				File::GetFilesInDir(directories[d], &fileInfo, "ini:");
+			}
 		}
 
 		for (size_t f = 0; f < fileInfo.size(); f++) {
 			IniFile ini;
 			bool success = false;
-			std::string name = fileInfo[f].fullName;
-			std::string path = directories[d];
-			// Hack around Android VFS path bug. really need to redesign this.
-			if (name.substr(0, 7) == "assets/")
-				name = name.substr(7);
-			if (path.substr(0, 7) == "assets/")
-				path = path.substr(7);
+			if (fileInfo[f].isDirectory)
+				continue;
 
-			if (ini.LoadFromVFS(name) || ini.Load(fileInfo[f].fullName)) {
+			Path name = fileInfo[f].fullName;
+			Path path = directories[d];
+			// Hack around Android VFS path bug. really need to redesign this.
+			if (name.ToString().substr(0, 7) == "assets/")
+				name = Path(name.ToString().substr(7));
+			if (path.ToString().substr(0, 7) == "assets/")
+				path = Path(path.ToString().substr(7));
+
+			if (ini.LoadFromVFS(g_VFS, name.ToString()) || ini.Load(fileInfo[f].fullName)) {
 				success = true;
 				// vsh load. meh.
 			}
+
 			if (!success)
 				continue;
 
 			// Alright, let's loop through the sections and see if any is a shader.
 			for (size_t i = 0; i < ini.Sections().size(); i++) {
-				Section &section = ini.Sections()[i];
-				std::string shaderType;
-				section.Get("Type", &shaderType, "render");
+				Section &section = *(ini.Sections()[i].get());
+				std::string shaderType = "render";
+				section.Get("Type", &shaderType);
 
-				if (section.Exists("Fragment") && section.Exists("Vertex") && strncasecmp(shaderType.c_str(), "render", shaderType.size()) == 0) {
+				std::vector<std::string> vendorBlacklist;
+				section.Get("VendorBlacklist", &vendorBlacklist);
+				bool skipped = false;
+				for (auto &item : vendorBlacklist) {
+					const Draw::GPUVendor blacklistedVendor = VendorFromString(item);
+					if (blacklistedVendor == gpuVendor && blacklistedVendor != Draw::GPUVendor::VENDOR_UNKNOWN) {
+						skipped = true;
+						break;
+					}
+				}
+				if (skipped) {
+					continue;
+				}
+
+				if (section.HasKey("Fragment") && section.HasKey("Vertex") &&
+					(strncasecmp(shaderType.c_str(), "render", shaderType.size()) == 0 ||
+					 strncasecmp(shaderType.c_str(), "StereoToMono", shaderType.size()) == 0)) {
 					// Valid shader!
-					ShaderInfo info;
+					ShaderInfo info{};
 					std::string temp;
 					info.section = section.name();
-					section.Get("Name", &info.name, section.name().c_str());
-					section.Get("Parent", &info.parent, "");
-					section.Get("Visible", &info.visible, true);
-					section.Get("Fragment", &temp, "");
-					info.fragmentShaderFile = path + "/" + temp;
-					section.Get("Vertex", &temp, "");
-					info.vertexShaderFile = path + "/" + temp;
-					section.Get("OutputResolution", &info.outputResolution, false);
-					section.Get("Upscaling", &info.isUpscalingFilter, false);
-					section.Get("SSAA", &info.SSAAFilterLevel, 0);
-					section.Get("60fps", &info.requires60fps, false);
+					info.name = section.name();
+					info.visible = true;
+					section.Get("Name", &info.name);
+					section.Get("Parent", &info.parent);
+					section.Get("Visible", &info.visible);
+					std::string fragment;
+					std::string vertex;
+					section.Get("Fragment", &fragment);
+					section.Get("Vertex", &vertex);
+					// Shader inis come from downloads, so keep them to their own folder.
+					if (HasParentDirComponent(fragment) || HasParentDirComponent(vertex)) {
+						WARN_LOG(Log::G3D, "Ignoring shader '%s' with a parent dir in its paths", info.section.c_str());
+						continue;
+					}
+					info.fragmentShaderFile = path / fragment;
+					info.vertexShaderFile = path / vertex;
+					section.Get("OutputResolution", &info.outputResolution);
+					section.Get("Upscaling", &info.isUpscalingFilter);
+					section.Get("SSAA", &info.SSAAFilterLevel);
+					if (info.SSAAFilterLevel < 0 || info.SSAAFilterLevel > 8) {
+						// It multiplies the render resolution, and shader inis come from downloads -
+						// the neighbouring texture-shader "Scale" is bounded for the same reason.
+						WARN_LOG(Log::G3D, "Ignoring out-of-range SSAA level %d in shader '%s'", info.SSAAFilterLevel, info.section.c_str());
+						info.SSAAFilterLevel = 0;
+					}
+					section.Get("60fps", &info.requires60fps);
+					section.Get("UsePreviousFrame", &info.usePreviousFrame);
 
 					if (info.parent == "Off")
-						info.parent = "";
+						info.parent.clear();
+
+					if (strncasecmp(shaderType.c_str(), "stereotomono", shaderType.size()) == 0) {
+						info.isStereo = true;
+						info.isUpscalingFilter = false;
+						info.parent.clear();
+					}
 
 					for (size_t i = 0; i < ARRAY_SIZE(info.settings); ++i) {
 						auto &setting = info.settings[i];
-						section.Get(StringFromFormat("SettingName%d", i + 1).c_str(), &setting.name, "");
-						section.Get(StringFromFormat("SettingDefaultValue%d", i + 1).c_str(), &setting.value, 0.0f);
-						section.Get(StringFromFormat("SettingMinValue%d", i + 1).c_str(), &setting.minValue, -1.0f);
-						section.Get(StringFromFormat("SettingMaxValue%d", i + 1).c_str(), &setting.maxValue, 1.0f);
-						section.Get(StringFromFormat("SettingStep%d", i + 1).c_str(), &setting.step, 0.01f);
-
-						// Populate the default setting value.
-						std::string section = StringFromFormat("%sSettingValue%d", info.section.c_str(), i + 1);
-						if (!setting.name.empty() && g_Config.mPostShaderSetting.find(section) == g_Config.mPostShaderSetting.end()) {
-							g_Config.mPostShaderSetting.insert(std::pair<std::string, float>(section, setting.value));
-						}
+						setting.name.clear();
+						setting.value = 0.0;
+						setting.minValue = -1.0f;
+						setting.maxValue = 1.0f;
+						setting.step = 0.01f;
+						section.Get(StringFromFormat("SettingName%d", i + 1).c_str(), &setting.name);
+						section.Get(StringFromFormat("SettingDefaultValue%d", i + 1).c_str(), &setting.value);
+						section.Get(StringFromFormat("SettingMinValue%d", i + 1).c_str(), &setting.minValue);
+						section.Get(StringFromFormat("SettingMaxValue%d", i + 1).c_str(), &setting.maxValue);
+						section.Get(StringFromFormat("SettingStep%d", i + 1).c_str(), &setting.step);
 					}
 
 					// Let's ignore shaders we can't support. TODO: Not a very good check
 					if (gl_extensions.IsGLES && !gl_extensions.GLES3) {
-						bool requiresIntegerSupport;
-						section.Get("RequiresIntSupport", &requiresIntegerSupport, false);
+						bool requiresIntegerSupport = false;
+						section.Get("RequiresIntSupport", &requiresIntegerSupport);
 						if (requiresIntegerSupport)
 							continue;
 					}
@@ -157,37 +218,106 @@ void LoadPostShaderInfo(const std::vector<std::string> &directories) {
 					} else {
 						notVisible.push_back(info);
 					}
-				} else if (section.Exists("Compute") && strncasecmp(shaderType.c_str(), "texture", shaderType.size()) == 0) {
+				} else if (section.HasKey("Compute") && strncasecmp(shaderType.c_str(), "texture", shaderType.size()) == 0) {
 					// This is a texture shader.
-					TextureShaderInfo info;
+					TextureShaderInfo info{};
 					std::string temp;
 					info.section = section.name();
-					section.Get("Name", &info.name, section.name().c_str());
-					section.Get("Compute", &temp, "");
-					section.Get("MaxScale", &info.maxScale, 255);
-					info.computeShaderFile = path + "/" + temp;
-
-					appendTextureShader(info);
+					info.name = section.name();
+					info.scaleFactor = 0;
+					section.Get("Name", &info.name);
+					section.Get("Scale", &info.scaleFactor);
+					bool hidden = false;
+					section.Get("Hidden", &info.hidden);
+					std::string cbufferFilename;
+					if (section.Get("ConstantBuffer", &cbufferFilename)) {
+						if (HasParentDirComponent(cbufferFilename)) {
+							WARN_LOG(Log::G3D, "Ignoring texture shader '%s' with a parent dir in its paths", info.section.c_str());
+							continue;
+						}
+						Path cbufferPath = path / cbufferFilename;
+						info.constantBuffer = cbufferPath;
+					}
+					if (section.Get("Compute", &temp)) {
+						if (HasParentDirComponent(temp)) {
+							WARN_LOG(Log::G3D, "Ignoring texture shader '%s' with a parent dir in its paths", info.section.c_str());
+							continue;
+						}
+						info.computeShaderFile = path / temp;
+						info.computeShaderFiles.push_back(info.computeShaderFile);
+						bool badPath = false;
+						for (int computeIndex = 2; computeIndex <= 4; ++computeIndex) {
+							temp.clear();
+							if (section.Get(StringFromFormat("Compute%d", computeIndex).c_str(), &temp)) {
+								if (HasParentDirComponent(temp)) {
+									badPath = true;
+								}
+								info.computeShaderFiles.push_back(path / temp);
+							}
+						}
+						if (badPath) {
+							WARN_LOG(Log::G3D, "Ignoring texture shader '%s' with a parent dir in its paths", info.section.c_str());
+						} else if (info.scaleFactor >= 2 && info.scaleFactor < 8) {
+							appendTextureShader(info);
+						}
+					} else {
+						ERROR_LOG(Log::G3D, "Compute field missing for compute shader");
+					}
+				} else if (!section.name().empty()) {
+					WARN_LOG(Log::G3D, "Unrecognized shader type '%s' or invalid shader in section '%s'", shaderType.c_str(), section.name().c_str());
 				}
 			}
 		}
 	}
 
+	// Sort shaders alphabetically.
+	std::sort(shaderInfo.begin(), shaderInfo.end());
+	std::sort(textureShaderInfo.begin(), textureShaderInfo.end());
+
+	ShaderInfo off{};
+	off.visible = true;
+	off.name = "Off";
+	off.section = "Off";
+	for (size_t i = 0; i < ARRAY_SIZE(off.settings); ++i) {
+		off.settings[i].name.clear();
+		off.settings[i].value = 0.0f;
+		off.settings[i].minValue = -1.0f;
+		off.settings[i].maxValue = 1.0f;
+		off.settings[i].step = 0.01f;
+	}
+
+	TextureShaderInfo textureOff{};
+	textureOff.name = "Off";
+	textureOff.section = "Off";
+	textureShaderInfo.insert(textureShaderInfo.begin(), textureOff);
+
 	// We always want the not visible ones at the end.  Makes menus easier.
+	shaderInfo.reserve(notVisible.size() + 1);
+	shaderInfo.insert(shaderInfo.begin(), off);
 	for (const auto &info : notVisible) {
 		appendShader(info);
 	}
 }
 
 // Scans the directories for shader ini files and collects info about all the shaders found.
-void ReloadAllPostShaderInfo() {
-	std::vector<std::string> directories;
-	directories.push_back("shaders");
-	directories.push_back(g_Config.memStickDirectory + "PSP/shaders");
-	LoadPostShaderInfo(directories);
+void ReloadAllPostShaderInfo(Draw::DrawContext *draw) {
+	std::vector<Path> directories;
+	directories.push_back(Path("shaders"));  // For VFS
+	directories.push_back(GetSysDirectory(DIRECTORY_CUSTOM_SHADERS));
+	LoadPostShaderInfo(draw, directories);
 }
 
-const ShaderInfo *GetPostShaderInfo(const std::string &name) {
+void RemoveUnknownPostShaders(std::vector<std::string> *names) {
+	for (auto iter = names->begin(); iter != names->end(); ) {
+		if (GetPostShaderInfo(*iter) == nullptr) {
+			iter = names->erase(iter);
+		} else {
+			++iter;
+		}
+	}
+}
+
+const ShaderInfo *GetPostShaderInfo(std::string_view name) {
 	for (size_t i = 0; i < shaderInfo.size(); i++) {
 		if (shaderInfo[i].section == name)
 			return &shaderInfo[i];
@@ -221,8 +351,8 @@ std::vector<const ShaderInfo *> GetPostShaderChain(const std::string &name) {
 
 std::vector<const ShaderInfo *> GetFullPostShadersChain(const std::vector<std::string> &names) {
 	std::vector<const ShaderInfo *> fullChain;
-	for (auto shaderName : names) {
-		auto shaderChain = GetPostShaderChain(shaderName);
+	for (const auto &shaderName : names) {
+		const auto &shaderChain = GetPostShaderChain(shaderName);
 		fullChain.insert(fullChain.end(), shaderChain.begin(), shaderChain.end());
 	}
 	return fullChain;
@@ -240,7 +370,7 @@ const std::vector<ShaderInfo> &GetAllPostShaderInfo() {
 	return shaderInfo;
 }
 
-const TextureShaderInfo *GetTextureShaderInfo(const std::string &name) {
+const TextureShaderInfo *GetTextureShaderInfo(std::string_view name) {
 	for (auto &info : textureShaderInfo) {
 		if (info.section == name) {
 			return &info;
@@ -250,4 +380,26 @@ const TextureShaderInfo *GetTextureShaderInfo(const std::string &name) {
 }
 const std::vector<TextureShaderInfo> &GetAllTextureShaderInfo() {
 	return textureShaderInfo;
+}
+
+void FixPostShaderOrder(std::vector<std::string> *names) {
+	// There's one rule only that we enforce - only one shader can use UsePreviousFrame,
+	// and it has to be the last one. So we simply remove any we find from the list,
+	// and then append it to the end if there is one.
+	std::string prevFrameShader;
+	for (auto iter = names->begin(); iter != names->end(); ) {
+		const ShaderInfo *info = GetPostShaderInfo(*iter);
+		if (info) {
+			if (info->usePreviousFrame) {
+				prevFrameShader = *iter;
+				iter = names->erase(iter++);
+				continue;
+			}
+		}
+		++iter;
+	}
+
+	if (!prevFrameShader.empty()) {
+		names->push_back(prevFrameShader);
+	}
 }

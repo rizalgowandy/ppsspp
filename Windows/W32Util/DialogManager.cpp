@@ -1,8 +1,8 @@
-#include "Common/CommonWindows.h"
 #include <vector>
 #include <algorithm>
-#include "Windows/W32Util/DialogManager.h"
 
+#include "Common/CommonWindows.h"
+#include "Windows/W32Util/DialogManager.h"
 
 Dialog::Dialog(LPCSTR res, HINSTANCE _hInstance, HWND _hParent) 
 {
@@ -30,11 +30,16 @@ void Dialog::Destroy()
 	DestroyWindow(m_hDlg);
 }
 
-void Dialog::Show(bool _bShow)
+void Dialog::Show(bool _bShow, bool includeToTop)
 {
-	m_bShowState = _bShow ? SW_NORMAL : SW_HIDE;
+	if (_bShow && includeToTop)
+		m_bShowState = SW_SHOWNORMAL;
+	else if (_bShow)
+		m_bShowState = SW_SHOWNOACTIVATE;
+	else
+		m_bShowState = SW_HIDE;
 	ShowWindow(m_hDlg, m_bShowState);
-	if (_bShow)
+	if (_bShow && includeToTop)
 		BringWindowToTop(m_hDlg);
 }
 
@@ -71,6 +76,9 @@ void DialogManager::AddDlg(Dialog *dialog)
 
 void DialogManager::RemoveDlg(Dialog *dialog)
 {
+	if (!dialog) {
+		return;
+	}
 	dialogs.erase(std::remove(dialogs.begin(), dialogs.end(), dialog), dialogs.end());
 }
 

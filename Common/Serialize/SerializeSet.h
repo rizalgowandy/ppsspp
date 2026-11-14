@@ -30,6 +30,12 @@ void DoSet(PointerWrap &p, std::set<T> &x) {
 	case PointerWrap::MODE_READ:
 	{
 		x.clear();
+		// Guard against an attacker-controlled count driving an enormous number of
+		// loop iterations/allocations, same spirit as DoVector's guard.
+		if (number > p.Remaining() / SerializeMinElemSize<T>()) {
+			p.SetError(PointerWrap::ERROR_FAILURE);
+			return;
+		}
 		while (number-- > 0) {
 			T it = T();
 			Do(p, it);
@@ -46,19 +52,19 @@ void DoSet(PointerWrap &p, std::set<T> &x) {
 			Do(p, *itr++);
 	}
 	break;
-
-	default:
-		ERROR_LOG(SAVESTATE, "Savestate error: invalid mode %d.", p.mode);
+	case PointerWrap::MODE_NOOP:
+		break;
 	}
 }
 
 template <class T>
 void Do(PointerWrap &p, std::set<T *> &x) {
 	if (p.mode == PointerWrap::MODE_READ) {
-		for (auto it = x.begin(), end = x.end(); it != end; ++it) {
-			if (*it != nullptr)
-				delete *it;
+		for (T *s : x) {
+			delete s;
 		}
+		// Right away: if reading the count fails, DoSet won't get as far as clearing.
+		x.clear();
 	}
 	DoSet(p, x);
 }

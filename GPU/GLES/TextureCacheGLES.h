@@ -17,84 +17,63 @@
 
 #pragma once
 
-#include <map>
-
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/OpenGL/GLCommon.h"
 #include "Common/GPU/OpenGL/GLRenderManager.h"
-#include "GPU/GPUInterface.h"
+#include "Common/GPU/thin3d.h"
 #include "GPU/GPUState.h"
-#include "GPU/GLES/TextureScalerGLES.h"
 #include "GPU/Common/TextureCacheCommon.h"
 
 struct VirtualFramebuffer;
 class FramebufferManagerGLES;
-class DepalShaderCacheGLES;
+class TextureShaderCache;
 class ShaderManagerGLES;
 class DrawEngineGLES;
 class GLRTexture;
 
 class TextureCacheGLES : public TextureCacheCommon {
 public:
-	TextureCacheGLES(Draw::DrawContext *draw);
+	TextureCacheGLES(Draw::DrawContext *draw, Draw2D *draw2D);
 	~TextureCacheGLES();
 
 	void Clear(bool delete_them) override;
-	void StartFrame();
 
 	void SetFramebufferManager(FramebufferManagerGLES *fbManager);
-	void SetDepalShaderCache(DepalShaderCacheGLES *dpCache) {
-		depalShaderCache_ = dpCache;
-	}
-	void SetShaderManager(ShaderManagerGLES *sm) {
-		shaderManager_ = sm;
-	}
 	void SetDrawEngine(DrawEngineGLES *td) {
 		drawEngine_ = td;
 	}
 
 	void ForgetLastTexture() override {
-		lastBoundTexture = nullptr;
-	}
-	void InvalidateLastTexture() override {
-		lastBoundTexture = nullptr;
+		lastBoundTexture_ = nullptr;
 	}
 
-	bool GetCurrentTextureDebug(GPUDebugBuffer &buffer, int level) override;
+	bool GetCurrentTextureDebug(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) override;
 
-	void DeviceLost();
-	void DeviceRestore(Draw::DrawContext *draw);
+	void DeviceLost() override;
+	void DeviceRestore(Draw::DrawContext *draw) override;
 
 protected:
 	void BindTexture(TexCacheEntry *entry) override;
+
 	void Unbind() override;
 	void ReleaseTexture(TexCacheEntry *entry, bool delete_them) override;
 
+	void BindAsClutTexture(Draw::Texture *tex, bool smooth) override;
+	void *GetNativeTextureView(const TexCacheEntry *entry, bool flat) const override;
+
 private:
-	void ApplySamplingParams(const SamplerCacheKey &key);
-	void LoadTextureLevel(TexCacheEntry &entry, ReplacedTexture &replaced, int level, int scaleFactor, Draw::DataFormat dstFmt);
-	Draw::DataFormat GetDestFormat(GETextureFormat format, GEPaletteFormat clutFormat) const;
+	void ApplySamplerByKey(const SamplerCacheKey &key) override;
+	static Draw::DataFormat GetDestFormat(GETextureFormat format, GEPaletteFormat clutFormat) ;
 
-	static TexCacheEntry::TexStatus CheckAlpha(const uint8_t *pixelData, Draw::DataFormat dstFmt, int stride, int w, int h);
 	void UpdateCurrentClut(GEPaletteFormat clutFormat, u32 clutBase, bool clutIndexIsSimple) override;
-	void ApplyTextureFramebuffer(VirtualFramebuffer *framebuffer, GETextureFormat texFormat, FramebufferNotificationChannel channel) override;
-
 	void BuildTexture(TexCacheEntry *const entry) override;
 
 	GLRenderManager *render_;
 
-	TextureScalerGLES scaler;
-
-	GLRTexture *lastBoundTexture = nullptr;
+	GLRTexture *lastBoundTexture_ = nullptr;
 
 	FramebufferManagerGLES *framebufferManagerGL_;
-	DepalShaderCacheGLES *depalShaderCache_;
-	ShaderManagerGLES *shaderManager_;
 	DrawEngineGLES *drawEngine_;
-
-	GLRInputLayout *shadeInputLayout_ = nullptr;
 
 	enum { INVALID_TEX = -1 };
 };
-
-Draw::DataFormat getClutDestFormat(GEPaletteFormat format);
